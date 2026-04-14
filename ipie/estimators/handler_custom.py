@@ -126,13 +126,13 @@ class EstimatorHandler(EstimatorHandler_):
         if comm.rank>0:
             return
         ntot = len(self.log_average_weights)
-        nprod = min(max_nprod,ntot-1)
-        nsum = min(ntot-nprod,max_nsum)
-        shift = ntot - nsum
+        nprod = min(max_nprod,ntot)
+        nsum = min(ntot-nprod+1,max_nsum)
+        shift = ntot - nsum 
         print(f'ntot={ntot},nprod={nprod},nsum={nsum},shift={shift}')
         weight = numpy.zeros(nsum)
         for i in range(nsum):
-            stop = i+shift
+            stop = i+shift+1
             start = stop-nprod
             weight[i] = sum(self.log_average_weights[start:stop])
         max_weight = numpy.amax(weight)
@@ -141,6 +141,7 @@ class EstimatorHandler(EstimatorHandler_):
         output_string = " "
         vals = numpy.mean(weight),max_weight,0.
         output_string += walker_factors.to_text(numpy.array(vals))
+        output_string += " "
 
         offset = self.num_walker_props
         for k,e in self.items():

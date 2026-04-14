@@ -35,7 +35,7 @@ class PhaselessLin(PhaselessBase):
         synchronize()
         start_time = time.time()
         gf = hamiltonian.calc_bare_gf(walkers) 
-        ovlp,_ = hamiltonian.calc_trial_ovlp(walkers,trial)
+        ovlp = hamiltonian.calc_trial_ovlp(walkers,trial)[0]
         synchronize()
         self.timer.tgf += time.time() - start_time
 

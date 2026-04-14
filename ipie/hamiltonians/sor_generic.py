@@ -234,6 +234,11 @@ class SumOfRotationBase(GenericBase):
 
     @plum.dispatch
     def calc_bare_gf(self,walkers:UHFWalkers):
+        gf = dict()
+        for d,terms in enumerate(self.terms):
+            for i,term in enumerate(terms):
+                gf[d,i] = term.ai/self.Lambda/self.scale
+        return gf
         # basis indexing: 
         # \delta-basis: p,q,...
         # ham basis: x,y,...
@@ -260,24 +265,38 @@ class SumOfRotationBase(GenericBase):
         gf = self._update_gf1_uhf(gf,D0,UD,DU,M,self.H1)[0]
         gf = self._update_gf_2body_uhf(gf,D0,UD,DU,M)
         # compute det(X)(1.-H/\Lambda)/scale
+        _sum = 0.
         for d,terms in enumerate(self.terms):
             for i,term in enumerate(terms):
                 #gf[d,i] = ovlp[d,i]*D0_ovlp*(self.Lambda - gf[d,i])
+                _sum += gf[d,i]
                 gf[d,i] = ovlp[d,i]*D0_ovlp*(1.-gf[d,i]/self.Lambda)/self.scale
+        #print(_sum)
+        #exit()
         return gf
 
     def calc_trial_ovlp(self,walkers,trial):
         D0 = _D0(walkers,trial)
+        #tr0 = _trace_regularize(D0)
+        #print('tr0=',tr0)
+
         UD = _conjugate_1rdm_left(self.chol_basis,D0) 
         UDU = _conjugate_1rdm_both(self.chol_basis,UD=UD,full=True) 
 
         R0 = 1.
         ovlp = dict()
+        # note tha this eloc corresponds to incoming walkers,
+        # whereas for now our SR uses outgoing walkers,
+        # so that one still recomputes self.local_energy
+        eloc = 0. 
         if self.eps_sq is None:
             for d,terms in enumerate(self.terms):
                 for i,term in enumerate(terms):
                     ovlp[d,i] = term.compute_trial_ovlp(UDU[d])
-            return ovlp,R0
+                    eloc += term.ai * ovlp[d,i]
+            eloc = self.Lambda - eloc
+            #print('eloc=',eloc)
+            return ovlp,R0,eloc
 
         M = dict()
         # compute M,detX
@@ -286,8 +305,10 @@ class SumOfRotationBase(GenericBase):
                 M1,M2 = term.compute_M(UDU[d])
                 M[d,i] = M1,M2
                 ovlp[d,i] = term.ds.prod()/np.linalg.det(M1)
+                eloc += term.ai * ovlp[d,i]
+        eloc = self.Lambda - eloc
+        #print('eloc=',eloc)
 
-        tr0 = _trace_regularize(D0)
         R0 = 1./np.sqrt(1.+self.eps_sq*tr0)
         #print(f'RANK={RANK},Rmean={np.mean(self.R0)}')
 
@@ -316,7 +337,7 @@ class SumOfRotationBase(GenericBase):
 
                 R = 1./np.sqrt(1.+self.eps_sq*tr)
                 ovlp[d,i] *= R0/R
-        return ovlp,R0
+        return ovlp,R0,eloc
 
     def sample_from_gf(self,gf,ovlp):
         p = np.array([gf[key]*ovlp[key] for key in self.keys]) 
@@ -336,17 +357,26 @@ class SumOfRotationBase(GenericBase):
             kix = np.random.choice(self.nkeys,p=p[:,w])
             keys[w] = self.keys[kix]
             b[w] *= sign[kix,w] 
+        self.b = b
         return keys,b
     
     @plum.dispatch
     def update_workers(self,keys,walkers:UHFWalkers):
         for w,(d,i) in enumerate(keys):
             term = self.terms[d][i] 
-            U = term.get_rotation_matrix(self.chol_basis[d])
-            if U[0] is not None:
-                walkers.phia[w] = np.dot(U[0],walkers.phia[w])
-            if U[1] is not None:
-                walkers.phib[w] = np.dot(U[1],walkers.phib[w])
+            #U = term.get_rotation_matrix(self.chol_basis[d])
+            #if U[0] is not None:
+            #    print('U0')
+            #    print(U[0])
+            #    walkers.phia[w] = np.dot(U[0],walkers.phia[w])
+            #if U[1] is not None:
+            #    print('U1')
+            #    print(U[1])
+            #    walkers.phib[w] = np.dot(U[1],walkers.phib[w])
+            phi = [walkers.phia[w],walkers.phib[w]]
+            phi = term.apply_rotation(phi,self.chol_basis[d])
+            walkers.phia[w] = phi[0]
+            walkers.phib[w] = phi[1]
 
     # NOT USED
     #def compute_eloc_from_sor(self,walkers,trial,thresh=1e-10):
@@ -360,6 +390,9 @@ class SumOfRotationBase(GenericBase):
     #    return self.Lambda-eloc,np.zeros(1),np.zeros(1)
 
     def local_energy(self,walkers,trial):
+        #if self.b is not None:
+        #    E = self.b*self.alpha
+        #    return self.b,0.,0.,1.
         D = _D0(walkers,trial)
         tr0 = _trace_regularize(D)
         R0 = 1.
@@ -400,6 +433,28 @@ class SumOfRotationBase(GenericBase):
                 rdm1[d,i] = np.array(D)
         return rdm1
 
+    def _get_bare_gf(self,walkers:UHFWalkers):
+        C = _walkers2uhf(walkers)
+        phis = dict()
+        for d,terms in enumerate(self.terms):
+            for i,term in enumerate(terms):
+                U = term.get_rotation_matrix(self.chol_basis[d])
+                C_ = C.copy() 
+                for s,u in enumerate(U):
+                    if u is not None:
+                        C_[s] = np.einsum('xy,wyi->wxi',u,C_[s]) 
+                phis[d,i] = C_,term.ai
+        gf = dict()
+        for d,terms in enumerate(self.terms):
+            for i,term in enumerate(terms):
+                gf[d,i] = 0.
+                C1,_ = phis[d,i]
+                for (g,j),(C2,coeff) in phis.items():
+                    X = np.einsum('swxi,swxj->swij',C1,C2) 
+                    det = np.linalg.det(X)
+                    gf[d,i] += (det[0]*det[1]*coeff)/self.Lambda/self.scale
+        return gf 
+
     @plum.dispatch
     def _get_walker_ovlp(self,walkers:UHFWalkers):
         C = _walkers2uhf(walkers)
@@ -433,6 +488,7 @@ class SumOfRotationBase(GenericBase):
         detBdC = np.linalg.det(BdC)
         ovlp = dict() 
         nb = trial.nbasis 
+        eloc = 0
         for d,terms in enumerate(self.terms):
             for i,term in enumerate(terms):
                 U = term.get_rotation_matrix(self.chol_basis[d])
@@ -444,6 +500,7 @@ class SumOfRotationBase(GenericBase):
                 C_ = np.einsum('xy,wyi->wxi',Ufull,C) 
                 BdC = np.einsum('xi,wxj->wij',B,C_)
                 ovlp[d,i] = np.linalg.det(BdC)/detBdC 
+                eloc += term.ai*ovlp[d,i]
 
                 BdCinv = np.linalg.inv(BdC)
                 D = np.einsum('wxi,wij->wxj',C_,BdCinv)
@@ -451,7 +508,7 @@ class SumOfRotationBase(GenericBase):
                 tr = np.einsum('wxy->w',D**2)
                 R = 1./np.sqrt(1.+self.eps_sq*tr)
                 ovlp[d,i] *= R0/R
-        return ovlp,R0
+        return ovlp,R0,self.Lambda-eloc
 
     def _get_MB_gf(self,basis):
         H = 0
@@ -525,11 +582,14 @@ class SumOfRotationGeneric(SumOfRotationBase):
         raise NotImplementedError
 
 class SumOfRotationOnsite(SumOfRotationBase):
-    def __init__(self,h1e,U,eps_sq=None):
-        self.eps_sq = eps_sq
-        self.U = U
-        self.scale = 1.
+    def __init__(self,h1e,U,eps_sq=None,scale=1.):
         super().__init__(h1e)
+        self.U = U
+        self.eps_sq = eps_sq
+        self.scale = scale
+
+        self.b = None
+        self.eloc = None
 
     def get_decomposition(self,at,gu,thresh=1e-6,iprint=0,nelec=None):
         self.chol_basis = []
@@ -635,3 +695,23 @@ class SumOfRotationOnsite(SumOfRotationBase):
             H[ix1,ix1] += self.U*count_double_occupancy(cf1,self.nbasis)
         return H,basis
 
+#from ipie.hamiltonians.bitstring_utils import string_act,count_double_occupancy
+#class Hubbard:
+#    def __init__(self,h1e,U,eps_sq=None):
+#        self.eps_sq = eps_sq
+#        self.U = U
+#        self.scale = 1.
+#        self.b = None
+#        self.nbasis = h1e.shape[0]
+#        self.hops = []        
+#        for i in range(self.nbasis):
+#            for j in range(i+1,self.nbasis):
+#                if np.fabs(h1e[i,j])>1e-6:
+#                    self.hops.append((i,j))
+#    def calc_bare_gf(self,walkers):
+#        for cf in walkers.configs:
+#            for (i,j) in self.hops:
+#                for s in (0,1):
+#                    ops = (2*i+s,'cre'),(2*j+s,'des')
+#                    y,sgn = string_act(cf,ops)
+#

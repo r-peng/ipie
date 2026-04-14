@@ -42,6 +42,8 @@ class EnergyEstimator(EnergyEstimator_):
         self._data["EDenom"] = xp.sum(weight)
         self._data["E1Body"] = xp.sum(weight * E1)
         self._data["E2Body"] = xp.sum(weight * E2)
+        #print('R0,sign=',R0,walkers.sgn_ovlp)
+        #print('Eloc=',xp.sum(weight * Etot)/xp.sum(weight))
         return self.data
     def process_sr_data(self,data,dirname='.'):
         for key in self._sr_data: 

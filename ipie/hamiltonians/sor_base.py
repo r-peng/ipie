@@ -88,3 +88,12 @@ class Udiag:
                 continue
             U[s] = np.einsum('xp,yp,p->xy',v,v,Us)
         return U
+    def apply_rotation(self,phi0,v):
+        nsite = v.shape[0]
+        phi = [phis.copy() for phis in phi0]
+        for p,d in zip(self.ps,self.ds):
+            s,ps = p//nsite,p%nsite
+            vec = np.take(v,ps,axis=1)
+            phi[s] += d*np.outer(vec,np.dot(vec,phi0[s]))
+        return phi
+
