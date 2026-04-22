@@ -7,7 +7,7 @@ Original file is located at
     https://colab.research.google.com/drive/1sFf4TUd4LanpPhKhQXAhrnv5r91ULUNV
 """
 
-from typing import Iterator, Iterable, Optional, Tuple, Sequence, List
+from typing import Iterator, Iterable, Optional, Tuple, Sequence, List, Dict
 import numpy as np
 from dataclasses import dataclass
 ### bitstring utilities ###
@@ -500,3 +500,126 @@ def count_double_occupancy(det: int, n_sites: int) -> int:
             dn_comp |= 1 << site
 
     return (up_comp & dn_comp).bit_count()
+def all_bitstrings_list(n_sites: int) -> list[int]:
+    n_orb = 2 * n_sites
+    return list(range(1 << n_orb))
+
+def apply_c_dag_to_state(
+    psi: np.ndarray,
+    dets: Sequence[int],
+    q: int,
+    det_to_index: Optional[Dict[int, int]] = None,
+) -> np.ndarray:
+    """
+    Compute phi = c_q^† |psi> in the same basis 'dets'.
+
+    Convention:
+      - det is a Python int bitstring; bit p=1 means occupied.
+      - fermionic sign for c_q^† is (-1)^(N_{<q}) where N_{<q} is the number
+        of occupied orbitals with index < q in the current determinant.
+
+    If the basis 'dets' does not contain the resulting determinant (common if
+    your basis is fixed-N), that contribution is skipped (i.e. projected out).
+
+    Args:
+      psi: shape (dim,) complex/float
+      dets: length dim list/array of bitstrings
+      q: orbital index to create on
+      det_to_index: optional dict mapping det->index; if None, it is built.
+
+    Returns:
+      phi: shape (dim,) same dtype as psi
+    """
+    psi = np.asarray(psi)
+    dim = len(dets)
+    if psi.shape[0] != dim:
+        raise ValueError("psi and dets must have the same length")
+
+    q = int(q)
+    bitq = 1 << q
+    left_mask = bitq - 1  # bits < q
+
+    if det_to_index is None:
+        det_to_index = {int(d): i for i, d in enumerate(dets)}
+
+    phi = np.zeros_like(psi)
+
+    for i, d in enumerate(dets):
+        d = int(d)
+
+        # if already occupied at q, creation gives zero
+        if d & bitq:
+            continue
+
+        d_new = d | bitq
+
+        j = det_to_index.get(d_new)
+        if j is None:
+            # result not in this basis (e.g., fixed-N basis) -> projected out
+            continue
+
+        # fermionic phase = (-1)^(popcount of occupied bits below q)
+        n_left = (d & left_mask).bit_count()
+        sgn = -1 if (n_left & 1) else +1
+
+        phi[j] += sgn * psi[i]
+
+    return phi
+def iter_set_bits(x: int):
+    while x:
+        lsb = x & -x
+        yield lsb
+        x &= x - 1
+def apply_a_dag_dense_sign(
+    psi: np.ndarray,
+    dets: Sequence[int],
+    A_col: np.ndarray,                 # shape (n_orb,)
+    n_orb: int,
+    det_to_index: Optional[Dict[int, int]] = None,
+) -> np.ndarray:
+    """
+    Same as above but includes fermionic sign for c_q^†.
+    """
+    psi = np.asarray(psi)
+    A = np.asarray(A_col)
+    dim = len(dets)
+    if psi.shape[0] != dim:
+        raise ValueError("psi and dets must have the same length")
+    if A.shape[0] != n_orb:
+        raise ValueError("A_col must have length n_orb")
+
+    if det_to_index is None:
+        det_to_index = {int(d): k for k, d in enumerate(dets)}
+
+    mask_all = (1 << int(n_orb)) - 1
+    phi = np.zeros_like(psi)
+
+    get = det_to_index.get
+    A_list = A.tolist()
+
+    for k, d in enumerate(dets):
+        amp = psi[k]
+        if amp == 0:
+            continue
+        d = int(d) & mask_all
+
+        vir = (~d) & mask_all
+        for bq in iter_set_bits(vir):
+            q = bq.bit_length() - 1
+            Aq = A_list[q]
+            if Aq == 0:
+                continue
+
+            d_new = d | bq
+            j = get(d_new)
+            if j is None:
+                continue
+
+            # sign = (-1)^(popcount of occupied bits below q)
+            n_left_odd = ((d & (bq - 1)).bit_count() & 1)
+            if n_left_odd:
+                phi[j] -= Aq * amp
+            else:
+                phi[j] += Aq * amp
+
+    return phi

@@ -1,7 +1,7 @@
 import numpy as np
 import scipy,itertools,plum
 from ipie.hamiltonians.generic_base import GenericBase
-from ipie.hamiltonians.sor_base import Udiag  
+from ipie.hamiltonians.sor_base import * 
 from ipie.walkers.uhf_walkers import UHFWalkers
 from ipie.walkers.ghf_walkers import GHFWalkers
 from ipie.trial_wavefunction.single_det import SingleDet 
@@ -173,23 +173,6 @@ def _conjugate_1rdm_both(U,D=None,UD=None,full=False):
     UDU[:,:,:,nb:] = np.einsum('dwpy,dyq->dwpq',UD[:,:,:,nb:],U)
     return UDU
 
-def _conjugate_h1_uhf(UD,DU,U,A,full=False):
-    ADU = np.einsum('xy,sdwyq->sdwxq',A,DU) 
-    A1 = np.einsum('sdwpx,sdwxq->sdwpq',UD,ADU)
-    A2 = np.einsum('dxp,sdwxq->sdwpq',U,ADU)
-    if full:
-        A1 = _make_full(A1[0],A1[1])
-        A2 = _make_full(A2[0],A2[1])
-    return A1,A2
-
-def _trace_h1(D,A):
-    if len(D.shape)==4:
-        return np.einsum('swxy,yx->w',D,A)
-    nb = A.shape[0]
-    tr = np.einsum('wxy,yx->w',D[:,:nb,:nb],A)
-    tr += np.einsum('wxy,yx->w',D[:,nb:,nb:],A)
-    return tr
-
 def _trace_regularize(D0):
     if len(D0.shape)==3:
         return np.einsum('wxy->w',D0**2)
@@ -215,104 +198,52 @@ def _conjugate_regularize(U,D,UD,full=True):
 
 class SumOfRotationBase(GenericBase):
 
-    def _update_gf1_uhf(self,gf,D0,UD,DU,M,A,sq=False,fac=1):
-        tr0 = _trace_h1(D0,A)
-        A1,A2 = _conjugate_h1_uhf(UD,DU,self.chol_basis,A,full=True)
+    def parse_decomposition(self):
+        self.chol_basis = np.array(self.chol_basis)
+        self.keys = [(d,i) for d,terms in enumerate(self.terms) for i in range(len(terms))]
+        self.nkeys = len(self.keys)
+        self.key_map = {key:kix for kix,key in enumerate(self.keys)} 
+
+        Lambda = self.Lambda1 + self.Lambda2
+        self.bare_gf = np.zeros(self.nkeys) 
         for d,terms in enumerate(self.terms):
             for i,term in enumerate(terms):
-                Ai1 = term.select(A1[d],(1,2))
-                Ai2 = term.select(A2[d],(1,2))
-                M1,M2 = M[d,i]
-                tr = tr0 - np.einsum('wij,wji->w',Ai1,M1)
-                tr += np.einsum('wij,wji->w',Ai2,M2)
-                if sq:
-                    tr = tr**2
-                if (d,i) not in gf:
-                    gf[d,i] = 0
-                gf[d,i] += tr*fac 
-        return gf,A1,A2
+                kix = self.key_map[d,i]
+                self.bare_gf[kix] = term.ai/Lambda
 
-    @plum.dispatch
-    def calc_bare_gf(self,walkers:UHFWalkers):
-        gf = dict()
-        for d,terms in enumerate(self.terms):
-            for i,term in enumerate(terms):
-                gf[d,i] = term.ai/self.Lambda/self.scale
-        return gf
-        # basis indexing: 
-        # \delta-basis: p,q,...
-        # ham basis: x,y,...
-        # walker basis: i,j,...
-
-        # compute (U^\delta)^\dagger C for all \delta
-        D0,D0_ovlp = _D0(walkers,ovlp=True)
-        DU = _conjugate_1rdm_right(self.chol_basis,D0) 
-        UD = DU.transpose(0,1,2,4,3)
-        UDU = _conjugate_1rdm_both(self.chol_basis,UD=UD,full=True) 
-
-        D0_ovlp = D0_ovlp.prod(axis=0)
-        M = dict()
-        ovlp = dict()
-        # compute M,detX
-        for d,terms in enumerate(self.terms):
-            for i,term in enumerate(terms):
-                M1,M2 = term.compute_M(UDU[d])
-                M[d,i] = M1,M2
-                ovlp[d,i] = term.ds.prod()/np.linalg.det(M1)
-
-        # compute H-expectation value 
-        gf = dict()
-        gf = self._update_gf1_uhf(gf,D0,UD,DU,M,self.H1)[0]
-        gf = self._update_gf_2body_uhf(gf,D0,UD,DU,M)
-        # compute det(X)(1.-H/\Lambda)/scale
-        _sum = 0.
-        for d,terms in enumerate(self.terms):
-            for i,term in enumerate(terms):
-                #gf[d,i] = ovlp[d,i]*D0_ovlp*(self.Lambda - gf[d,i])
-                _sum += gf[d,i]
-                gf[d,i] = ovlp[d,i]*D0_ovlp*(1.-gf[d,i]/self.Lambda)/self.scale
-        #print(_sum)
-        #exit()
-        return gf
-
-    def calc_trial_ovlp(self,walkers,trial):
+    def calc_trial_ovlp_ratio(self,walkers,trial,compute_R0=True,compute_R=True):
         D0 = _D0(walkers,trial)
-        #tr0 = _trace_regularize(D0)
-        #print('tr0=',tr0)
+        if self.eps_sq is None:
+            compute_R0 = False
+            compute_R = False
+
+        R0 = None 
+        if compute_R0:
+            tr0 = _trace_regularize(D0)
+            R0 = 1./np.sqrt(1.+self.eps_sq*tr0)
 
         UD = _conjugate_1rdm_left(self.chol_basis,D0) 
         UDU = _conjugate_1rdm_both(self.chol_basis,UD=UD,full=True) 
 
-        R0 = 1.
-        ovlp = dict()
-        # note tha this eloc corresponds to incoming walkers,
-        # whereas for now our SR uses outgoing walkers,
-        # so that one still recomputes self.local_energy
-        eloc = 0. 
-        if self.eps_sq is None:
+        nw = walkers.nwalkers
+        ovlp = np.zeros((self.nkeys,nw)) 
+        if not compute_R:
             for d,terms in enumerate(self.terms):
                 for i,term in enumerate(terms):
-                    ovlp[d,i] = term.compute_trial_ovlp(UDU[d])
-                    eloc += term.ai * ovlp[d,i]
-            eloc = self.Lambda - eloc
-            #print('eloc=',eloc)
-            return ovlp,R0,eloc
+                    kix = self.key_map[d,i]
+                    ovlp[kix] = term.compute_trial_ovlp(UDU[d])
+            return ovlp,R0,None
 
         M = dict()
-        # compute M,detX
         for d,terms in enumerate(self.terms):
             for i,term in enumerate(terms):
                 M1,M2 = term.compute_M(UDU[d])
                 M[d,i] = M1,M2
-                ovlp[d,i] = term.ds.prod()/np.linalg.det(M1)
-                eloc += term.ai * ovlp[d,i]
-        eloc = self.Lambda - eloc
-        #print('eloc=',eloc)
-
-        R0 = 1./np.sqrt(1.+self.eps_sq*tr0)
-        #print(f'RANK={RANK},Rmean={np.mean(self.R0)}')
+                kix = self.key_map[d,i]
+                ovlp[kix] = term.ds.prod()/np.linalg.det(M1)
 
         P1,P2,P3 = _conjugate_regularize(self.chol_basis,D0,UD)
+        R = np.ones((self.nkeys,nw))
         for d,terms in enumerate(self.terms):
             for i,term in enumerate(terms):
                 tr = tr0.copy()
@@ -335,20 +266,26 @@ class SumOfRotationBase(GenericBase):
                 P3i = term.select(P3[d],(1,2))
                 tr -= 2*np.einsum('wij,wji->w',P3i,M1)
 
-                R = 1./np.sqrt(1.+self.eps_sq*tr)
-                ovlp[d,i] *= R0/R
-        return ovlp,R0,eloc
+                kix = self.key_map[d,i]
+                R[kix] = 1./np.sqrt(1.+self.eps_sq*tr)
+        return ovlp,R0,R
 
-    def sample_from_gf(self,gf,ovlp):
-        p = np.array([gf[key]*ovlp[key] for key in self.keys]) 
-        sign = np.sign(p)
+    def calc_gf(self,walkers,trial):
+        ovlp,R0,R = self.calc_trial_ovlp_ratio(walkers,trial)
+        gf = self.bare_gf.reshape(self.nkeys,1) * ovlp
+        if R0 is None:
+            return gf
+        return gf*R0.reshape(1,walkers.nwalkers)/R
+
+    def sample_from_gf(self,gf):
+        sign = np.sign(gf)
         s = sign.flatten()
         nminus = len(s[s<-0.5])
         if nminus>0:
             print('number of minus=',nminus)
             #exit()
 
-        p = np.fabs(p)
+        p = np.fabs(gf)
         b = p.sum(axis=0)
         nwalker = b.size
         p /= b.reshape(1,nwalker)
@@ -364,117 +301,28 @@ class SumOfRotationBase(GenericBase):
     def update_workers(self,keys,walkers:UHFWalkers):
         for w,(d,i) in enumerate(keys):
             term = self.terms[d][i] 
-            #U = term.get_rotation_matrix(self.chol_basis[d])
-            #if U[0] is not None:
-            #    print('U0')
-            #    print(U[0])
-            #    walkers.phia[w] = np.dot(U[0],walkers.phia[w])
-            #if U[1] is not None:
-            #    print('U1')
-            #    print(U[1])
-            #    walkers.phib[w] = np.dot(U[1],walkers.phib[w])
             phi = [walkers.phia[w],walkers.phib[w]]
             phi = term.apply_rotation(phi,self.chol_basis[d])
             walkers.phia[w] = phi[0]
             walkers.phib[w] = phi[1]
 
-    # NOT USED
-    #def compute_eloc_from_sor(self,walkers,trial,thresh=1e-10):
-    #    C = self._pack_walkers(walkers,thresh=thresh)
-    #    UdC = np.einsum('dxp,swxi->dswpi',self.chol_basis,C)
-    #    ovlp = self.calc_trial_ovlp(trial,C,UdC,thresh=thresh)
-    #    eloc = 0
-    #    for d,terms in enumerate(self.terms):
-    #        for i,term in enumerate(terms):
-    #            eloc += term.ai*ovlp[d,i]
-    #    return self.Lambda-eloc,np.zeros(1),np.zeros(1)
-
     def local_energy(self,walkers,trial):
-        #if self.b is not None:
-        #    E = self.b*self.alpha
-        #    return self.b,0.,0.,1.
-        D = _D0(walkers,trial)
-        tr0 = _trace_regularize(D)
-        R0 = 1.
-        if self.eps_sq is not None:
-            R0 = 1./np.sqrt(1.+self.eps_sq*tr0)
-        if len(D.shape)==3:
-            nb = self.nbasis
-            Daa,Dbb,Dab,Dba = D[:,:nb,:nb],D[:,nb:,nb:],D[:,:nb,nb:],D[:,nb:,:nb]
-        else:
-            Daa,Dbb = D[0],D[1]
-            Dab = Dba = None
-        E1 = self._compute_eloc1_from_1rdm(Daa,Dbb)
-        E2 = self._compute_eloc2_from_1rdm(Daa,Dbb,Dab,Dba) 
+        ovlp,R0,_ = self.calc_trial_ovlp_ratio(walkers,trial,compute_R=False)
+
+        E1 = 0
+        E2 = 0
+        for d,terms in enumerate(self.terms):
+            for i,term in enumerate(terms):
+                kix = self.key_map[d,i]
+                if d==0:
+                    E1 += term.ai * ovlp[kix]
+                else:
+                    E2 += term.ai * ovlp[kix]
+        E1 = self.Lambda1 - E1
+        E2 = self.Lambda2 - E2
         return E1+E2,E1,E2,R0
 
-    def _compute_eloc1_from_1rdm(self,Daa,Dbb):
-        E1 = np.einsum('wxy,xy->w',Daa,self.H1)
-        E1 += np.einsum('wxy,xy->w',Dbb,self.H1)
-        return E1
-
-    @plum.dispatch
-    def _get_walker_1rdms(self,walkers:UHFWalkers):
-        C = _walkers2uhf(walkers)
-        rdm1 = dict()
-        for d,terms in enumerate(self.terms):
-            for i,term in enumerate(terms):
-                U = term.get_rotation_matrix(self.chol_basis[d])
-                D = [None] * 2 
-                for s,u in enumerate(U):
-                    if u is None:
-                        C_ = C[s].copy()
-                    else:
-                        C_ = np.einsum('xy,wyi->wxi',u,C[s]) 
-                    X = np.einsum('wxi,wxj->wij',C_,C[s]) 
-                    Xinv = np.linalg.inv(X)
-                    D[s] = np.einsum('wxi,wij->wxj',C[s],Xinv)
-                    D[s] = np.einsum('wxi,wyi->wxy',D[s],C_)
-                rdm1[d,i] = np.array(D)
-        return rdm1
-
-    def _get_bare_gf(self,walkers:UHFWalkers):
-        C = _walkers2uhf(walkers)
-        phis = dict()
-        for d,terms in enumerate(self.terms):
-            for i,term in enumerate(terms):
-                U = term.get_rotation_matrix(self.chol_basis[d])
-                C_ = C.copy() 
-                for s,u in enumerate(U):
-                    if u is not None:
-                        C_[s] = np.einsum('xy,wyi->wxi',u,C_[s]) 
-                phis[d,i] = C_,term.ai
-        gf = dict()
-        for d,terms in enumerate(self.terms):
-            for i,term in enumerate(terms):
-                gf[d,i] = 0.
-                C1,_ = phis[d,i]
-                for (g,j),(C2,coeff) in phis.items():
-                    X = np.einsum('swxi,swxj->swij',C1,C2) 
-                    det = np.linalg.det(X)
-                    gf[d,i] += (det[0]*det[1]*coeff)/self.Lambda/self.scale
-        return gf 
-
-    @plum.dispatch
-    def _get_walker_ovlp(self,walkers:UHFWalkers):
-        C = _walkers2uhf(walkers)
-        CdC = np.einsum('swxi,swxj->swij',C,C)
-        #detCdC = np.linalg.det(CdC)
-        ovlp = dict() 
-        for d,terms in enumerate(self.terms):
-            for i,term in enumerate(terms):
-                U = term.get_rotation_matrix(self.chol_basis[d])
-                det = 1.
-                for s,u in enumerate(U):
-                    if u is None:
-                        continue
-                    C_ = np.einsum('xy,wyi->wxi',u,C[s]) 
-                    CdC = np.einsum('wxi,wxj->wij',C[s],C_)
-                    det *= np.linalg.det(CdC)#/detCdC[s] 
-                ovlp[d,i] = det
-        return ovlp
-
-    def _get_trial_ovlp(self,walkers,trial):
+    def _get_trial_ovlp_ratio(self,walkers,trial):
         C = _walkers2ghf(walkers)
         B = _trial2ghf(trial)
         BdC = np.einsum('xi,wxj->wij',B,C)
@@ -486,9 +334,10 @@ class SumOfRotationBase(GenericBase):
         R0 = 1./np.sqrt(1.+self.eps_sq*tr)
 
         detBdC = np.linalg.det(BdC)
-        ovlp = dict() 
+        nw = walkers.nwalkers
         nb = trial.nbasis 
-        eloc = 0
+        ovlp = np.zeros((self.nkeys,nw)) 
+        R = np.ones((self.nkeys,nw))
         for d,terms in enumerate(self.terms):
             for i,term in enumerate(terms):
                 U = term.get_rotation_matrix(self.chol_basis[d])
@@ -499,16 +348,15 @@ class SumOfRotationBase(GenericBase):
                     Ufull[nb:,nb:] = U[1]
                 C_ = np.einsum('xy,wyi->wxi',Ufull,C) 
                 BdC = np.einsum('xi,wxj->wij',B,C_)
-                ovlp[d,i] = np.linalg.det(BdC)/detBdC 
-                eloc += term.ai*ovlp[d,i]
+                kix = self.key_map[d,i]
+                ovlp[kix] = np.linalg.det(BdC)/detBdC 
 
                 BdCinv = np.linalg.inv(BdC)
                 D = np.einsum('wxi,wij->wxj',C_,BdCinv)
                 D = np.einsum('wxi,yi->wxy',D,B)
                 tr = np.einsum('wxy->w',D**2)
-                R = 1./np.sqrt(1.+self.eps_sq*tr)
-                ovlp[d,i] *= R0/R
-        return ovlp,R0,self.Lambda-eloc
+                R[kix] = 1./np.sqrt(1.+self.eps_sq*tr)
+        return ovlp,R0,R
 
     def _get_MB_gf(self,basis):
         H = 0
@@ -528,77 +376,46 @@ class SumOfRotationBase(GenericBase):
         return H
 
 class SumOfRotationGeneric(SumOfRotationBase):
-    def get_decomposition(self,h1e,eri,thresh=1e-6,cmax=None):
-        if cmax is None:
-            thresh = 1e-6 
-            s,chol = np.linalg.eigh(eri.reshape((self.nbasis**2,)*2)) 
-            s = s[s>thresh]
-            chol = chol[:,-len(s):].T
-        else:
-            s = None
-        nchol = chol.shape[0]
-        chol = chol.reshape(nchol,self.nbasis,self.nbasis)
-        self.chol_eigvecs = []
 
-        chols = [h1e] + list(chol)
-        for Li,ci in zip(chols,coeffs):
-            if np.fabs(ci)<thresh:
-                continue
-            assert np.linalg.norm(Li.imag)<thresh
-            assert np.linalg.norm(Li-Li.T)<thresh
-            ei,vi = np.linalg.eigh(Li) 
-            print(ei)
-            self.chol_eigvecs.append(vi)
-            self.chol_eigvals.append(ei)
-            self.chol_coeffs.append(ci)
+    def decompose_h2(self,eri,thresh=1e-6,cmax=None):
+        return
+    #    if cmax is None:
+    #        thresh = 1e-6 
+    #        s,chol = np.linalg.eigh(eri.reshape((self.nbasis**2,)*2)) 
+    #        s = s[s>thresh]
+    #        chol = chol[:,-len(s):].T
+    #    else:
+    #        s = None
+    #    nchol = chol.shape[0]
+    #    chol = chol.reshape(nchol,self.nbasis,self.nbasis)
+    #    self.chol_eigvecs = []
 
-    def _update_gf2(self,gf,Aconj1,typ1,Aconj2,typ2,fac=1):
-        for d,terms in enumerate(self.terms):
-            for i,term in enumerate(terms):
-                tr = term._trace2(Aconj1[d],typ1,Aconj2[d],typ2)
-                gf[d,i] += tr*fac
-        return gf
-
-    def _update_gf_2body_uhf(self,gf,C,UdC):
-        # cholesky 
-        for chol in self.chol:
-            gf,AC,Aconj1,Aconj2 = self._update_gf1(gf,chol,C,UdC,sq=True)
-
-            AD0A = np.einsum('swxi,swyi->swxy',AC,AC) 
-            gf = self._update_gf1(gf,AD0A,C,UdC,fac=2)[0]
-
-            AD0AC = np.einsum('swxy,swyi->swxi',AD0A,self.C) 
-            tr = np.einsum('swxi,swxi->w',self.C,AD0A) 
-            for (d,i) in gf:
-                gf[d,i] -= tr
-            AD0A = AD0AC = None
-            
-            gf = self._update_gf2(gf,Aconj1,0,Aconj1,0)
-            gf = self._update_gf2(gf,Aconj2,1,Aconj2,1)
-            gf = self._update_gf2(gf,Aconj2,0,Aconj1,1,fac=-2)
-        return gf
-
-    def _compute_eloc2_from_1rdm(self,D):
-        raise NotImplementedError
+    #    chols = [h1e] + list(chol)
+    #    for Li,ci in zip(chols,coeffs):
+    #        if np.fabs(ci)<thresh:
+    #            continue
+    #        assert np.linalg.norm(Li.imag)<thresh
+    #        assert np.linalg.norm(Li-Li.T)<thresh
+    #        ei,vi = np.linalg.eigh(Li) 
+    #        print(ei)
+    #        self.chol_eigvecs.append(vi)
+    #        self.chol_eigvals.append(ei)
+    #        self.chol_coeffs.append(ci)
 
 class SumOfRotationOnsite(SumOfRotationBase):
-    def __init__(self,h1e,U,eps_sq=None,scale=1.):
+    def __init__(self,h1e,U,eps_sq=None):
         super().__init__(h1e)
         self.U = U
         self.eps_sq = eps_sq
-        self.scale = scale
 
-        self.b = None
-        self.eloc = None
-
-    def get_decomposition(self,at,gu,thresh=1e-6,iprint=0,nelec=None):
         self.chol_basis = []
         self.terms = []
-        self.Lambda = 0.
+    def decompose_h1(self,at,thresh=1e-6,iprint=0):
+        # hopping
+        self.Lambda1 = 0.
         if RANK>0:
             iprint = 0
 
-        # hopping
         eks,vk = np.linalg.eigh(self.H1) 
         self.chol_basis.append(vk)
         terms = []
@@ -610,74 +427,33 @@ class SumOfRotationOnsite(SumOfRotationBase):
             if gk<0:
                 raise ValueError
             gk = np.log(gk)
-            self.Lambda += 2*ak
+            self.Lambda1 += 2*ak
             if iprint>0:
                 print(f'band={k},ek={ek},gk={gk}')
             terms.append(Udiag(ak,(k,),(gk,)))
             terms.append(Udiag(ak,(k+self.nbasis,),(gk,)))
         self.terms.append(terms)
-
+        return eks
+    def decompose_h2(self,gu,iprint=0,nelec=None):
         # onsite interaction
+        self.Lambda2 = 0.
+        if RANK>0:
+            iprint = 0
+
         self.chol_basis.append(np.eye(self.nbasis))
         terms = []
         ai = self.U/(np.cosh(gu)-1)/4
         if iprint>0:
             print('a_U=',ai)
-        self.Lambda += 2*ai*self.nbasis
+        self.Lambda2 += 2*ai*self.nbasis
         if nelec is not None:
-            self.Lambda += self.U*sum(nelec)/2 
-            if RANK==0:
-                eks = np.sort(eks)
-                Emax = eks[:nelec[0]].sum()+eks[:nelec[1]].sum()
-                Emax += self.U * min(nelec)
-                print('Emax upper bound=',Emax)
-                Emax = max(eks)*sum(nelec)
-                Emax += self.U * min(nelec)
-                print('Emax upper bound=',Emax)
+            self.Lambda2 += self.U*sum(nelec)/2 
         for i in range(self.nbasis): 
             terms.append(Udiag(ai,(i,i+self.nbasis,),(gu,-gu,)))
             terms.append(Udiag(ai,(i,i+self.nbasis,),(-gu,gu,)))
         self.terms.append(terms)
 
-        self.chol_basis = np.array(self.chol_basis)
-        self.keys = [(d,i) for d,terms in enumerate(self.terms) for i in range(len(terms))]
-        self.nkeys = len(self.keys)
-
-    def _update_gf_2body_uhf(self,gf,D0,UD,DU,M):
-        D0_diag = np.diagonal(D0,axis1=2,axis2=3)
-        UD = _make_full(UD[0],UD[1])
-        DU = _make_full(DU[0],DU[1])
-        nb = self.nbasis
-        for d,terms in enumerate(self.terms):
-            U = np.zeros((nb*2,)*2)
-            U[:nb,:nb] = self.chol_basis[d]
-            U[nb:,nb:] = self.chol_basis[d]
-            for i,term in enumerate(terms):
-                UDi = term.select(UD[d],(1,))
-                DUi = term.select(DU[d],(2,))
-                M1,M2 = M[d,i]
-                D1 = np.einsum('wxi,wij->wxj',DUi,M1)
-                D1 = np.einsum('wxj,wjx->wx',D1,UDi)
-
-                Ui = term.select(U,(1,))
-                D2 = np.einsum('wxi,wij->wxj',DUi,M2)
-                D2 = np.einsum('wxi,xi->wx',D2,Ui)
-                Da = D0_diag[0]-D1[:,:nb]+D2[:,:nb]
-                Db = D0_diag[1]-D1[:,nb:]+D2[:,nb:]
-                gf[d,i] += self.U*(Da*Db).sum(axis=1)
-        return gf
-
-    def _compute_eloc2_from_1rdm(self,Daa,Dbb,Dab=None,Dba=None):
-        E2 = self.U*np.einsum('wii,wii->w',Daa,Dbb)
-        if Dab is None:
-            return E2
-        if Dba is None:
-            return E2
-        E2 -= self.U*np.einsum('wii,wii->w',Dab,Dba)
-        return E2
-
     def _get_MB_hamiltonian(self,nelecs,thresh=1e-6):
-        from ipie.hamiltonians.bitstring_utils import get_all_configs_u11,string_act,count_double_occupancy
         basis = get_all_configs_u11((self.nbasis,self.nbasis),nelecs)
         basis_map = {cf:i for i,cf in enumerate(basis)}
 
@@ -695,23 +471,52 @@ class SumOfRotationOnsite(SumOfRotationBase):
             H[ix1,ix1] += self.U*count_double_occupancy(cf1,self.nbasis)
         return H,basis
 
-#from ipie.hamiltonians.bitstring_utils import string_act,count_double_occupancy
-#class Hubbard:
-#    def __init__(self,h1e,U,eps_sq=None):
-#        self.eps_sq = eps_sq
-#        self.U = U
-#        self.scale = 1.
-#        self.b = None
-#        self.nbasis = h1e.shape[0]
-#        self.hops = []        
-#        for i in range(self.nbasis):
-#            for j in range(i+1,self.nbasis):
-#                if np.fabs(h1e[i,j])>1e-6:
-#                    self.hops.append((i,j))
-#    def calc_bare_gf(self,walkers):
-#        for cf in walkers.configs:
-#            for (i,j) in self.hops:
-#                for s in (0,1):
-#                    ops = (2*i+s,'cre'),(2*j+s,'des')
-#                    y,sgn = string_act(cf,ops)
-#
+# some helper fxns
+def get_bcs_state(h1e,hbcs,thresh=1e-10):
+    nsite = h1e.shape[0]
+
+    hbdg = np.zeros((nsite*4,)*2)
+    hbdg[:nsite,:nsite] = h1e.copy()
+    hbdg[nsite:2*nsite,nsite:2*nsite] = h1e.copy()
+    hbdg[2*nsite:3*nsite,2*nsite:3*nsite] = -h1e.T
+    hbdg[3*nsite:,3*nsite:] = -h1e.T
+    hbdg[:2*nsite,2*nsite:] = hbcs.copy()
+    hbdg[2*nsite:,:2*nsite] = -hbcs
+
+    w,v = np.linalg.eigh(hbdg)
+    if RANK==0:
+        print('bcs energy levels=',w)
+    
+    U,V = v[:2*nsite,2*nsite:],v[2*nsite:,2*nsite:]
+    rho = np.dot(V,V.T)
+    n,W = np.linalg.eigh(rho)
+    if RANK==0:
+        print('occupation=',n)
+    nocc = len(n[n>1.-thresh])
+    nvir = len(n[n<thresh])
+    npair = 2*nsite-nocc-nvir
+    assert npair%2==0
+    if RANK==0:
+        print('number of occupied,pair,virtual=',nocc,npair,nvir)
+    A,B = W[:,nvir:nvir+npair],W[:,nvir+npair:]
+    assert A.shape[1]==npair
+    assert B.shape[1]==nocc
+    n = n[nvir:nvir+npair]
+    u = np.sqrt(1.-n)
+    v = np.sqrt(n)
+    if RANK==0:
+        print('u=',u)
+        print('v=',v)
+
+    U = A*u.reshape(1,npair)
+    V = np.zeros((npair,)*2)
+    for k in range(npair//2):
+        V[2*k,2*k+1] = v[2*k]
+        V[2*k+1,2*k] = -v[2*k]
+    V = np.dot(A,V)
+    Z = np.linalg.inv(np.dot(U.T,V.conj()))
+    Z = np.dot(V.conj(),np.dot(Z,V.T.conj()))
+    if RANK==0:
+        print('Z symmetry=',np.linalg.norm(Z+Z.T))
+        print('Z norm=',np.linalg.norm(Z))
+    return Z,A,B,u,v 

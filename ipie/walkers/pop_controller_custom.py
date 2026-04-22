@@ -22,6 +22,7 @@ class PopController(PopController_):
         global_max = xp.amax(walkers.weight) 
         global_max = comm.reduce(global_max, op=MPI.MAX, root=0)
         global_max = comm.bcast(global_max, root=0)
+        #global_max = 0.
 
         walkers.weight = xp.exp(walkers.weight-global_max)
         walkers.unscaled_weight = walkers.weight
@@ -30,7 +31,7 @@ class PopController(PopController_):
             average_weight = walkers.weight[0]
             walkers.weight = 0. 
             average_weight = xp.log(average_weight)
-            print('global_max,log_ave',global_max,average_weight)
+            #print('global_max,log_ave',global_max,average_weight)
             return average_weight + global_max
         else:
             raise NotImplementedError

@@ -34,16 +34,14 @@ class EnergyEstimator(EnergyEstimator_):
     def compute_estimator(self, system=None, walkers=None, hamiltonian=None, trial=None):
         # Need to be able to dispatch here
         Etot,E1,E2,R0 = hamiltonian.local_energy(walkers,trial)
-        # walker weights becomes 1 after sr
-        assert xp.linalg.norm(walkers.weight)/xp.sqrt(walkers.nwalkers)<1e-6
+        weight = xp.exp(walkers.weight) * walkers.sgn_ovlp
+        if R0 is not None:
+            weight *= R0 
 
-        weight = walkers.sgn_ovlp * R0 
         self._data["ENumer"] = xp.sum(weight * Etot)
         self._data["EDenom"] = xp.sum(weight)
         self._data["E1Body"] = xp.sum(weight * E1)
         self._data["E2Body"] = xp.sum(weight * E2)
-        #print('R0,sign=',R0,walkers.sgn_ovlp)
-        #print('Eloc=',xp.sum(weight * Etot)/xp.sum(weight))
         return self.data
     def process_sr_data(self,data,dirname='.'):
         for key in self._sr_data: 

@@ -34,13 +34,12 @@ class PhaselessLin(PhaselessBase):
         # 1.compute dressed gf
         synchronize()
         start_time = time.time()
-        gf = hamiltonian.calc_bare_gf(walkers) 
-        ovlp = hamiltonian.calc_trial_ovlp(walkers,trial)[0]
+        gf = hamiltonian.calc_gf(walkers,trial)
         synchronize()
         self.timer.tgf += time.time() - start_time
 
         # 2.update walker
-        keys,b = hamiltonian.sample_from_gf(gf,ovlp)
+        keys,b = hamiltonian.sample_from_gf(gf)
         start_time = time.time()
         hamiltonian.update_workers(keys,walkers)
         synchronize()

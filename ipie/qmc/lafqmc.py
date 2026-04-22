@@ -330,10 +330,10 @@ class LAFQMC(AFQMC):
         if additional_estimators is not None:
             for k, v in additional_estimators.items():
                 self.estimators[k] = v
-        # TODO: Move this to estimator and log uuid etc in serialization
-        json.encoder.FLOAT_REPR = lambda o: format(o, ".6f")
-        json_string = to_json(self)
-        self.estimators.json_string = json_string
+        ## TODO: Move this to estimator and log uuid etc in serialization
+        #json.encoder.FLOAT_REPR = lambda o: format(o, ".6f")
+        #json_string = to_json(self)
+        #self.estimators.json_string = json_string
 
         self.estimators.initialize(comm)
         # Calculate estimates for initial distribution of walkers.
@@ -341,6 +341,24 @@ class LAFQMC(AFQMC):
         self.accumulators.update(self.walkers)
         self.estimators.print_block(comm, 0, self.accumulators)
         self.accumulators.zero()
+
+
+    def post_pop_ctr(self,comm,log_average_weight):
+        if self.params.pop_control_method!='stochastic_reconfiguration':
+            return
+        self.estimators.compute_estimators(
+            self.system, self.hamiltonian, self.trial, self.walkers
+        )
+        self.estimators.post_sr(comm,self.accumulators,log_average_weight)
+
+    def estimate_energy(self,comm,block,max_nprod,max_nsum):
+        if self.params.pop_control_method=='stochastic_reconfiguration':
+            self.estimators.print_block_sr(comm,block,self.accumulators,max_nprod,max_nsum)
+        else:
+            self.estimators.compute_estimators(
+                self.system, self.hamiltonian, self.trial, self.walkers
+            )
+            self.estimators.print_block(comm, block, self.accumulators)
 
     def run(
         self,
@@ -367,7 +385,7 @@ class LAFQMC(AFQMC):
         tzero_setup = time.time()
         if walkers is not None:
             self.walkers = walkers
-        self.walkers.weight = xp.zeros_like(self.walkers.weight) # use log(weight)
+        self.walkers.weight = xp.log(self.walkers.weight) # use log(weight)
         self.setup_timers()
         eshift = 0.0
         self.walkers.orthogonalise()
@@ -448,22 +466,22 @@ class LAFQMC(AFQMC):
                 self.tprop_vhs = self.propagator.timer.tvhs
                 self.tprop_gemm = self.propagator.timer.tgemm
 
-            #start_clip = time.time()
-            #if step > 1 and step <= num_eqlb_steps:
-            #    wbound = self.pcontrol_eq.total_weight * 0.10
-            #    xp.nan_to_num(self.walkers.weight, copy=False)
-            #    xp.clip(
-            #        self.walkers.weight, a_min=-wbound, a_max=wbound, out=self.walkers.weight
-            #    )  # in-place clipping
-            #elif step > num_eqlb_steps and step > 1:
-            #    wbound = self.pcontrol.total_weight * 0.10
-            #    xp.nan_to_num(self.walkers.weight, copy=False)
-            #    xp.clip(
-            #        self.walkers.weight, a_min=-wbound, a_max=wbound, out=self.walkers.weight
-            #    )  # in-place clipping
+            start_clip = time.time()
+            if step > 1 and step <= num_eqlb_steps:
+                wbound = self.pcontrol_eq.total_weight * 0.10
+                xp.nan_to_num(self.walkers.weight, copy=False)
+                xp.clip(
+                    self.walkers.weight, a_min=-wbound, a_max=wbound, out=self.walkers.weight
+                )  # in-place clipping
+            elif step > num_eqlb_steps and step > 1:
+                wbound = self.pcontrol.total_weight * 0.10
+                xp.nan_to_num(self.walkers.weight, copy=False)
+                xp.clip(
+                    self.walkers.weight, a_min=-wbound, a_max=wbound, out=self.walkers.weight
+                )  # in-place clipping
 
-            #synchronize()
-            #self.tprop_clip += time.time() - start_clip
+            synchronize()
+            self.tprop_clip += time.time() - start_clip
 
             start_barrier = time.time()
             if step % self.params.pop_control_freq == 0:
@@ -481,10 +499,6 @@ class LAFQMC(AFQMC):
                     self.tpopc_recv = self.pcontrol_eq.timer.recv_time
                     self.tpopc_comm = self.pcontrol_eq.timer.communication_time
                     self.tpopc_non_comm = self.pcontrol_eq.timer.non_communication_time
-                    self.estimators.compute_estimators(
-                        self.system, self.hamiltonian, self.trial, self.walkers
-                    )
-                    self.estimators.post_sr(comm,self.accumulators,log_average_weight)
             else:
                 if step % self.params.pop_control_freq == 0:
                     start = time.time()
@@ -495,40 +509,32 @@ class LAFQMC(AFQMC):
                     self.tpopc_recv = self.pcontrol.timer.recv_time
                     self.tpopc_comm = self.pcontrol.timer.communication_time
                     self.tpopc_non_comm = self.pcontrol.timer.non_communication_time
-                    self.estimators.compute_estimators(
-                        self.system, self.hamiltonian, self.trial, self.walkers
-                    )
-                    self.estimators.post_sr(comm,self.accumulators,log_average_weight)
 
-            ## accumulate weight, hybrid energy etc. across block
-            #start = time.time()
-            #self.accumulators.update(self.walkers)
-            #synchronize()
-            #self.testim += time.time() - start  # we dump this time into estimator
+            # accumulate weight, hybrid energy etc. across block
+            start = time.time()
+            self.accumulators.update(self.walkers)
+            synchronize()
+            self.testim += time.time() - start  # we dump this time into estimator
+
+            # post poppulation control accumulation
+            if step <= num_eqlb_steps:
+                if step % self.params.eq_pop_control_freq == 0:
+                    self.post_pop_ctr(comm,log_average_weight)
+            else:
+                if step % self.params.pop_control_freq == 0:
+                    self.post_pop_ctr(comm,log_average_weight)
 
             # calculate estimators
             start = time.time()
             if step > num_eqlb_steps:
                 if step % self.params.num_steps_per_block == 0:
-                    #self.estimators.compute_estimators(
-                    #    self.system, self.hamiltonian, self.trial, self.walkers
-                    #)
-                    self.estimators.print_block_sr(
-                        comm,
-                        (step - num_eqlb_steps) // self.params.num_steps_per_block,
-                        self.accumulators,
-                        max_nprod,
-                        max_nsum
-                    )
+                    block = (step - num_eqlb_steps) // self.params.num_steps_per_block
+                    self.estimate_energy(comm,block,max_nprod,max_nsum)
                     self.accumulators.zero()
             else:
                 if step % self.params.eq_num_steps_per_block == 0:
-                    #self.estimators.compute_estimators(
-                    #    self.system, self.hamiltonian, self.trial, self.walkers
-                    #)
-                    self.estimators.print_block_sr(
-                        comm, step // self.params.eq_num_steps_per_block, self.accumulators,max_nprod,max_nsum
-                    )
+                    block = step // self.params.eq_num_steps_per_block
+                    self.estimate_energy(comm,block,max_nprod,max_nsum)
                     self.accumulators.zero()
             synchronize()
             self.testim += time.time() - start

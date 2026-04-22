@@ -129,7 +129,7 @@ class EstimatorHandler(EstimatorHandler_):
         nprod = min(max_nprod,ntot)
         nsum = min(ntot-nprod+1,max_nsum)
         shift = ntot - nsum 
-        print(f'ntot={ntot},nprod={nprod},nsum={nsum},shift={shift}')
+        #print(f'ntot={ntot},nprod={nprod},nsum={nsum},shift={shift}')
         weight = numpy.zeros(nsum)
         for i in range(nsum):
             stop = i+shift+1
