@@ -5,7 +5,7 @@ from ipie.hamiltonians.kpt_isdf_hamiltonian import KptISDF
 from ipie.hamiltonians.generic_chunked import GenericRealCholChunked
 from ipie.hamiltonians.chunked_isdf import GenericRealISDFChunked
 from ipie.hamiltonians.kpt_chunked import KptComplexCholChunked
-from ipie.hamiltonians.sor_generic import SumOfRotationOnsite
+from ipie.hamiltonians.sor_hf_trial import SORHFTrial
 from ipie.propagation.phaseless_generic import (
     PhaselessGeneric,
     PhaselessGenericChunked,
@@ -32,5 +32,5 @@ Propagator = {
     KptComplexCholSymm: PhaselessKptChol,
     KptComplexCholChunked: PhaselessKptCholChunked,
     KptISDF: PhaselessKptISDF,
-    SumOfRotationOnsite:PhaselessLin,
+    SORHFTrial:PhaselessLin,
 }

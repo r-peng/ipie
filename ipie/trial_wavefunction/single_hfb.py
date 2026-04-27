@@ -18,13 +18,14 @@ from ipie.propagation.overlap import calc_overlap_single_det_ghf
 from ipie.propagation.force_bias import construct_force_bias_batch_single_det
 
 
-class SingleBCS(TrialWavefunctionBase):
+class SingleHFB(TrialWavefunctionBase):
     # `num_basis`is # of spin-less AOs.
     @plum.dispatch
     def __init__(
         self,
         occupied: numpy.ndarray,
         pairing: numpy.ndarray,
+        nocc: int,
         num_basis: int,
         verbose: bool = False,
     ):
@@ -34,7 +35,22 @@ class SingleBCS(TrialWavefunctionBase):
         super().__init__(None, (None,None), num_basis, verbose=verbose)
         if verbose:
             print("# Parsing input options for trial_wavefunction.SingleDetGHF.")
-        self.psi = occupied
-        self.pairing = pairing
+        self.psi0 = (occupied,pairing)
+        self.nocc = nocc
         self._num_dets = 1
         self._max_num_dets = 1
+
+    def build(self) -> None:
+        pass
+
+    def calc_force_bias(self,hamiltonian,walkers,mpi_handler=None):
+        pass
+
+    def calc_greens_function(self, walkers, build_full: bool = False):
+        pass
+
+    def calc_overlap(self, walkers):
+        pass
+
+    def half_rotate(self, hamiltonian, comm):
+        pass

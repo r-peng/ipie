@@ -1,6 +1,10 @@
 import numpy as np
 import scipy,itertools
 from ipie.hamiltonians.bitstring_utils import * 
+from ipie.hamiltonians.generic_base import GenericBase
+from mpi4py import MPI
+COMM = MPI.COMM_WORLD
+RANK = COMM.Get_rank()
 def quadratic2MB(M,basis,spin,thresh=1e-6):
     if len(M.shape)==1:
         M = np.diag(M)
@@ -52,6 +56,27 @@ def det2MB(B,basis=None,basis_map=None,order=1):
     for k in ks:
         psi = apply_cre(k,psi,B)
     return psi,basis,basis_map
+def hubbard2MB(h1e,U,nelecs,basis=None,basis_map=None,thresh=1e-6):
+    nsite = h1e.shape[0]
+    if basis is None:
+        basis = get_all_configs_u11((nsite,nsite),nelecs)
+    if basis_map is None:
+        basis_map = {cf:i for i,cf in enumerate(basis)}
+
+    H = np.zeros((len(basis),)*2)
+    for ix1,cf1 in enumerate(basis):
+        for i,j in itertools.product(range(nsite),repeat=2):
+            if np.fabs(h1e[i,j])<thresh:
+                continue
+            for s in (0,1):
+                ops = (2*i+s,'cre'),(2*j+s,'des') 
+                cf2,sign = string_act(cf1,ops)
+                if cf2 is not None:
+                    ix2 = basis_map[cf2]
+                    H[ix2,ix1] += h1e[i,j]*sign
+        H[ix1,ix1] += U*count_double_occupancy(cf1,nsite)
+    return H,basis,basis_map
+
 class Udiag:
     def __init__(self,ai,ps,gs):
         self.ai = ai
@@ -63,22 +88,6 @@ class Udiag:
         for ax in axes:
             D = np.take(D,self.ps,axis=ax)
         return D
-    def compute_trial_ovlp(self,D):
-        Dj = self.select(D,(1,2))
-        M = Dj+np.diag(1./self.ds).reshape(1,self.ns,self.ns)
-        det = np.linalg.det(M)
-        det *= self.ds.prod()
-        return det
-    def compute_M(self,D):
-        # input matrix dim: walker,p,q
-        Dj = self.select(D,(1,2))
-        M1 = Dj+np.diag(1./self.ds).reshape(1,self.ns,self.ns)
-        M1 = np.linalg.inv(M1)
-
-        M2 = np.einsum('wij,wjk->wik',M1,Dj)
-        M2 = np.eye(self.ns).reshape(1,self.ns,self.ns) - M2
-        M2 = M2*self.ds.reshape(1,1,self.ns)
-        return M1,M2
     def get_MB_kappa(self,v,basis):
         nsite = v.shape[0]
         kappa = [None] * 2
@@ -110,4 +119,131 @@ class Udiag:
             vec = np.take(v,ps,axis=1)
             phi[s] += d*np.outer(vec,np.dot(vec,phi0[s]))
         return phi
+
+class SumOfRotationBase(GenericBase):
+
+    def __init__(self,h1e,U,eps_sq=None):
+        super().__init__(h1e)
+        self.U = U 
+        self.eps_sq = eps_sq
+
+        self.chol_basis = []
+        self.terms = []
+
+    def decompose_h1(self,at,thresh=1e-6,iprint=0):
+        # hopping
+        self.Lambda1 = 0.
+        if RANK>0:
+            iprint = 0
+
+        eks,vk = np.linalg.eigh(self.H1) 
+        self.chol_basis.append(vk)
+        terms = []
+        for k,ek in enumerate(eks):
+            if np.fabs(ek)<thresh:
+                continue
+            ak = at
+            gk = 1.-ek/ak
+            if gk<0:
+                raise ValueError
+            gk = np.log(gk)
+            self.Lambda1 += 2*ak
+            if iprint>0:
+                print(f'band={k},ek={ek},gk={gk}')
+            terms.append(Udiag(ak,(k,),(gk,)))
+            terms.append(Udiag(ak,(k+self.nbasis,),(gk,)))
+        self.terms.append(terms)
+        return eks
+
+    def decompose_h2(self,gu,iprint=0,nelec=None):
+        # onsite interaction
+        self.Lambda2 = 0.
+        if RANK>0:
+            iprint = 0
+
+        self.chol_basis.append(np.eye(self.nbasis))
+        terms = []
+        ai = self.U/(np.cosh(gu)-1)/4
+        if iprint>0:
+            print('a_U=',ai)
+        self.Lambda2 += 2*ai*self.nbasis
+        if nelec is not None:
+            self.Lambda2 += self.U*sum(nelec)/2 
+        for i in range(self.nbasis): 
+            terms.append(Udiag(ai,(i,i+self.nbasis,),(gu,-gu,)))
+            terms.append(Udiag(ai,(i,i+self.nbasis,),(-gu,gu,)))
+        self.terms.append(terms)
+
+    def parse_decomposition(self):
+        self.chol_basis = np.array(self.chol_basis)
+        self.keys = [(d,i) for d,terms in enumerate(self.terms) for i in range(len(terms))]
+        self.nkeys = len(self.keys)
+        self.key_map = {key:kix for kix,key in enumerate(self.keys)} 
+
+        Lambda = self.Lambda1 + self.Lambda2
+        self.bare_gf = np.zeros(self.nkeys) 
+        for d,terms in enumerate(self.terms):
+            for i,term in enumerate(terms):
+                kix = self.key_map[d,i]
+                self.bare_gf[kix] = term.ai/Lambda
+
+    def calc_gf(self,walkers,trial):
+        ovlp,R0,R = self.calc_trial_ovlp_ratio(walkers,trial)
+        gf = self.bare_gf.reshape(self.nkeys,1) * ovlp
+        if R0 is None:
+            return gf
+        return gf*R0.reshape(1,walkers.nwalkers)/R
+
+    def sample_from_gf(self,gf):
+        sign = np.sign(gf)
+        s = sign.flatten()
+        nminus = len(s[s<-0.5])
+        if nminus>0:
+            print('number of minus=',nminus)
+            #exit()
+
+        p = np.fabs(gf)
+        b = p.sum(axis=0)
+        nwalker = b.size
+        p /= b.reshape(1,nwalker)
+        keys = [None] * nwalker
+        for w in range(nwalker):
+            kix = np.random.choice(self.nkeys,p=p[:,w])
+            keys[w] = self.keys[kix]
+            b[w] *= sign[kix,w] 
+        self.b = b
+        return keys,b
+    
+    def local_energy(self,walkers,trial):
+        ovlp,R0,_ = self.calc_trial_ovlp_ratio(walkers,trial,compute_R=False)
+
+        E1 = 0
+        E2 = 0
+        for d,terms in enumerate(self.terms):
+            for i,term in enumerate(terms):
+                kix = self.key_map[d,i]
+                if d==0:
+                    E1 += term.ai * ovlp[kix]
+                else:
+                    E2 += term.ai * ovlp[kix]
+        E1 = self.Lambda1 - E1
+        E2 = self.Lambda2 - E2
+        return E1+E2,E1,E2,R0
+
+    def _get_MB_gf(self,basis):
+        H = 0
+        for vi,terms in zip(self.chol_basis,self.terms): 
+            for term in terms:
+                kappa = term.get_MB_kappa(vi,basis)
+                U = None
+                for spin,k in enumerate(kappa):
+                    if k is None:
+                        continue
+                    Us = scipy.linalg.expm(k)
+                    if U is None:
+                        U = Us
+                    else:
+                        U = np.dot(U,Us)
+                H += term.ai*U
+        return H
 
