@@ -565,7 +565,69 @@ def apply_c_dag_to_state(
         phi[j] += sgn * psi[i]
 
     return phi
-def iter_set_bits(x: int):
+def apply_c_to_state(
+    psi: np.ndarray,
+    dets: Sequence[int],
+    p: int,
+    det_to_index: Optional[Dict[int, int]] = None,
+) -> np.ndarray:
+    """
+    Compute phi = c_p |psi> in the same basis 'dets'.
+
+    Convention:
+      - det is a Python int bitstring; bit q=1 means occupied.
+      - fermionic sign for c_p is (-1)^(N_{<p}) where N_{<p} counts occupied
+        orbitals with index < p in the CURRENT determinant.
+
+    If the resulting determinant is not in 'dets', the contribution is skipped.
+
+    Args:
+      psi: shape (dim,) complex/float
+      dets: length dim list/array of determinants (Python ints recommended)
+      p: orbital index
+      det_to_index: optional dict mapping det->index; if None, built internally
+
+    Returns:
+      phi: shape (dim,) same dtype as psi
+    """
+    psi = np.asarray(psi)
+    dim = len(dets)
+    if psi.shape[0] != dim:
+        raise ValueError("psi and dets must have the same length")
+
+    p = int(p)
+    bitp = 1 << p
+    left_mask = bitp - 1
+
+    if det_to_index is None:
+        det_to_index = {int(d): i for i, d in enumerate(dets)}
+
+    phi = np.zeros_like(psi)
+    get = det_to_index.get  # local binding for speed
+
+    for i, d in enumerate(dets):
+        d = int(d)
+        amp = psi[i]
+        if amp == 0:
+            continue
+
+        # if p unoccupied -> annihilation gives zero
+        if (d & bitp) == 0:
+            continue
+
+        d_new = d & ~bitp
+        j = get(d_new)
+        if j is None:
+            continue
+
+        n_left = (d & left_mask).bit_count()
+        if n_left & 1:
+            phi[j] -= amp
+        else:
+            phi[j] += amp
+
+    return phi
+def _iter_set_bits_new(x: int):
     while x:
         lsb = x & -x
         yield lsb
@@ -604,7 +666,7 @@ def apply_a_dag_dense_sign(
         d = int(d) & mask_all
 
         vir = (~d) & mask_all
-        for bq in iter_set_bits(vir):
+        for bq in _iter_set_bits_new(vir):
             q = bq.bit_length() - 1
             Aq = A_list[q]
             if Aq == 0:
