@@ -41,14 +41,14 @@ def trial2ghf(trial:SingleDetGHF):
     return trial.psi0.real
 
 def make_full(Daa,Dbb,Dab=None,Dba=None):
-    nw,n1,n2 = Daa.shape 
-    D = np.zeros((nw,n1*2,n2*2))
-    D[:,:n1,:n2] = Daa
-    D[:,n1:,n2:] = Dbb
+    nchol,nw,n1,n2 = Daa.shape 
+    D = np.zeros((nchol,nw,n1*2,n2*2))
+    D[:,:,:n1,:n2] = Daa
+    D[:,:,n1:,n2:] = Dbb
     if Dab is not None:
-        D[:,:n1,n2:] = Dab
+        D[:,:,:n1,n2:] = Dab
     if Dba is not None:
-        D[:,n1:,:n2] = Dba
+        D[:,:,n1:,:n2] = Dba
     return D
 
 @plum.dispatch
@@ -130,29 +130,55 @@ def _D0(walkers:GHFWalkers,trial:SingleDetGHF,ovlp=False):
 
 def conjugate_chol_left(U,D,full=False):
     if len(D.shape)==4:
-        UD = np.einsum('xp,swxy->swpy',U,D)
+        UD = np.einsum('dxp,swxy->sdwpy',U,D)
         if full:
             UD = make_full(UD[0],UD[1])
         return UD
     nw,_,sh2 = D.shape
-    nb,_ = U.shape
-    UD = np.zeros((nw,nb*2,sh2))
-    UD[:,:nb] = np.einsum('xp,wxy->wpy',U,D[:,:nb])
-    UD[:,nb:] = np.einsum('xp,wxy->wpy',U,D[:,nb:])
+    nchol,nb,_ = U.shape
+    UD = np.zeros((nchol,nw,nb*2,sh2))
+    UD[:,:,:nb] = np.einsum('dxp,wxy->dwpy',U,D[:,:nb])
+    UD[:,:,nb:] = np.einsum('dxp,wxy->dwpy',U,D[:,nb:])
     return UD
 
 def conjugate_chol_right(U,D,full=False):
     if len(D.shape)==4:
-        DU = np.einsum('swxy,yq->swxq',D,U)
+        DU = np.einsum('swxy,dyq->sdwxq',D,U)
         if full:
             DU = make_full(DU[0],DU[1])
         return DU
     nw,sh1,_ = D.shape
-    nb,_ = U.shape
-    DU = np.zeros((nw,sh1,nb*2))
-    DU[:,:,:nb] = np.einsum('wxy,yq->wxq',D[:,:,:nb],U)
-    DU[:,:,nb:] = np.einsum('wxy,yq->wxq',D[:,:,nb:],U)
+    nchol,nb,_ = U.shape
+    DU = np.zeros((nchol,nw,sh1,nb*2))
+    DU[:,:,:,:nb] = np.einsum('wxy,dyq->dwxq',D[:,:,:nb],U)
+    DU[:,:,:,nb:] = np.einsum('wxy,dyq->dwxq',D[:,:,nb:],U)
     return DU
+
+def conjugate_chol_right_left(U,DU,full=False):
+    if len(DU.shape)==5:
+        UDU = np.einsum('dxp,sdwxq->sdwpq',U,DU)
+        if full:
+            UDU = make_full(UDU[0],UDU[1])
+        return UDU
+    nw = DU.shape[1]
+    nchol,nb,_ = U.shape
+    UDU = np.zeros((nchol,nw,nb*2,nb*2))
+    UDU[:,:,:nb] = np.einsum('dxp,dwxq->dwpq',U,DU[:,:,:nb])
+    UDU[:,:,nb:] = np.einsum('dxp,dwxq->dwpq',U,DU[:,:,nb:])
+    return UDU
+
+def conjugate_chol_left_right(U,UD,full=False):
+    if len(UD.shape)==5:
+        UDU = np.einsum('sdwpy,dyq->sdwpq',UD,U)
+        if full:
+            UDU = make_full(UDU[0],UDU[1])
+        return UDU
+    nw = UD.shape[1]
+    nchol,nb,_ = U.shape
+    UDU = np.zeros((nchol,nw,nb*2,nb*2))
+    UDU[:,:,:,:nb] = np.einsum('dwpy,dyq->dwpq',UD[:,:,:,:nb],U)
+    UDU[:,:,:,nb:] = np.einsum('dwpy,dyq->dwpq',UD[:,:,:,nb:],U)
+    return UDU
 
 def _trace_regularize(D0):
     if len(D0.shape)==3:
@@ -162,15 +188,15 @@ def _trace_regularize(D0):
 def _rdm_intermediates(U,D,UD,full=True):
     DU = conjugate_chol_right(U,D)
     if len(D.shape)==3:
-        UDDtU = np.einsum('wpx,wqx->wpq',UD,UD)
-        UDtDU = np.einsum('wxp,wxq->wpq',DU,DU)
-        UDDt = np.einsum('wpx,wyx->wpy',UD,D)
-        UDDDU = np.einsum('wpx,wxq->wpq',UDDt,DU)
+        UDDtU = np.einsum('dwpx,dwqx->dwpq',UD,UD)
+        UDtDU = np.einsum('dwxp,dwxq->dwpq',DU,DU)
+        UDDt = np.einsum('dwpx,wyx->dwpy',UD,D)
+        UDDDU = np.einsum('dwpx,dwxq->dwpq',UDDt,DU)
         return UDDtU,UDtDU,UDDDU
-    UDDtU = np.einsum('swpx,swqx->swpq',UD,UD)
-    UDtDU = np.einsum('swxp,swxq->swpq',DU,DU)
-    UDDt = np.einsum('swpx,swyx->swpy',UD,D)
-    UDDDU = np.einsum('swpx,swxq->swpq',UDDt,DU)
+    UDDtU = np.einsum('sdwpx,sdwqx->sdwpq',UD,UD)
+    UDtDU = np.einsum('sdwxp,sdwxq->sdwpq',DU,DU)
+    UDDt = np.einsum('sdwpx,swyx->sdwpy',UD,D)
+    UDDDU = np.einsum('sdwpx,sdwxq->sdwpq',UDDt,DU)
     if full:
         UDDtU = make_full(UDDtU[0],UDDtU[1])
         UDtDU = make_full(UDtDU[0],UDtDU[1])
@@ -208,31 +234,36 @@ class SORHFTrial(SumOfRotationBase):
             tr0 = _trace_regularize(D0)
             R0 = 1./np.sqrt(1.+self.eps_sq*tr0)
 
+        UD = conjugate_chol_left(self.chol_basis,D0) 
+        UDU = conjugate_chol_left_right(self.chol_basis,UD,full=True) 
+
         nw = walkers.nwalkers
         ovlp = np.zeros((self.nkeys,nw)) 
-        R = None
-        if compute_R:
-            R = np.ones((self.nkeys,nw))
+        if not compute_R:
+            for d,terms in enumerate(self.terms):
+                for i,term in enumerate(terms):
+                    kix = self.key_map[d,i]
+                    ovlp[kix] = _compute_trial_ovlp(term,UDU[d])
+            return ovlp,R0,None
+
+        M = dict()
         for d,terms in enumerate(self.terms):
-            U = self.chol_basis[d]
-            UD = conjugate_chol_left(U,D0) 
-            UDU = conjugate_chol_right(U,UD,full=True) 
-            if compute_R:
-                P1,P2,P3 = _rdm_intermediates(U,D0,UD)
-
             for i,term in enumerate(terms):
+                M1,M2 = _compute_M(term,UDU[d])
+                M[d,i] = M1,M2
                 kix = self.key_map[d,i]
-                if not compute_R:
-                    ovlp[kix] = _compute_trial_ovlp(term,UDU)
-                    continue
-
-                M1,M2 = _compute_M(term,UDU)
                 ovlp[kix] = term.ds.prod()/np.linalg.det(M1)
 
+        P1,P2,P3 = _rdm_intermediates(self.chol_basis,D0,UD)
+        R = np.ones((self.nkeys,nw))
+        for d,terms in enumerate(self.terms):
+            for i,term in enumerate(terms):
                 tr = tr0.copy()
-                P1i = term.select(P1,(1,2))
-                P2i = term.select(P2,(1,2))
-                UDUi = term.select(UDU,(1,2))
+
+                P1i = term.select(P1[d],(1,2))
+                P2i = term.select(P2[d],(1,2))
+                UDUi = term.select(UDU[d],(1,2))
+                M1,M2 = M[d,i]
 
                 t = np.einsum('wij,wkj->wik',P1i,M1)
                 t -= 2*np.einsum('wij,wkj->wik',UDUi,M2)
@@ -244,9 +275,10 @@ class SORHFTrial(SumOfRotationBase):
                 m += 2*M2
                 tr += np.einsum('wij,wji->w',P2i,m)
 
-                P3i = term.select(P3,(1,2))
+                P3i = term.select(P3[d],(1,2))
                 tr -= 2*np.einsum('wij,wji->w',P3i,M1)
 
+                kix = self.key_map[d,i]
                 R[kix] = 1./np.sqrt(1.+self.eps_sq*tr)
         return ovlp,R0,R
 

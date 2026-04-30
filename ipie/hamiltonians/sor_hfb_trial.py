@@ -56,16 +56,16 @@ def get_bcs_state(h1e,hbcs,thresh=1e-10):
 
 @plum.dispatch
 def _conjugate_walkers_left(walkers:GHFWalkers,ZU):
-    return np.einsum('wxi,dxp->dwip',walkers.phi.real,ZU)
+    return np.einsum('wxi,xp->wip',walkers.phi.real,ZU)
 
 @plum.dispatch
 def _conjugate_walkers_left(walkers:UHFWalkers,ZU):
     nw,nb,_ = walkers.phia.shape
     nu,nd = walkers.nup,walkers.ndown
-    nchol,_,sh2 = ZU.shape
-    t = np.zeros((nchol,nw,nu+nd,sh2))
-    t[:,:,:nu] = np.einsum('wxi,dxq->dwiq',walkers.phia.real,ZU[:,:nb])
-    t[:,:,nu:] = np.einsum('wxi,dxq->dwiq',walkers.phib.real,ZU[:,nb:])
+    _,sh2 = ZU.shape
+    t = np.zeros((nw,nu+nd,sh2))
+    t[:,:nu] = np.einsum('wxi,xq->wiq',walkers.phia.real,ZU[:nb])
+    t[:,nu:] = np.einsum('wxi,xq->wiq',walkers.phib.real,ZU[nb:])
     return t
 
 def _K12(walkers,B):
@@ -99,24 +99,31 @@ def _p0(walkers:GHFWalkers,U):
     C = walkers2ghf(walkers)
     return conjugate_chol_right(U,C.transpose(0,2,1))
 
-def assemble2(K11,K12,K21=None,K22=None):
-    nw,n1,n2 = K12.shape
-    n = n1+n2
-    K = np.zeros((nw,n,n))
-    K[:,:n1,:n1] = K11
-    K[:,:n1,n1:] = K12
+def assemble2(K11,K12,K21=None,K22=None,sign=-1):
+    nw,r1,c1 = K11.shape
+    _,_,c2 = K12.shape
     if K21 is None:
-        K21 = -K12.transpose(0,2,1)
-    K[:,n1:,:n1] = K21 
+        K21 = sign*K12.transpose(0,2,1)
+    _,r2,_ = K21.shape
+    r = r1+r2
+    c = c1+c2
+
+    K = np.zeros((nw,r,c))
+    K[:,:r1,:c1] = K11
+    K[:,:r1,c1:] = K12
+    K[:,r1:,:c1] = K21 
     if K22 is not None:
-        K[:,n1:,n1:] = K22
+        K[:,r1:,c1:] = K22
     return K
 
-def block_inv(K11,K12):
+def block_inv(K11,K12,return_full=True):
     nw,nocc,no = K12.shape
     K = assemble2(K11,K12)
     Kinv = np.linalg.inv(K)
-    return Kinv[:,:nocc,:nocc],Kinv[:,:nocc,nocc:],Kinv[:,nocc:,nocc:]
+    if return_full:
+        return Kinv
+    else:
+        return Kinv[:,:nocc,:nocc],Kinv[:,:nocc,nocc:],Kinv[:,nocc:,nocc:]
 
 def _conjugate_b(K,b1,b2=None,symm='skew'):
     t1,p1,h1 = b1
@@ -127,7 +134,6 @@ def _conjugate_b(K,b1,b2=None,symm='skew'):
 
     if isinstance(K,tuple):
         k11,k12,k22 = K
-        if
     else:
         n1 = t1.shape[2]
         k11 = K[:n1,:n1]
@@ -232,35 +238,53 @@ class SORHFBTrial(SORHFTrial):
         B,Z = trial.psi0
 
         Z = Z.reshape(1,nb*2,nb*2)
-        Z1U = conjugate_chol_right(self.chol_basis,Z)
-        self.s1 = conjugate_chol_right_left(self.chol_basis,Z1U)[:,0]
-        self.Z1U = Z1U[:,0]
-
         B = B.reshape(1,nb*2,no)
-        self.h1 = conjugate_chol_left(self.chol_basis,B)[:,0]
 
-        if self.eps_sq is None:
-            return
-        Z2U = np.einsum('wxy,dyp->dwxp',Z,self.Z1U)
-        self.s2 = conjugate_chol_right_left(self.chol_basis,Z2U)[:,0]
-        self.Z2U = Z2U[:,0]
+        self.s1 = np.zeros((self.nchol,nb*2,nb*2))
+        self.Z1U = np.zeros((self.nchol,nb*2,nb*2))
+        self.h1 = np.zeros((self.nchol,nb*2,no))
+        if self.eps_sq is not None:
+            self.s2 = np.zeros((self.nchol,nb*2,nb*2))
+            self.Z2U = np.zeros((self.nchol,nb*2,nb*2))
+            self.h2 = np.zeros((self.nchol,nb*2,no))
+            ZB = np.dot(Z[0],B[0]).reshape(1,nb*2,nb*2)
+        for d,U in enumerate(self.chol_basis):
+            Z1U = conjugate_chol_right(U,Z)
+            self.s1[d] = conjugate_chol_left(U,Z1U)[:,0]
+            self.Z1U[d] = Z1U[:,0]
+            self.h1[d] = conjugate_chol_left(U,B)[:,0]
+            if self.eps_sq is None:
+                continue
 
-        ZB = np.dot(Z[0],B[0]).reshape(1,nb*2,nb*2)
-        self.h2 = conjugate_chol_left(self.chol_basis,ZB)[:,0]
+            Z2U = np.einsum('wxy,yp->wxp',Z,self.Z1U[d])
+            self.s2[d] = conjugate_chol_left(U,Z2U)[:,0]
+            self.Z2U[d] = Z2U[:,0]
+            self.h2[d] = conjugate_chol_left(U,ZB)[:,0]
     def calc_trial_ovlp_ratio(self,walkers,trial,compute_R0=True,compute_R=True):
         B,Z = trial.psi0
         CZ,k11 = _K11(walkers,Z)
         k12 = _K12(walkers,B)
-        k11,k12,k22 = block_inv(k11,k12) 
+        Kinv = block_inv(k11,k12) 
+        if self.eps_sq is None:
+            compute_R0 = False
+            compute_R = False
+        R0 = None
+        if compute_R0:
+            D0 = _D0(walkers,k11,k12,CZ,B)
+            R0 = 1./np.sqrt(1.+self.eps_sq*tr0)
 
-        t1 =  _conjugate_walkers_left(walkers,self.Z1U)
-        p = _p0(walkers,self.chol_basis)
         b1 = t1,p,-self.h1
         m11,m12,m22 = _conjugate_b(k11,k12,k22,p,t1,-self.h1,symm='skew')
 
         nw = walkers.nwalkers
         ovlp = np.zeros((self.nkeys,nw)) 
         for d,terms in enumerate(self.terms):
+            t1 =  _conjugate_walkers_left(walkers,self.Z1U[d])
+            U = self.chol_basis[d]
+            p = _p0(walkers,U)
+            b = _assemble2(t1,p,K21=-self.h.T)
+            bKinv = np.einsum('w')
+
             for i,term in enumerate(terms):
                 kix = self.key_map[d,i]
                 ns = term.ns
@@ -282,13 +306,6 @@ class SORHFBTrial(SORHFTrial):
                 for w in range(nw):
                     ovlp[kix,w] = pf.pfaffian(top[w])/pf_bot
 
-        if self.eps_sq is None:
-            compute_R0 = False
-            compute_R = False
-        R0 = None
-        if compute_R0:
-            D0 = _D0(walkers,k11,k12,CZ,B)
-            R0 = 1./np.sqrt(1.+self.eps_sq*tr0)
         if not compute_R:
             return ovlp,R0,None
 
