@@ -129,6 +129,11 @@ def _D0(walkers:GHFWalkers,trial:SingleDetGHF,ovlp=False):
     return D,1./np.linalg.det(CdBinv)
 
 def conjugate_chol_left(U,D,full=False):
+    if U is None:
+        if len(D.shape)==4 and full:
+            return make_full(D[0],D[1])
+        return D
+
     if len(D.shape)==4:
         UD = np.einsum('xp,swxy->swpy',U,D)
         if full:
@@ -142,6 +147,11 @@ def conjugate_chol_left(U,D,full=False):
     return UD
 
 def conjugate_chol_right(U,D,full=False):
+    if U is None:
+        if len(D.shape)==4 and full:
+            return make_full(D[0],D[1])
+        return D
+
     if len(D.shape)==4:
         DU = np.einsum('swxy,yq->swxq',D,U)
         if full:
@@ -164,12 +174,18 @@ def _rdm_intermediates(U,D,UD,full=True):
     if len(D.shape)==3:
         UDDtU = np.einsum('wpx,wqx->wpq',UD,UD)
         UDtDU = np.einsum('wxp,wxq->wpq',DU,DU)
-        UDDt = np.einsum('wpx,wyx->wpy',UD,D)
+        if U is None:
+            UDDt = UDDtU
+        else:
+            UDDt = np.einsum('wpx,wyx->wpy',UD,D)
         UDDDU = np.einsum('wpx,wxq->wpq',UDDt,DU)
         return UDDtU,UDtDU,UDDDU
     UDDtU = np.einsum('swpx,swqx->swpq',UD,UD)
     UDtDU = np.einsum('swxp,swxq->swpq',DU,DU)
-    UDDt = np.einsum('swpx,swyx->swpy',UD,D)
+    if U is None:
+        UDDt = UDDtU
+    else:
+        UDDt = np.einsum('swpx,swyx->swpy',UD,D)
     UDDDU = np.einsum('swpx,swxq->swpq',UDDt,DU)
     if full:
         UDDtU = make_full(UDDtU[0],UDDtU[1])
@@ -275,9 +291,12 @@ class SORHFTrial(SumOfRotationBase):
         ovlp = np.zeros((self.nkeys,nw)) 
         R = np.ones((self.nkeys,nw))
         for d,terms in enumerate(self.terms):
+            v = self.chol_basis[d]
+            if v is None:
+                v = np.eye(self.nbasis)
             for i,term in enumerate(terms):
                 kix = self.key_map[d,i]
-                U = term.get_rotation_matrix(self.chol_basis[d])
+                U = term.get_rotation_matrix(v)
                 Ufull = np.eye(nb*2)
                 if U[0] is not None:
                     Ufull[:nb,:nb] = U[0]

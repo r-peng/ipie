@@ -161,7 +161,7 @@ class SumOfRotationBase(GenericBase):
         if RANK>0:
             iprint = 0
 
-        self.chol_basis.append(np.eye(self.nbasis))
+        self.chol_basis.append(None)
         terms = []
         ai = self.U/(np.cosh(gu)-1)/4
         if iprint>0:
@@ -175,7 +175,6 @@ class SumOfRotationBase(GenericBase):
         self.terms.append(terms)
 
     def parse_decomposition(self):
-        self.chol_basis = np.array(self.chol_basis)
         self.keys = [(d,i) for d,terms in enumerate(self.terms) for i in range(len(terms))]
         self.nkeys = len(self.keys)
         self.key_map = {key:kix for kix,key in enumerate(self.keys)} 
