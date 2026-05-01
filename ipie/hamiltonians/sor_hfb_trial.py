@@ -68,11 +68,6 @@ def _conjugate_walkers_left(walkers:UHFWalkers,ZU):
     t[:,nu:] = np.einsum('wxi,xq->wiq',walkers.phib.real,ZU[nb:])
     return t
 
-def _K12(walkers,B):
-    sh1,sh2 = B.shape
-    CB = _conjugate_walkers_left(walkers,B.reshape(1,sh1,sh2))
-    return CB[0]
-
 @plum.dispatch
 def _K11(walkers:UHFWalkers,Z):
     CZ = _K12(walkers,Z)
@@ -89,93 +84,22 @@ def _K11(walkers:GHFWalkers,Z):
     CZ = _K12(walkers,Z)
     return CZ,np.einsum('wix,wxj->wij',CZ,walkers.phi.real)
 
-@plum.dispatch
-def _p0(walkers:UHFWalkers,U):
-    C = walkers2uhf(walkers)
-    return conjugate_chol_right(U,C.transpose(0,1,3,2),full=True)
+def _K12(walkers,B):
+    sh1,sh2 = B.shape
+    CB = _conjugate_walkers_left(walkers,B.reshape(1,sh1,sh2))
+    return CB[0]
 
-@plum.dispatch
-def _p0(walkers:GHFWalkers,U):
-    C = walkers2ghf(walkers)
-    return conjugate_chol_right(U,C.transpose(0,2,1))
+def _parse(K,n1):
+    return K[:,:n1,:n1],K[:,:n1,n1:],K[:,n1:,:n1],K[:,n1:,n1:]
 
-def assemble2(K11,K12,K21=None,K22=None,sign=-1):
-    nw,r1,c1 = K11.shape
-    _,_,c2 = K12.shape
-    if K21 is None:
-        K21 = sign*K12.transpose(0,2,1)
-    _,r2,_ = K21.shape
-    r = r1+r2
-    c = c1+c2
+def _KY(CZ,B,k11,k12):
+    KY = np.einsum('wij,wjp->wip',k11,CZ)
+    KY -= np.einsum('wij,pj->wip',k12,B)
+    return KY
 
-    K = np.zeros((nw,r,c))
-    K[:,:r1,:c1] = K11
-    K[:,:r1,c1:] = K12
-    K[:,r1:,:c1] = K21 
-    if K22 is not None:
-        K[:,r1:,c1:] = K22
-    return K
-
-def block_inv(K11,K12,return_full=True):
-    nw,nocc,no = K12.shape
-    K = assemble2(K11,K12)
-    Kinv = np.linalg.inv(K)
-    if return_full:
-        return Kinv
-    else:
-        return Kinv[:,:nocc,:nocc],Kinv[:,:nocc,nocc:],Kinv[:,nocc:,nocc:]
-
-def _conjugate_b(K,b1,b2=None,symm='skew'):
-    t1,p1,h1 = b1
-    if b2 is None:
-        t2,p2,h2 = None,None,None
-    else:
-        t2,p2,h2 = b2
-
-    if isinstance(K,tuple):
-        k11,k12,k22 = K
-    else:
-        n1 = t1.shape[2]
-        k11 = K[:n1,:n1]
-        k12 = K[:n1,n1:]
-        k21 = K[n1:,:n1]
-        k22 = K[n1:,n1:]
-
-    if symm[:4]=='herm':
-        sign = 1 
-    elif symm[:4]=='skew':
-        sign = -1 
-    else:
-        sign = None
-    
-    t1k11 = np.einsum('dwip,wij->dwpj',t1,k11)
-    h1k21 = np.einsum('dwpi,wji->dwpj',h1,k12)*sign
-    t2_ = t1 if t2 is None else t2
-    m11 = np.einsum('dwpj,dwjq->dwpq',t1k11+h1k21,t2_)
-
-    t1k12 = np.einsum('dwip,wij->dwpj',t1,k12)
-    h1k22 = np.einsum('dpi,wij->dwpj',h1,k22)
-    h2_ = h1 if h2 is None else h2
-    m11 += np.einsum('dwpj,dqj->dwpq',t1k12+h1k22,h2_)
-    p2_ = p1 if p2 is None else p1
-    m12 = np.einsum('dwpj,dwjq->dwpq',t1k11+h1k21,p2_)
-    if t2 is None and h2 is None and p2 is None:
-        m21 = m12.transpose(0,1,3,2)*sign
-    else:
-        if t2 is None:
-            k11t2 = -t1k11.transpose(0,1,3,2)*sign
-        else:
-            k11t2 = np.einsum('wij,dwjp->dwip',k11,t2)
-        if h2 is None:
-            k12h2 = h1k21.transpose(0,1,3,2)*sign
-        else:
-            k12h2 = np.einsum('wij,dwpj->dwip',k12,h2)
-        m21 = np.einsum('dwip,dwiq->dwpq',p1,k11t2+k12h2)
-
-    p1k11 = np.einsum('dwip,wij->dwpj',p1,k11)
-    p2_ = p1 if p2 is None else p2
-    m22 = np.einsum('dwpj,dwjq->dwpq',p1k11,p2_)
-    return m11,m12,m21,m22
+def _D0(walkers,CZ,B,k11,k12):
+    D = _KY(CZ,B,k11,k12)
+    return _multiply_walkers_left(walkers,D)
 
 @plum.dispatch
 def _multiply_walkers_left(walkers:UHFWalkers,T):
@@ -191,15 +115,6 @@ def _multiply_walkers_left(walkers:UHFWalkers,T):
 def _multiply_walkers_left(walkers:GHFWalkers,T):
     return np.einsum('wpi,wiq->wpq',walkers.phi.real,T)
 
-def _KY(CZ,B,k11,k12):
-    KY = np.einsum('wij,wjp->wip',k11,CZ)
-    KY -= np.einsum('wij,pj->wip',k12,B)
-    return KY
-
-def _D0(walkers,k11,k12,CZ,B):
-    D = _KY(CZ,B,k11,k12)
-    return _multiply_walkers_left(walkers,D)
-
 @plum.dispatch
 def _multiply_walkers_right(walkers:UHFWalkers,T):
     nw,nb = walkers.nwalkers,walkers.nbasis
@@ -213,13 +128,8 @@ def _multiply_walkers_right(walkers:UHFWalkers,T):
 def _multiply_walkers_right(walkers:GHFWalkers,T):
     return np.einsum('wip,wpj->wij',T,walkers.phi.real)
 
-def _XK(walkers,K11,K12):
-    CK11 = _multiply_walkers_left(walkers,K11)
-    CK12 = _multiply_walkers_left(walkers,K12)
-    return -np.stack([CK11,CK12],axis=2)
-
-def _KXXK(walkers,k11,k12):
-    XK = _XK(walkers,k11,k12)
+def _KXXK(walkers,k1):
+    XK = -_multiply_walkers_left(walkers,k1)
     KXXK = np.einsum('wpi,wpj->wij',XK,XK)
     KXX = _multiply_walkers_right(walkers,XK.transpose(0,2,1))
     return KXXK, KXX
@@ -229,6 +139,115 @@ def _KYYK(CZ,B,k11,k12,k22):
     KY2 = _KY(CZ,B,-k12.transpose(0,2,1),k22)
     KY = -np.stack([KY1,KY2],axis=1)
     return np.einsum('wip,wjp->wij',KY,KY)
+
+def _rdm_intermediates1(walkers,CZ,B,K):
+    Kx,KXX = _KXXK(walkers,np.stack([K[0],K[1]],axis=2))
+    Ky = _KYYK(CZ,B,K[0],K[1],K[3])
+    Kxy = np.einsum('wij,wjk->wik',KXX,Ky)
+
+    n1 = CZ.shape[1]
+    return [_parse(K,n1) for K in (Kx,Ky,Kxy)] 
+
+@plum.dispatch
+def _p0(walkers:UHFWalkers,U):
+    C = walkers2uhf(walkers)
+    return conjugate_chol_right(U,C.transpose(0,1,3,2),full=True)
+
+@plum.dispatch
+def _p0(walkers:GHFWalkers,U):
+    C = walkers2ghf(walkers)
+    return conjugate_chol_right(U,C.transpose(0,2,1))
+
+def _bK(K,t,p,h,compute11=True,compute12=True,compute21=True,compute22=True):
+    k11,k12,k21,k22 = K
+    m11 = None
+    m12 = None
+    m21 = None
+    m22 = None
+    if compute11:
+        m11 = np.einsum('wip,wij->wpj',t,k11)
+        m11 += np.einsum('pi,wij->wpj',h,k21)
+    if compute12:
+        m12 = np.einsum('wip,wij->wpj',t,k12)
+        m12 += np.einsum('pi,wij->wpj',h,k22)
+    if compute21:
+        m21 = np.einsum('wip,wij->wpj',p,k11)
+    if compute22:
+        m22 = np.einsum('wip,wij->wpj',p,k12)
+    return m11,m12,m21,m22
+
+def _Kb(K,t,p,h,compute11=True,compute12=True,compute21=True,compute22=True):
+    k11,k12,k21,k22 = K
+    m11 = None
+    m12 = None
+    m21 = None
+    m22 = None
+    if compute11:
+        m11 = np.einsum('wpj,wjq->wpq',k11,t)
+        m11 += np.einsum('wpj,qj->wpq',k12,h)
+    if compute12:
+        m12 = np.einsum('wpj,wjq->wpq',k11,p)
+    if compute21:
+        m21 = np.einsum('wpj,wjq->wpq',k21,t)
+        m21 += np.einsum('wpj,qj->wpq',k22,h)
+    if compute22:
+        m22 = np.einsum('wpj,wjq->wpq',k21,p)
+    return m11,m12,m21,m22
+
+def _Kp(K,p,compute11=True,compute21=True):
+    k11,k21 = K
+    m11 = None
+    m21 = None
+    if compute11:
+        m11 = np.einsum('wpi,wiq->wpq',k11,p)
+    if compute21:
+        m21 = np.einsum('wpi,wiq->wpq',k21,p)
+    return m11,None,m21,None 
+
+def _pK(K,p,commpute11=True,compute12=True):
+    k11,k12 = K
+    m11 = None
+    m12 = None
+    if compute11:
+        m11 = np.einsum('wip,wij->wpj',k11,p)
+    if compute12:
+        m11 = np.einsum('wip,wij->wpj',k12,p)
+    return m11,m12,None,None
+
+def _rdm_intermediates2(Kmap,p,t1,t2,h1,h2):
+    kmap = dict()
+    K = _bK(Kmap['Kxy'],t1,p,h1)
+    kmap['Kxy11'] = _Kb(K,t1,p,h1)
+
+    K = _bK(Kmap['Kx'],t2,p,h2,n1,n1)
+    kmap['Kx21'] = _Kb(K,t1,p,h1)
+    kmap['Kx22'] = _Kb(K,t2,p,h2,compute21=False)
+
+    kmap['K12'] = _Kb(Kmap['K1'],t2,p,h2)
+
+    K = _bK(Kmap['Kx'],t1,p,h1)
+    kmap['Kx11'] = _Kb(K,t1,p,h1,compute21=False)
+
+    K = _bK(Kmap['Ky'],t1,p,h1,n1,n1)
+    kmap['Ky11'] = _Kb(K,t1,p,h1,compute21=False)
+    kmap['Ky1p'] = _Kp((K[0],K[2]),p) 
+
+    K = Kmap['K1']
+    kmap['K1p'] = _Kp((K[0],K[2]),p) 
+
+    K = _bK(Kmap['K'],t2,p,h2,compute12=False,compute21=False,compute22=False)
+    kmap['K2p'] = _Kp((K[0],K[2]),p,compute21=False) 
+
+    K = Kmap['Ky']
+    K = _Kp((K[0],None),p,compute21=False)
+    kmap['Kypp'] = _pK((K[0],K[1]),p,compute12=False) 
+    return kmap 
+
+def _select(K,ixs,term,axes=(1,2)):
+    ls = [None] * 4
+    for ix in ixs:
+        ls[ix] = term.selec(K[ix],axes)
+    return ls
 
 class SORHFBTrial(SORHFTrial):
 
@@ -262,70 +281,155 @@ class SORHFBTrial(SORHFTrial):
             self.h2[d] = conjugate_chol_left(U,ZB)[:,0]
     def calc_trial_ovlp_ratio(self,walkers,trial,compute_R0=True,compute_R=True):
         B,Z = trial.psi0
-        CZ,k11 = _K11(walkers,Z)
-        k12 = _K12(walkers,B)
-        Kinv = block_inv(k11,k12) 
+        n1 = walkers.nup + walkers.ndown
+        n2 = B.shape[1]
+        nb = walker.nbasis
+        nw = walkers.nwalkers
+
+        CZ,K11 = _K11(walkers,Z)
+        K12 = _K12(walkers,B)
+        K = np.block([[K11,K12],[-K12.transpose(0,2,1),np.zeros((nw,n2,n2))]])
+        K = np.linalg.inv(K)
+        K = _parse(K,n1)
         if self.eps_sq is None:
             compute_R0 = False
             compute_R = False
         R0 = None
         if compute_R0:
-            D0 = _D0(walkers,k11,k12,CZ,B)
+            D0 = _D0(walkers,CZ,B,K[0],K[1])
+            tr0 = np.einsum('wij->w',D0**2)
             R0 = 1./np.sqrt(1.+self.eps_sq*tr0)
+        R = None
+        if compute_R:
+            Kx,Ky,Kxy = _rdm_intermediates1(walkers,CZ,B,K)
+            R = np.ones((self.nkeys,nw))
+            Kmap = {'K':K,'Kx':Kx,'Ky':Ky,'Kxy':Kxy}
 
-        b1 = t1,p,-self.h1
-        m11,m12,m22 = _conjugate_b(k11,k12,k22,p,t1,-self.h1,symm='skew')
-
-        nw = walkers.nwalkers
         ovlp = np.zeros((self.nkeys,nw)) 
         for d,terms in enumerate(self.terms):
-            t1 =  _conjugate_walkers_left(walkers,self.Z1U[d])
             U = self.chol_basis[d]
             p = _p0(walkers,U)
-            b = _assemble2(t1,p,K21=-self.h.T)
-            bKinv = np.einsum('w')
+            t1 =  _conjugate_walkers_left(walkers,self.Z1U[d])
+            h1 = -self.h1[d]
+            s1 = self.s1[d]
+            K1 = _bK(K,t1,p,h1,n1,n1)
+            K11 = _Kb(K1,t1,p,h1,nb*2,n1,compute21=False)
+
+            if compute_R:
+                t2 =  _conjugate_walkers_left(walkers,self.Z2U[d])
+                h2 = self.h2[d]
+                s2 = self.s2[d]
+                Kmap['K1'] = K1
+                kmap = _rdm_intermediates2(Kmap,p,t1,t2,h1,h2)
 
             for i,term in enumerate(terms):
                 kix = self.key_map[d,i]
                 ns = term.ns
-                s = term.select(self.s[d],(0,1))*np.outer(term.ds,term.ds)
+                s = term.select(s,(0,1))*np.outer(term.ds,term.ds)
                 ds = np.diag(term.ds)
-                zero = np.zeros((ns,ns))
 
-                c = np.block([[zero,ds],
-                              [-ds,s]]) 
-                cinv = np.linalg.inv(c)
-                pf_bot = pf.pfaffian(cinv)
+                c1 = np.block([[np.zeros((ns,ns)),ds],[-ds,s1]]) 
+                c1 = np.linalg.inv(c1)
+                pf_bot = pf.pfaffian(c1)
 
-                M11 = term.select(m11[d],(1,2))
-                M12 = term.select(m12[d],(1,2))
-                M22 = term.select(m22[d],(1,2))
-                top = assemble2(M11,M12,K22=M22) 
-                top += cinv.reshape(1,ns*2,ns*2) 
-                top = 0.5 * (top-top.transpose(0,2,1))
+                m = _select(K11,(0,1,3),term)
+                m = np.block([[m[0],m[1]],[-m[1].transpose(0,2,1),m[3]]])
+                m = m + c1.reshape(1,ns*2,ns*2)
+                m = 0.5 * (top-top.transpose(0,2,1))
                 for w in range(nw):
-                    ovlp[kix,w] = pf.pfaffian(top[w])/pf_bot
+                    ovlp[kix,w] = pf.pfaffian(m[w])/pf_bot
 
-        if not compute_R:
-            return ovlp,R0,None
+                if not compute_R:
+                    continue
+                tr = tr0.copy()
+                m = np.linalg.inv(m)
+                c2 = np.block([[np.zeros((ns,ns)),ds],[ds,s2]]) 
+                d2 = np.sqrt(terms.ds*2.+term.ds**2)
 
-        KXXK,KXX = _KXXK(walkers,k11,k12)
-        KYYK = _KYYK(CZ,B,k11,k12,k22)
-        KXXKYYK = np.einsum('wij,wjk->wik',KXX,KYYK)
-        t2 =  _conjugate_walkers_left(walkers,self.Z2U)
+                # (0,0,0,1),(0,1,0,0)
+                k = _select(kmap['Kxy11'],(0,1,2,3),term)
+                k = np.block([[k[0],k[1]],[k[2],k[3]]])
+                tr -= 2.*np.einsum('wij,wji->w',k,m)
 
-        R = np.ones((self.nkeys,nw))
+                # (0,0,1,0)
+                k = _select(kmap['Kx22'],(0,1,3),term)
+                k = np.block([[k[0],k[1]],[k[1].transpose(0,2,1),k[3]]])
+                tr += np.einsum('wij,ji->w',k,c2)
+
+                # (0,0,1,1),(0,1,1,0)
+                k = _select(kmap['Kx21'],(0,1,2,3),term)
+                k = np.block([[k[0],k[1]],[k[2],k[3]]])
+                tmp = np.einsum('wji,jk->wik',k,c2)
+                k = _select(kmap['K12'],(0,1,2,3),term)
+                k = np.block([[k[0],k[1]],[k[2],k[3]]])
+                mK12 = np.einsum('wij,wjk->wik',m,k)
+                tr -= 2.*np.einsum('wij,wij->w',tmp,mK12)
+
+                # (0,1,0,1)
+                k = _select(kmap['Kx11'],(0,1,3),term)
+                Kx11 = np.block([[k[0],k[1]],[k[1].transpose(0,2,1),k[3]]])
+                tmp = np.einsum('wij,wkj->wik',Kx11,m)
+                k = _select(kmap['Ky11'],(0,1,3),term)
+                Ky11 = np.block([[k[0],k[1]],[k[1].transpose(0,2,1),k[3]]])
+                tmp = np.einsum('wij,wjk->wik',tmp,Ky11)
+                tr += np.einsum('wij,wji->w',tmp,m)
+
+                # (0,1,1,1)
+                tmp = np.einsum('wji,wjk->wik',mK12,Kx11)
+                tmp = np.einsum('wij,wjk->w',tmp,mK12)
+                tr += np.einsum('wij,ji->w',tmp,c2)
+
+                # (1,0,0,0)
+                k = term.select(kmap['Kypp'][0],(1,2))
+                tr += np.einsum('wii,i->w',k,d2**2)
+
+                # (1,0,0,1)
+                k = _select(kmap['Ky1p'],(0,2),term)
+                tmp = np.stack([k[0],k[2]],axis=1) * d2.reshape(1,1,ns)
+                k = _select(kmap['K1p'],(0,2),term)
+                k = np.stack([k[0],k[2]],axis=1)
+                mK1pd = np.einsum('wij,wjk,k->wik',m,k,d)
+                tr -= 2*np.einsum('wji,wji->w',tmp,mK1p)
+                
+                # (1,0,1,0)
+                k = _select(kmap['K2p'],(0,2),term)
+                K2pd = np.stack([k[0],k[2]],axis=1) * d2.reshape(1,1,ns)
+                tr += np.einsum('wji,wji->w',K2pd,K2pd)
+
+                # (1,0,1,1),(1,1,1,0)
+                k = _select(kmap['K12'],(0,1,2,3),term)
+                K12 = np.block([[k[0],k[1]],[k[2],k[3]]])
+                K12c = np.einsum('wij,jk->wik',K12,c2)
+                tmp = np.einsum('wji,wkj->wik',K2pd,K12c)
+                tr -= 2.*np.einsum('wij,wji->w',tmp,mK1pd)
+
+                # (1,1,0,1)
+                tmp = np.einsum('wji,wjk->wik',mK1pd,Ky11)
+                tr += np.einsum('wij-wji->w',tmp,mK1pd)
+
+                # (1,1,1,1)
+                tmp = np.einsum('wji,wjk->wik',mK1pd,K12c)
+                tmp = np.einsum('wij,wjk->wik',tmp,K12)
+                tr += np.einsum('wij,wji->w',tmp,mK1pd)
+
+                R[kix] = 1./np.sqrt(1.+self.eps_sq*tr)
+        return ovlp,R0,R
+
     def _get_trial_ovlp_ratio(self,walkers,trial):
         B,Z = trial.psi0
+        n1 = walkers.nup + walkers.ndown
+        n2 = B.shape[1]
+
         K11 = _K11(walkers,Z)
         K12 = _K12(walkers,B)
-        K = assemble2(K11,K12) 
+        K = np.block([[K11,K12],[-K12.transpose(0,2,1),np.zeros((nw,n2,n2))]])
         ovlp0 = np.array([pf.pfaffian(Ki) for Ki in K])
 
         phia = walkers.phia.copy()
         phib = walkers.phib.copy()
         nw = walkers.nwalkers
         ovlp = np.zeros((self.nkeys,nw)) 
+        R = np.ones((self.nkeys,nw))
         for d,terms in enumerate(self.terms):
             for i,term in enumerate(terms):
                 kix = self.key_map[d,i]
@@ -336,8 +440,14 @@ class SORHFBTrial(SORHFTrial):
                     walkers.phia = np.einsum('xy,wyi->wxi',U[0],phia)
                 if U[1] is not None:
                     walkers.phib = np.einsum('xy,wyi->wxi',U[1],phib)
-                K11 = _K11(walkers,Z)
+                CZ,K11 = _K11(walkers,Z)
                 K12 = _K12(walkers,B)
-                K = assemble2(K11,K12) 
+                K = np.block([[K11,K12],[-K12.transpose(0,2,1),np.zeros((nw,n2,n2))]])
                 ovlp[kix] = np.array([pf.pfaffian(Ki) for Ki in K])/ovlp0
-        return ovlp,None,None
+
+                K = np.linalg.inv(K)
+                K = _parse(K,n1)
+                D = _D0(walkers,CZ,B,K[0],K[1])
+                tr = np.einsum('wij->w',D**2)
+                R[kix] = 1./np.sqrt(1.+self.eps_sq*tr)
+        return ovlp,None,R

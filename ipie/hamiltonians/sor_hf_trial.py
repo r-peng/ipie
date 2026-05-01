@@ -202,7 +202,6 @@ class SORHFTrial(SumOfRotationBase):
         if self.eps_sq is None:
             compute_R0 = False
             compute_R = False
-
         R0 = None 
         if compute_R0:
             tr0 = _trace_regularize(D0)
