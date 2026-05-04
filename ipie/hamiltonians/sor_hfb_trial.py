@@ -1,5 +1,5 @@
 import numpy as np
-import scipy,itertools,plum
+import scipy,itertools,plum,time
 from pfapack import pfaffian as pf
 from ipie.hamiltonians.sor_hf_trial import * 
 from ipie.trial_wavefunction.single_hfb import SingleHFB
@@ -214,34 +214,32 @@ def _pK(K,p,compute11=True,compute12=True):
         m12 = np.einsum('wip,wij->wpj',k12,p)
     return m11,m12,None,None
 
-def _rdm_intermediates2(Kmap,p,t1,t2,h1,h2):
+def _rdm_intermediates2(K,K1,Kx,Ky,Kxy,p,t1,t2,h1,h2):
     kmap = dict()
-    K = _bK(Kmap['Kxy'],t1,p,h1)
-    kmap['Kxy11'] = _Kb(K,t1,p,h1)
+    k = _bK(Kxy,t1,p,h1)
+    Kxy11 = _Kb(k,t1,p,h1)
 
-    K = _bK(Kmap['Kx'],t2,p,h2)
-    kmap['Kx21'] = _Kb(K,t1,p,h1)
-    kmap['Kx22'] = _Kb(K,t2,p,h2,compute21=False)
+    k = _bK(Kx,t2,p,h2)
+    Kx21 = _Kb(k,t1,p,h1)
+    Kx22 = _Kb(k,t2,p,h2,compute21=False)
 
-    kmap['K12'] = _Kb(Kmap['K1'],t2,p,h2)
+    K12 = _Kb(K1,t2,p,h2)
 
-    K = _bK(Kmap['Kx'],t1,p,h1)
-    kmap['Kx11'] = _Kb(K,t1,p,h1,compute21=False)
+    k = _bK(Kx,t1,p,h1)
+    Kx11 = _Kb(k,t1,p,h1,compute21=False)
 
-    K = _bK(Kmap['Ky'],t1,p,h1)
-    kmap['Ky11'] = _Kb(K,t1,p,h1,compute21=False)
-    kmap['Ky1p'] = _Kp((K[0],K[2]),p) 
+    k = _bK(Ky,t1,p,h1)
+    Ky11 = _Kb(k,t1,p,h1,compute21=False)
+    Ky1p = _Kp((k[0],k[2]),p) 
 
-    K = Kmap['K1']
-    kmap['K1p'] = _Kp((K[0],K[2]),p) 
+    K1p = _Kp((K1[0],K1[2]),p) 
 
-    K = _bK(Kmap['K'],t2,p,h2,compute12=False,compute22=False)
-    kmap['K2p'] = _Kp((K[0],K[2]),p) 
+    k = _bK(K,t2,p,h2,compute12=False,compute22=False)
+    K2p = _Kp((k[0],k[2]),p) 
 
-    K = Kmap['Ky']
-    K = _Kp((K[0],None),p,compute21=False)
-    kmap['Kypp'] = _pK((K[0],K[1]),p,compute12=False) 
-    return kmap 
+    k = _Kp((Ky[0],None),p,compute21=False)
+    Kypp = _pK((k[0],k[1]),p,compute12=False) 
+    return Kxy11,Kx21,Kx22,K12,Kx11,Ky11,Ky1p,K1p,K2p,Kypp 
 
 def _select(K,ixs,term,axes=(1,2)):
     ls = [None] * 4
@@ -252,6 +250,8 @@ def _select(K,ixs,term,axes=(1,2)):
 class SORHFBTrial(SORHFTrial):
 
     def trial_precompute(self,trial):
+        t0 = time.time()
+
         nb = trial.nbasis
         no = trial.nocc
         nchol = len(self.chol_basis)
@@ -260,27 +260,44 @@ class SORHFBTrial(SORHFTrial):
         Z = Z.reshape(1,nb*2,nb*2)
         B = B.reshape(1,nb*2,no)
 
-        self.s1 = np.zeros((nchol,nb*2,nb*2))
+        self.c1 = dict() 
         self.Z1U = np.zeros((nchol,nb*2,nb*2))
         self.h1 = np.zeros((nchol,nb*2,no))
         if self.eps_sq is not None:
-            self.s2 = np.zeros((nchol,nb*2,nb*2))
+            self.c2 = dict() 
             self.Z2U = np.zeros((nchol,nb*2,nb*2))
             self.h2 = np.zeros((nchol,nb*2,no))
             ZB = np.dot(Z[0],B[0]).reshape(1,nb*2,no)
         for d,U in enumerate(self.chol_basis):
-            Z1U = conjugate_chol_right(U,Z)
-            self.s1[d] = conjugate_chol_left(U,Z1U)[0]
-            self.Z1U[d] = Z1U[0]
             self.h1[d] = conjugate_chol_left(U,B)[0]
+            Z1U = conjugate_chol_right(U,Z)
+            self.Z1U[d] = Z1U[0]
+            s1 = conjugate_chol_left(U,Z1U)[0]
+            for i,term in enumerate(self.terms[d]):
+                ns = term.ns
+                c1 = term.select(s1,(0,1))*np.outer(term.ds,term.ds)
+                ds = np.diag(term.ds)
+                c1 = np.block([[np.zeros((ns,ns)),ds],[-ds,c1]]) 
+                c1 = np.linalg.inv(c1)
+                c1 = 0.5 * (c1-c1.T)
+                pf_bot = pf.pfaffian(c1)
+                self.c1[d,i] = c1,pf_bot
             if self.eps_sq is None:
                 continue
 
-            Z2U = np.einsum('wxy,yp->wxp',Z,self.Z1U[d])
-            self.s2[d] = conjugate_chol_left(U,Z2U)[0]
-            self.Z2U[d] = Z2U[0]
             self.h2[d] = conjugate_chol_left(U,ZB)[0]
-
+            Z2U = np.einsum('wxy,yp->wxp',Z,self.Z1U[d])
+            self.Z2U[d] = Z2U[0]
+            s2 = conjugate_chol_left(U,Z2U)[0]
+            for i,term in enumerate(self.terms[d]):
+                ns = term.ns
+                c2 = term.select(s2,(0,1))*np.outer(term.ds,term.ds)
+                ds = np.diag(term.ds)
+                c2 = -np.block([[np.zeros((ns,ns)),ds],[ds,c2]]) 
+                d2 = term.ds*2.+term.ds**2
+                self.c2[d,i] = c2,d2
+        if RANK==0:
+            print('precompute time=',time.time()-t0)
     def calc_trial_ovlp_ratio(self,walkers,trial,compute_R0=True,compute_R=True):
         B,Z = trial.psi0
         n1 = walkers.nup + walkers.ndown
@@ -305,7 +322,20 @@ class SORHFBTrial(SORHFTrial):
         if compute_R:
             Kx,Ky,Kxy = _rdm_intermediates1(walkers,CZ,B,K)
             R = np.ones((self.nkeys,nw))
-            Kmap = {'K':K,'Kx':Kx,'Ky':Ky,'Kxy':Kxy}
+
+        k_cache = {1:np.zeros((nw,2,2)),2:np.zeros((nw,4,4))}
+        def _block(ls,ns,sign=-1,copy=False):
+            k = k_cache[ns]
+            if copy:
+                k = k.copy()
+            k[:,:ns,:ns] = ls[0]
+            k[:,:ns,ns:] = ls[1]
+            if ls[2] is None:
+                k[:,ns:,:ns] = ls[1].transpose(0,2,1)*sign
+            else:
+                k[:,ns:,:ns] = ls[2]
+            k[:,ns:,ns:] = ls[3]
+            return k
 
         ovlp = np.zeros((self.nkeys,nw)) 
         for d,terms in enumerate(self.terms):
@@ -313,30 +343,22 @@ class SORHFBTrial(SORHFTrial):
             p = _p0(walkers,U)
             t1 =  _conjugate_walkers_left(walkers,self.Z1U[d])
             h1 = -self.h1[d]
-            s1 = self.s1[d]
             K1 = _bK(K,t1,p,h1)
             K11 = _Kb(K1,t1,p,h1,compute21=False)
 
             if compute_R:
                 t2 =  _conjugate_walkers_left(walkers,self.Z2U[d])
                 h2 = self.h2[d]
-                s2 = self.s2[d]
-                Kmap['K1'] = K1
-                kmap = _rdm_intermediates2(Kmap,p,t1,t2,h1,h2)
+                ls = _rdm_intermediates2(K,K1,Kx,Ky,Kxy,p,t1,t2,h1,h2)
+                Kxy11,Kx21,Kx22,K12,Kx11,Ky11,Ky1p,K1p,K2p,Kypp = ls
 
             for i,term in enumerate(terms):
                 kix = self.key_map[d,i]
+                c1,pf_bot = self.c1[d,i]
                 ns = term.ns
-                ds = np.diag(term.ds)
-
-                c1 = term.select(s1,(0,1))*np.outer(term.ds,term.ds)
-                c1 = np.block([[np.zeros((ns,ns)),ds],[-ds,c1]]) 
-                c1 = np.linalg.inv(c1)
-                c1 = 0.5 * (c1-c1.T)
-                pf_bot = pf.pfaffian(c1)
 
                 m = _select(K11,(0,1,3),term)
-                m = np.block([[m[0],m[1]],[-m[1].transpose(0,2,1),m[3]]])
+                m = _block(m,ns,sign=-1)
                 m = m + c1.reshape(1,ns*2,ns*2)
                 m = 0.5 * (m-m.transpose(0,2,1))
                 for w in range(nw):
@@ -346,76 +368,67 @@ class SORHFBTrial(SORHFTrial):
                     continue
                 tr = tr0.copy()
                 m = np.linalg.inv(m)
-                c2 = term.select(s2,(0,1))*np.outer(term.ds,term.ds)
-                c2 = -np.block([[np.zeros((ns,ns)),ds],[ds,c2]]) 
-                d2 = term.ds*2.+term.ds**2
+                c2,d2 = self.c2[d,i]
 
                 # (0,0,0,1),(0,1,0,0)
-                k = _select(kmap['Kxy11'],(0,1,2,3),term)
-                k = np.block([[k[0],k[1]],[k[2],k[3]]])
-                tr -= 2.*np.einsum('wij,wji->w',k,m)
+                k = _select(Kxy11,(0,1,2,3),term)
+                k = _block(k,ns)
+                #tr -= 2.*np.einsum('wij,wji->w',k,m)
+                tr += 2.*(k*m).sum()
 
                 # (0,0,1,0)
-                k = _select(kmap['Kx22'],(0,1,3),term)
-                k = np.block([[k[0],k[1]],[k[1].transpose(0,2,1),k[3]]])
-                tr += np.einsum('wij,ji->w',k,c2)
+                k = _select(Kx22,(0,1,3),term)
+                k = _block(k,ns,sign=1)
+                #tr += np.einsum('wij,ji->w',k,c2)
+                tr += (k*c2).sum()
 
                 # (0,0,1,1),(0,1,1,0)
-                k = _select(kmap['Kx21'],(0,1,2,3),term)
-                k = np.block([[k[0],k[1]],[k[2],k[3]]])
-                tmp = np.einsum('wji,jk->wik',k,c2)
-                k = _select(kmap['K12'],(0,1,2,3),term)
-                k = np.block([[k[0],k[1]],[k[2],k[3]]])
-                mK12 = np.einsum('wij,wjk->wik',m,k)
-                tr -= 2.*np.einsum('wij,wij->w',tmp,mK12)
+                k = _select(Kx21,(0,1,2,3),term)
+                k = _block(k,ns)
+                tmp = np.matmul(k.transpose(0,2,1),c2)
+                k = _select(K12,(0,1,2,3),term)
+                k12 = _block(k,ns,copy=True)
+                mk12 = np.matmul(m,k12)
+                #tr -= 2.*np.einsum('wij,wij->w',tmp,mk12)
+                tr -= 2.*(tmp*mk12).sum()
 
                 # (0,1,0,1)
-                k = _select(kmap['Kx11'],(0,1,3),term)
-                Kx11 = np.block([[k[0],k[1]],[k[1].transpose(0,2,1),k[3]]])
-                tmp = np.einsum('wij,wkj->wik',Kx11,m)
-                k = _select(kmap['Ky11'],(0,1,3),term)
-                Ky11 = np.block([[k[0],k[1]],[k[1].transpose(0,2,1),k[3]]])
-                tmp = np.einsum('wij,wjk->wik',tmp,Ky11)
-                tr += np.einsum('wij,wji->w',tmp,m)
-
+                k = _select(Ky11,(0,1,3),term)
+                ky11 = _block(k,ns,sign=1,copy=True)
+                right = -np.matmul(m,np.matmul(ky11,m))
                 # (0,1,1,1)
-                tmp = np.einsum('wji,wjk->wik',mK12,Kx11)
-                tmp = np.einsum('wij,wjk->wik',tmp,mK12)
-                tr += np.einsum('wij,ji->w',tmp,c2)
+                right += np.matmul(mk12,np.matmul(c2,mk12.transpose(0,2,1)))
+                k = _select(Kx11,(0,1,3),term)
+                k = _block(k,ns,sign=1)
+                #tr += np.einsum('wij,wji->w',k,right)
+                tr += (k*right).sum()
 
                 # (1,0,0,0)
-                k = term.select(kmap['Kypp'][0],(1,2))
+                k = term.select(Kypp[0],(1,2))
                 tr += np.einsum('wii,i->w',k,d2)
 
-                # (1,0,0,1),(1,1,0,0)
-                k = _select(kmap['Ky1p'],(0,2),term)
-                tmp = np.concatenate([k[0],k[2]],axis=1) 
-                k = _select(kmap['K1p'],(0,2),term)
-                k = np.concatenate([k[0],k[2]],axis=1)
-                mK1p = np.einsum('wij,wjk->wik',m,k)
-                tr -= 2*np.einsum('wji,wji,i->w',tmp,mK1p,d2)
-                
                 # (1,0,1,0)
-                k = _select(kmap['K2p'],(0,2),term)
-                K2p = np.concatenate([k[0],k[2]],axis=1) 
-                tmp = np.einsum('wji,jk->wik',K2p,c2)
-                tr += np.einsum('wij,wji,i->w',tmp,K2p,d2)
+                k = _select(K2p,(0,2),term)
+                k2p = np.concatenate([k[0],k[2]],axis=1) 
+                tmp = np.matmul(k2p.transpose(0,2,1),c2)
+                tr += np.einsum('wij,wji,i->w',tmp,k2p,d2)
+                #tr += (tmp.transpose(0,2,1)*k2p*d2).sum()
 
+                k = _select(K1p,(0,2),term)
+                k = np.concatenate([k[0],k[2]],axis=1)
+                mk1p = np.matmul(m,k)
+                # (1,0,0,1),(1,1,0,0)
+                k = _select(Ky1p,(0,2),term)
+                left = -2.*np.concatenate([k[0],k[2]],axis=1) 
                 # (1,0,1,1),(1,1,1,0)
-                k = _select(kmap['K12'],(0,1,2,3),term)
-                K12 = np.block([[k[0],k[1]],[k[2],k[3]]])
-                K12c = np.einsum('wij,jk->wik',K12,c2)
-                tmp = np.einsum('wji,wkj->wik',K2p,K12c)
-                tr += 2.*np.einsum('wij,wji,i->w',tmp,mK1p,d2)
-
+                k12c = np.matmul(k12,c2)
+                left += 2.*np.matmul(k12c,k2p)
                 # (1,1,0,1)
-                tmp = np.einsum('wji,wjk->wik',mK1p,Ky11)
-                tr += np.einsum('wij,wji,i->w',tmp,mK1p,d2)
-
                 # (1,1,1,1)
-                tmp = np.einsum('wji,wjk->wik',mK1p,K12c)
-                tmp = np.einsum('wij,wkj->wik',tmp,K12)
-                tr += np.einsum('wij,wji,i->w',tmp,mK1p,d2)
+                tmp = ky11 + np.matmul(k12,k12c.transpose(0,2,1))
+                left += np.matmul(tmp,mk1p)
+                tr += np.einsum('wji,wji,i->w',left,mk1p,d2)
+                #tr += (left*mk1p*d2).sum()
 
                 R[kix] = 1./np.sqrt(1.+self.eps_sq*tr)
         return ovlp,R0,R
@@ -452,6 +465,7 @@ class SORHFBTrial(SORHFTrial):
                 K12 = _K12(walkers,B)
                 K = np.block([[K11,K12],[-K12.transpose(0,2,1),np.zeros((nw,n2,n2))]])
                 ovlp[kix] = np.array([pf.pfaffian(Ki) for Ki in K])/ovlp0
+
                 K = np.linalg.inv(K)
                 K = _parse(K,n1)
                 D = _D0(walkers,CZ,B,K[0],K[1])

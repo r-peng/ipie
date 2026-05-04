@@ -25,7 +25,6 @@ class SingleHFB(TrialWavefunctionBase):
         self,
         occupied: numpy.ndarray,
         pairing: numpy.ndarray,
-        nocc: int,
         num_basis: int,
         verbose: bool = False,
     ):
@@ -36,7 +35,7 @@ class SingleHFB(TrialWavefunctionBase):
         if verbose:
             print("# Parsing input options for trial_wavefunction.SingleDetGHF.")
         self.psi0 = (occupied,pairing)
-        self.nocc = nocc
+        self.nocc = occupied.shape[1] 
         self._num_dets = 1
         self._max_num_dets = 1
 

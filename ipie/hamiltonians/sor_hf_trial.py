@@ -270,7 +270,7 @@ class SORHFTrial(SumOfRotationBase):
         for w,(d,i) in enumerate(keys):
             term = self.terms[d][i] 
             phi = [walkers.phia[w],walkers.phib[w]]
-            phi = term.apply_rotation(phi,self.chol_basis[d])
+            phi = term.apply_rotation(phi,self.chol_basis[d],self.nbasis)
             walkers.phia[w] = phi[0]
             walkers.phib[w] = phi[1]
 

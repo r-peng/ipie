@@ -111,13 +111,15 @@ class Udiag:
                 continue
             U[s] = np.einsum('xp,yp,p->xy',v,v,Us)
         return U
-    def apply_rotation(self,phi0,v):
-        nsite = v.shape[0]
+    def apply_rotation(self,phi0,v,nsite):
         phi = [phis.copy() for phis in phi0]
         for p,d in zip(self.ps,self.ds):
             s,ps = p//nsite,p%nsite
-            vec = np.take(v,ps,axis=1)
-            phi[s] += d*np.outer(vec,np.dot(vec,phi0[s]))
+            if v is None:
+                phi[s][ps] += d*phi0[s][ps]
+            else:
+                vec = np.take(v,ps,axis=1)
+                phi[s] += d*np.outer(vec,np.dot(vec,phi0[s]))
         return phi
 
 class SumOfRotationBase(GenericBase):
@@ -197,9 +199,9 @@ class SumOfRotationBase(GenericBase):
         sign = np.sign(gf)
         s = sign.flatten()
         nminus = len(s[s<-0.5])
-        if nminus>0:
-            print('number of minus=',nminus)
-            #exit()
+        #if nminus>0:
+        #    print('number of minus=',nminus)
+        #    #exit()
 
         p = np.fabs(gf)
         b = p.sum(axis=0)
