@@ -229,6 +229,8 @@ class SumOfRotationBase(GenericBase):
                     E2 += term.ai * ovlp[kix]
         E1 = self.Lambda1 - E1
         E2 = self.Lambda2 - E2
+        if RANK==0:
+            print('R0 mean=',np.mean(R0))
         return E1+E2,E1,E2,R0
 
     def _get_MB_gf(self,basis):

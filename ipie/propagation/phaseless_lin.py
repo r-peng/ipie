@@ -55,6 +55,5 @@ class PhaselessLin(PhaselessBase):
         walkers.sgn_ovlp *= xp.sign(b) 
         synchronize()
         self.timer.tupdate += time.time() - start_time
-
     def apply_VHS(self, walkers, hamiltonian, xshifted):
         pass
