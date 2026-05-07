@@ -29,7 +29,7 @@ class PopController(PopController_):
         if self.method=='stochastic_reconfiguration':
             stochastic_reconfiguration(walkers, comm, self.timer, self.pop_control_counter)
             average_weight = walkers.weight[0]
-            walkers.weight = 0. 
+            walkers.weight = xp.zeros(walkers.nwalkers) 
             average_weight = xp.log(average_weight)
             #print('global_max,log_ave',global_max,average_weight)
             return average_weight + global_max

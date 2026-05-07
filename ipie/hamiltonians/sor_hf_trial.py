@@ -1,10 +1,34 @@
 import numpy as np
-import scipy,itertools,plum
+import scipy,itertools,plum,h5py
 from ipie.hamiltonians.sor_base import * 
 from ipie.walkers.uhf_walkers import UHFWalkers
 from ipie.walkers.ghf_walkers import GHFWalkers
 from ipie.trial_wavefunction.single_det import SingleDet 
 from ipie.trial_wavefunction.single_det_ghf import SingleDetGHF
+
+@plum.dispatch
+def walkers2tensor(walkers:UHFWalkers):
+    return np.array([walkers.phia.real,walkers.phib.real])
+
+@plum.dispatch
+def walkers2tensor(walkers:GHFWalkers):
+    return walkers.phi.real
+
+def save_walkers(walkers,comm,dirname):
+    if comm.rank>0:
+        obj = walkers2tensor(walkers),walkers.weight,walkers.sgn_ovlp
+        comm.send(obj,0)
+        return
+    phi = [walkers2tensor(walkers)] + ([None] * (SIZE-1))
+    weights = [walkers.weight] + ([None] * (SIZE-1))
+    sgn_ovlp = [walkers.sgn_ovlp] + ([None] * (SIZE-1))
+    for r in range(1,SIZE):
+        phi[r],weights[r],sgn_ovlp[r] = comm.recv(source=r)
+    f = h5py.File(f'{dirname}/walkers.hdf5','w')
+    f.create_dataset('phi',data=np.concatenate(phi,axis=0))
+    f.create_dataset('log_weights',data=np.concatenate(weights,axis=0))
+    f.create_dataset('sgn_ovlp',data=np.concatenate(sgn_ovlp,axis=0))
+    f.close()
 
 @plum.dispatch
 def walkers2uhf(walkers:UHFWalkers):
@@ -266,13 +290,22 @@ class SORHFTrial(SumOfRotationBase):
         return ovlp,R0,R
 
     @plum.dispatch
-    def update_workers(self,keys,walkers:UHFWalkers):
+    def update_walkers(self,keys,walkers:UHFWalkers):
         for w,(d,i) in enumerate(keys):
             term = self.terms[d][i] 
             phi = [walkers.phia[w],walkers.phib[w]]
             phi = term.apply_rotation(phi,self.chol_basis[d],self.nbasis)
             walkers.phia[w] = phi[0]
             walkers.phib[w] = phi[1]
+
+    @plum.dispatch
+    def update_walkers(self,keys,walkers:GHFWalkers):
+        nb = walkers.nbasis
+        for w,(d,i) in enumerate(keys):
+            term = self.terms[d][i] 
+            phi = [walkers.phi[w,:nb],walkers.phi[w,nb:]]
+            phi = term.apply_rotation(phi,self.chol_basis[d],nb)
+            walkers.phi[w] = np.concatenate(phi,axis=0)
 
     def _get_trial_ovlp_ratio(self,walkers,trial):
         C = walkers2ghf(walkers)

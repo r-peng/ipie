@@ -5,6 +5,7 @@ from ipie.hamiltonians.generic_base import GenericBase
 from mpi4py import MPI
 COMM = MPI.COMM_WORLD
 RANK = COMM.Get_rank()
+SIZE = COMM.Get_size()
 def quadratic2MB(M,basis,spin,thresh=1e-6):
     if len(M.shape)==1:
         M = np.diag(M)
@@ -229,8 +230,9 @@ class SumOfRotationBase(GenericBase):
                     E2 += term.ai * ovlp[kix]
         E1 = self.Lambda1 - E1
         E2 = self.Lambda2 - E2
-        if RANK==0:
-            print('R0 mean=',np.mean(R0))
+        if R0 is not None:
+            if RANK==0:
+                print('R0 mean=',np.mean(R0))
         return E1+E2,E1,E2,R0
 
     def _get_MB_gf(self,basis):

@@ -31,6 +31,7 @@ from ipie.config import config
 from ipie.estimators.estimator_base import EstimatorBase
 from ipie.estimators.handler_custom import EstimatorHandler
 from ipie.hamiltonians.utils import get_hamiltonian
+from ipie.hamiltonians.sor_hf_trial import save_walkers
 from ipie.propagation.propagator import Propagator
 from ipie.qmc.options import QMCParams
 from ipie.qmc.utils import set_rng_seed
@@ -360,6 +361,16 @@ class LAFQMC(AFQMC):
             )
             self.estimators.print_block(comm, block, self.accumulators)
 
+    def save(self,comm,dirname='.'):
+        if dirname is None:
+            return
+        save_walkers(self.walkers,comm,dirname)
+        if self.params.pop_control_method!='stochastic_reconfiguration':
+            return
+        if comm.rank>0:
+            return
+        self.estimators.save(dirname)
+
     def run(
         self,
         walkers=None,
@@ -369,6 +380,7 @@ class LAFQMC(AFQMC):
         additional_estimators: Optional[Dict[str, EstimatorBase]] = None,
         max_nprod=20,
         max_nsum=500,
+        dirname='.',
     ):
         """Perform AFQMC simulation on state object using open-ended random walk.
 
@@ -531,27 +543,29 @@ class LAFQMC(AFQMC):
                     block = (step - num_eqlb_steps) // self.params.num_steps_per_block
                     self.estimate_energy(comm,block,max_nprod,max_nsum)
                     self.accumulators.zero()
+                    self.save(comm,dirname)
             else:
                 if step % self.params.eq_num_steps_per_block == 0:
                     block = step // self.params.eq_num_steps_per_block
                     self.estimate_energy(comm,block,max_nprod,max_nsum)
                     self.accumulators.zero()
+                    self.save(comm,dirname)
             synchronize()
             self.testim += time.time() - start
 
-            # restart write features disabled
-            if self.walkers.write_restart:
-                if self.walkers.write_freq is not None:
-                    if step % self.walkers.write_freq == 0:
-                        self.walkers.write_walkers_batch(comm)
-                else:
-                    assert self.walkers.write_time is not None
-                    if step == self.walkers.write_time:
-                        self.walkers.write_walkers_batch(comm)
+            ## restart write features disabled
+            #if self.walkers.write_restart:
+            #    if self.walkers.write_freq is not None:
+            #        if step % self.walkers.write_freq == 0:
+            #            self.walkers.write_walkers_batch(comm)
+            #    else:
+            #        assert self.walkers.write_time is not None
+            #        if step == self.walkers.write_time:
+            #            self.walkers.write_walkers_batch(comm)
 
-            if step < num_eqlb_steps:
-                eshift = self.accumulators.eshift
-            else:
-                eshift += self.accumulators.eshift - eshift
-            synchronize()
-            self.tstep += time.time() - start_step
+            #if step < num_eqlb_steps:
+            #    eshift = self.accumulators.eshift
+            #else:
+            #    eshift += self.accumulators.eshift - eshift
+            #synchronize()
+            #self.tstep += time.time() - start_step

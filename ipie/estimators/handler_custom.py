@@ -97,14 +97,18 @@ class EstimatorHandler(EstimatorHandler_):
             print("# Finished settting up estimator object.")
 
         self.log_average_weights = []
-    def save_log_average_weights(self,dirname='.'):
-        if dirname is None:
-            return
-        numpy.save(f'{dirname}/log_average_weights.npy',numpy.array(self.log_average_weights))
-    def load_log_average_weights(self,dirname,rank):
+    def load(self,dirname,rank):
         if rank>0:
             return
         self.log_average_weights = list(numpy.load(f'{dirname}/log_average_weights.npy'))
+        for k,e in self.items():
+            e.load_sr_data(dirname,rank)
+    def save(self,dirname='.'):
+        if dirname is None:
+            return
+        numpy.save(f'{dirname}/log_average_weights.npy',numpy.array(self.log_average_weights))
+        for k,e in self.items():
+            e.save_sr_data(dirname=dirname)
     def post_sr(self,comm,walker_factors,log_average_weight,dirname='.'):
         self.local_estimates[: walker_factors.size] = walker_factors.buffer
         comm.Reduce(self.local_estimates, self.global_estimates, op=MPI.SUM)
@@ -112,7 +116,6 @@ class EstimatorHandler(EstimatorHandler_):
             self.zero()
             return
         self.log_average_weights.append(log_average_weight)
-        self.save_log_average_weights(dirname)
         # Get walker data.
         offset = walker_factors.size
         #walker_factors.post_reduce_hook(self.global_estimates[:offset], 0)

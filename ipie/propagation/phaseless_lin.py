@@ -41,13 +41,16 @@ class PhaselessLin(PhaselessBase):
         # 2.update walker
         keys,b = hamiltonian.sample_from_gf(gf)
         start_time = time.time()
-        hamiltonian.update_workers(keys,walkers)
+        hamiltonian.update_walkers(keys,walkers)
         synchronize()
         self.timer.tgemm += time.time() - start_time
 
         # 3.update weight
         start_time = time.time()
         if constraint_path:
+            nminus = len(b[b<0])
+            if nminus>0:
+                print('number of minus=',nminus)
             xp.clip(b,a_min=0.,a_max=None,out=b) 
         walkers.weight += xp.log(xp.fabs(b))
         # use .sgn_ovlp to store signs for now

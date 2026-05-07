@@ -47,8 +47,7 @@ class EnergyEstimator(EnergyEstimator_):
         for key in self._sr_data: 
             ix = self._data_index[key]
             self._sr_data[key].append(data[ix])
-        self.save_sr_data(dirname)
-    def save_sr_data(self,dirname='./'): 
+    def save_sr_data(self,dirname='.'): 
         if dirname is None:
             return
         f = h5py.File(f'{dirname}/energy.h5','w')
