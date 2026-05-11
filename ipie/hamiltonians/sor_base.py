@@ -1,7 +1,10 @@
 import numpy as np
 import scipy,itertools
+from ipie.config import config
 from ipie.hamiltonians.bitstring_utils import * 
 from ipie.hamiltonians.generic_base import GenericBase
+from ipie.utils.backend import arraylib as xp
+from ipie.utils.backend import to_host
 from mpi4py import MPI
 COMM = MPI.COMM_WORLD
 RANK = COMM.Get_rank()
@@ -87,8 +90,11 @@ class Udiag:
         self.ns = self.ds.size
     def select(self,D,axes):
         for ax in axes:
-            D = np.take(D,self.ps,axis=ax)
+            D = xp.take(D,self.ps,axis=ax)
         return D
+    def cast_to_cupy(self):
+        self.gs = xp.asarray(self.gs)
+        self.ds = xp.asarray(self.ds)
     def get_MB_kappa(self,v,basis):
         nsite = v.shape[0]
         kappa = [None] * 2
@@ -105,12 +111,12 @@ class Udiag:
         for p,d in zip(self.ps,self.ds):
             s,ps = p//nsite,p%nsite
             if U[s] is None:
-                U[s] = np.ones(nsite)
+                U[s] = xp.ones(nsite)
             U[s][ps] = d+1
         for s,Us in enumerate(U):
             if Us is None:
                 continue
-            U[s] = np.einsum('xp,yp,p->xy',v,v,Us)
+            U[s] = xp.einsum('xp,yp,p->xy',v,v,Us)
         return U
     def apply_rotation(self,phi0,v,nsite):
         phi = [phis.copy() for phis in phi0]
@@ -119,8 +125,8 @@ class Udiag:
             if v is None:
                 phi[s][ps] += d*phi0[s][ps]
             else:
-                vec = np.take(v,ps,axis=1)
-                phi[s] += d*np.outer(vec,np.dot(vec,phi0[s]))
+                vec = xp.take(v,ps,axis=1)
+                phi[s] += d*xp.outer(vec,xp.dot(vec,phi0[s]))
         return phi
 
 class SumOfRotationBase(GenericBase):
@@ -189,6 +195,19 @@ class SumOfRotationBase(GenericBase):
                 kix = self.key_map[d,i]
                 self.bare_gf[kix] = term.ai/Lambda
 
+    def cast_to_cupy(self, verbose=False):
+        if not config.get_option("use_gpu"):
+            return
+        if verbose:
+            print(f"# {self.__class__.__name__}: moving SOR arrays to GPU")
+        self.H1 = xp.asarray(self.H1)
+        if hasattr(self, "bare_gf"):
+            self.bare_gf = xp.asarray(self.bare_gf)
+        self.chol_basis = [None if basis is None else xp.asarray(basis) for basis in self.chol_basis]
+        for terms in self.terms:
+            for term in terms:
+                term.cast_to_cupy()
+
     def calc_gf(self,walkers,trial):
         ovlp,R0,R = self.calc_trial_ovlp_ratio(walkers,trial)
         gf = self.bare_gf.reshape(self.nkeys,1) * ovlp
@@ -197,22 +216,22 @@ class SumOfRotationBase(GenericBase):
         return gf*R0.reshape(1,walkers.nwalkers)/R
 
     def sample_from_gf(self,gf):
-        sign = np.sign(gf)
-        s = sign.flatten()
-        nminus = len(s[s<-0.5])
+        sign = xp.sign(gf)
+        nminus = int(to_host(xp.sum(sign < -0.5)))
         #if nminus>0:
         #    print('number of minus=',nminus)
         #    #exit()
 
-        p = np.fabs(gf)
+        p = xp.fabs(gf)
         b = p.sum(axis=0)
         nwalker = b.size
         p /= b.reshape(1,nwalker)
-        keys = [None] * nwalker
-        for w in range(nwalker):
-            kix = np.random.choice(self.nkeys,p=p[:,w])
-            keys[w] = self.keys[kix]
-            b[w] *= sign[kix,w] 
+        cdf = xp.cumsum(p, axis=0)
+        sample = xp.random.random(nwalker)
+        kixs = xp.sum(cdf < sample.reshape(1,nwalker), axis=0).astype(xp.int64)
+        kixs = xp.minimum(kixs, self.nkeys - 1)
+        b *= sign[kixs, xp.arange(nwalker)]
+        keys = [self.keys[int(kix)] for kix in to_host(kixs)]
         self.b = b
         return keys,b
     
@@ -232,7 +251,7 @@ class SumOfRotationBase(GenericBase):
         E2 = self.Lambda2 - E2
         if R0 is not None:
             if RANK==0:
-                print('R0 mean=',np.mean(R0))
+                print('R0 mean=',to_host(xp.mean(R0)))
         return E1+E2,E1,E2,R0
 
     def _get_MB_gf(self,basis):
@@ -251,4 +270,3 @@ class SumOfRotationBase(GenericBase):
                         U = np.dot(U,Us)
                 H += term.ai*U
         return H
-
