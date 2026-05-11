@@ -14,6 +14,16 @@ def walkers2tensor(walkers:UHFWalkers):
 def walkers2tensor(walkers:GHFWalkers):
     return walkers.phi.real
 
+@plum.dispatch
+def tensor2walkers(walkers:UHFWalkers,phi):
+    walkers.phia = phi[0]
+    walkers.phib = phi[1]
+    return walkers
+
+def tensor2walkers(walkers:GHFWalkers,phi):
+    walkers.phi = phi
+    return walkers 
+
 def save_walkers(walkers,comm,dirname):
     if comm.rank>0:
         obj = walkers2tensor(walkers),walkers.weight,walkers.sgn_ovlp
@@ -29,6 +39,27 @@ def save_walkers(walkers,comm,dirname):
     f.create_dataset('log_weights',data=np.concatenate(weights,axis=0))
     f.create_dataset('sgn_ovlp',data=np.concatenate(sgn_ovlp,axis=0))
     f.close()
+
+def load_walkers(walkers,dirname):
+    f = h5py.File(f'{dirname}/walkers.hdf5','r')
+    phi = f['phi'][:]
+    log_weights = f['log_weights'][:]
+    sgn_ovlp = f['sgn_ovlp'][:]
+    f.close()
+
+    nw = log_weights.size
+    b,r = nw//SIZE,nw%SIZE
+    counts = np.array([b]*SIZE)
+    if r>0:
+        counts[:r] += 1
+    counts = np.cumsum(counts)
+    start = 0 if RANK==0 else counts[RANK-1]
+    stop = counts[RANK]
+    print(f'RANK={RANK},start={start},stop={stop}')
+    walkers = tensor2walkers(walkers,phi[start:stop])
+    walkers.weight = np.exp(log_weights[start:stop])
+    walkers.sgn_ovlp = sgn_ovlp[start:stop]
+    return walkers
 
 @plum.dispatch
 def walkers2uhf(walkers:UHFWalkers):

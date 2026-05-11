@@ -37,11 +37,16 @@ class EnergyEstimator(EnergyEstimator_):
         weight = xp.exp(walkers.weight) * walkers.sgn_ovlp
         if R0 is not None:
             weight *= R0 
+        nw = walkers.nwalkers
+        if abs(walkers.sgn_ovlp.sum()/nw-1.)>1e-6:
+            print(walkers.sgn_ovlp)
 
-        self._data["ENumer"] = xp.sum(weight * Etot)
-        self._data["EDenom"] = xp.sum(weight)
-        self._data["E1Body"] = xp.sum(weight * E1)
-        self._data["E2Body"] = xp.sum(weight * E2)
+        self._data["ENumer"] = xp.sum(weight * Etot)/nw
+        self._data["EDenom"] = xp.sum(weight)/nw
+        self._data["E1Body"] = xp.sum(weight * E1)/nw
+        self._data["E2Body"] = xp.sum(weight * E2)/nw
+        if abs(self._data['EDenom']-1.)>1e-6:
+            print('weight=',self._data['EDenom'])
         return self.data
     def process_sr_data(self,data,dirname='.'):
         for key in self._sr_data: 
@@ -59,13 +64,14 @@ class EnergyEstimator(EnergyEstimator_):
             return
         f = h5py.File(f'{dirname}/energy.h5','r')
         for key in self._sr_data:
-            self._sr_data = list(f[key][:])
+            self._sr_data[key] = list(f[key][:])
         f.close()
-    def compute_estimator_sr(self,weight,rank,shift):
+    def compute_estimator_sr(self,weight,rank,shift,ntot=None):
         if rank>0:
             return
         est_data = xp.zeros(len(self._data_index))
         for key,data in self._sr_data.items():
             ix = self._data_index[key]
-            est_data[ix] = xp.dot(weight,xp.array(data[shift:]))
+            dat = data[shift:] if ntot is None else data[shift:ntot]
+            est_data[ix] = xp.dot(weight,xp.array(dat))
         return est_data

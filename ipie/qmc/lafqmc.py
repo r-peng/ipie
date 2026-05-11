@@ -378,6 +378,7 @@ class LAFQMC(AFQMC):
         verbose=True,
         discard_weights_aftereq=False,
         additional_estimators: Optional[Dict[str, EstimatorBase]] = None,
+        constraint_path=True,
         max_nprod=20,
         max_nsum=500,
         dirname='.',
@@ -456,7 +457,7 @@ class LAFQMC(AFQMC):
             start = time.time()
             if step <= num_eqlb_steps:
                 self.eq_propagator.propagate_walkers(
-                    self.walkers, self.hamiltonian, self.trial, eshift
+                    self.walkers, self.hamiltonian, self.trial, constraint_path=constraint_path 
                 )
                 self.tprop_fbias = self.eq_propagator.timer.tfbias
                 self.tprop_ovlp = self.eq_propagator.timer.tovlp
@@ -469,7 +470,7 @@ class LAFQMC(AFQMC):
                     if step == num_eqlb_steps + 1:
                         self.walkers.weight.fill(1.0)
                 self.propagator.propagate_walkers(
-                    self.walkers, self.hamiltonian, self.trial, eshift
+                    self.walkers, self.hamiltonian, self.trial, constraint_path=constraint_path 
                 )
                 self.tprop_fbias = self.propagator.timer.tfbias
                 self.tprop_ovlp = self.propagator.timer.tovlp

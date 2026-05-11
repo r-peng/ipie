@@ -38,7 +38,6 @@ _predefined_estimators = {
     "energy": EnergyEstimator,
 }
 
-
 class EstimatorHandler(EstimatorHandler_):
     def __init__(
         self,
@@ -125,10 +124,10 @@ class EstimatorHandler(EstimatorHandler_):
             est_data = self.global_estimates[start:end]
             e.process_sr_data(est_data,dirname)
         self.zero()
-    def print_block_sr(self,comm,block,walker_factors,max_nprod,max_nsum):
-        if comm.rank>0:
-            return
-        ntot = len(self.log_average_weights)
+    def compute_weights(self,max_nprod,max_nsum,ntot=None):
+        log_average_weights = self.log_average_weights if ntot is None else \
+                              self.log_average_weights[:ntot]
+        ntot = len(log_average_weights)
         nprod = min(max_nprod,ntot)
         nsum = min(ntot-nprod+1,max_nsum)
         shift = ntot - nsum 
@@ -137,18 +136,22 @@ class EstimatorHandler(EstimatorHandler_):
         for i in range(nsum):
             stop = i+shift+1
             start = stop-nprod
-            weight[i] = sum(self.log_average_weights[start:stop])
+            weight[i] = sum(log_average_weights[start:stop])
         max_weight = numpy.amax(weight)
-        weight = numpy.exp(weight-max_weight)
+        return numpy.exp(weight-max_weight),shift,max_weight
+    def print_block_sr(self,comm,block,walker_factors,max_nprod,max_nsum,ntot=None):
+        if comm.rank>0:
+            return
+        weights,shift,max_weight = self.compute_weights(max_nprod,max_nsum,ntot=ntot)
 
         output_string = " "
-        vals = numpy.mean(weight),max_weight,0.
+        vals = numpy.mean(weights),max_weight,0.
         output_string += walker_factors.to_text(numpy.array(vals))
         output_string += " "
 
         offset = self.num_walker_props
         for k,e in self.items():
-            est_data = e.compute_estimator_sr(weight,comm.rank,shift)
+            est_data = e.compute_estimator_sr(weights,comm.rank,shift,ntot=ntot)
             e.post_reduce_hook(est_data)
             est_string = e.data_to_text(est_data)
             e.to_ascii_file(est_string)

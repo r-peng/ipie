@@ -48,7 +48,7 @@ class PhaselessLin(PhaselessBase):
         # 3.update weight
         start_time = time.time()
         if constraint_path:
-            nminus = len(b[b<0])
+            nminus = len(b[b<1e-6])
             if nminus>0:
                 print('number of minus=',nminus)
             xp.clip(b,a_min=0.,a_max=None,out=b) 
@@ -56,6 +56,8 @@ class PhaselessLin(PhaselessBase):
         # use .sgn_ovlp to store signs for now
         # doesn't seemed to be used for anything else
         walkers.sgn_ovlp *= xp.sign(b) 
+        if abs(xp.sign(b).sum()/b.size-1.)>1e-6:
+            print(b)
         synchronize()
         self.timer.tupdate += time.time() - start_time
     def apply_VHS(self, walkers, hamiltonian, xshifted):
