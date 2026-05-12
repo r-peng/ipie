@@ -17,9 +17,10 @@
 
 from typing import Union
 
-import plum,h5py
+import plum,h5py,numpy
 
 from ipie.utils.backend import arraylib as xp
+from ipie.utils.backend import to_host
 from ipie.estimators.energy import EnergyEstimator as EnergyEstimator_
 
 class EnergyEstimator(EnergyEstimator_):
@@ -38,15 +39,11 @@ class EnergyEstimator(EnergyEstimator_):
         if R0 is not None:
             weight *= R0 
         nw = walkers.nwalkers
-        if abs(walkers.sgn_ovlp.sum()/nw-1.)>1e-6:
-            print(walkers.sgn_ovlp)
 
         self._data["ENumer"] = xp.sum(weight * Etot)/nw
         self._data["EDenom"] = xp.sum(weight)/nw
         self._data["E1Body"] = xp.sum(weight * E1)/nw
         self._data["E2Body"] = xp.sum(weight * E2)/nw
-        if abs(self._data['EDenom']-1.)>1e-6:
-            print('weight=',self._data['EDenom'])
         return self.data
     def process_sr_data(self,data,dirname='.'):
         for key in self._sr_data: 
@@ -57,7 +54,7 @@ class EnergyEstimator(EnergyEstimator_):
             return
         f = h5py.File(f'{dirname}/energy.h5','w')
         for key,data in self._sr_data.items():
-            f.create_dataset(key,data=xp.array(data))
+            f.create_dataset(key,data=to_host(xp.asarray(data)))
         f.close()
     def load_sr_data(self,dirname,rank):
         if rank>0:
@@ -73,5 +70,5 @@ class EnergyEstimator(EnergyEstimator_):
         for key,data in self._sr_data.items():
             ix = self._data_index[key]
             dat = data[shift:] if ntot is None else data[shift:ntot]
-            est_data[ix] = xp.dot(weight,xp.array(dat))
+            est_data[ix] = xp.dot(weight,xp.asarray(dat).real)
         return est_data

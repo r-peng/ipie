@@ -25,6 +25,8 @@ from typing import Tuple, Union
 
 import h5py
 import numpy
+from ipie.utils.backend import arraylib as xp
+from ipie.utils.backend import to_host
 
 from ipie.config import config, MPI
 from ipie.estimators.energy_custom import EnergyEstimator
@@ -105,7 +107,7 @@ class EstimatorHandler(EstimatorHandler_):
     def save(self,dirname='.'):
         if dirname is None:
             return
-        numpy.save(f'{dirname}/log_average_weights.npy',numpy.array(self.log_average_weights))
+        numpy.save(f'{dirname}/log_average_weights.npy',to_host(xp.asarray(self.log_average_weights)))
         for k,e in self.items():
             e.save_sr_data(dirname=dirname)
     def post_sr(self,comm,walker_factors,log_average_weight,dirname='.'):
@@ -127,26 +129,29 @@ class EstimatorHandler(EstimatorHandler_):
     def compute_weights(self,max_nprod,max_nsum,ntot=None):
         log_average_weights = self.log_average_weights if ntot is None else \
                               self.log_average_weights[:ntot]
+        log_average_weights = xp.asarray(log_average_weights).real
         ntot = len(log_average_weights)
         nprod = min(max_nprod,ntot)
         nsum = min(ntot-nprod+1,max_nsum)
         shift = ntot - nsum 
         #print(f'ntot={ntot},nprod={nprod},nsum={nsum},shift={shift}')
-        weight = numpy.zeros(nsum)
+        weight = xp.zeros(nsum)
         for i in range(nsum):
             stop = i+shift+1
             start = stop-nprod
-            weight[i] = sum(log_average_weights[start:stop])
-        max_weight = numpy.amax(weight)
-        return numpy.exp(weight-max_weight),shift,max_weight
+            weight[i] = log_average_weights[start:stop].sum()
+        max_weight = xp.amax(weight)
+        return xp.exp(weight-max_weight),shift,max_weight
     def print_block_sr(self,comm,block,walker_factors,max_nprod,max_nsum,ntot=None):
         if comm.rank>0:
             return
         weights,shift,max_weight = self.compute_weights(max_nprod,max_nsum,ntot=ntot)
 
         output_string = " "
-        vals = numpy.mean(weights),max_weight,0.
-        output_string += walker_factors.to_text(numpy.array(vals))
+        vals = xp.zeros(3)
+        vals[0] = xp.mean(weights)
+        vals[1] = max_weight
+        output_string += walker_factors.to_text(vals)
         output_string += " "
 
         offset = self.num_walker_props

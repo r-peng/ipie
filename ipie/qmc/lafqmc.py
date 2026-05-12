@@ -439,6 +439,7 @@ class LAFQMC(AFQMC):
         comm = self.mpi_handler.comm
         self.tsetup += time.time() - tzero_setup
 
+        t0 = time.time()
         for step in range(1, total_steps + 1):
             synchronize()
             start_step = time.time()
@@ -545,12 +546,16 @@ class LAFQMC(AFQMC):
                     self.estimate_energy(comm,block,max_nprod,max_nsum)
                     self.accumulators.zero()
                     self.save(comm,dirname)
+                    if comm.rank==0:
+                        print('time=',time.time()-t0)
             else:
                 if step % self.params.eq_num_steps_per_block == 0:
                     block = step // self.params.eq_num_steps_per_block
                     self.estimate_energy(comm,block,max_nprod,max_nsum)
                     self.accumulators.zero()
                     self.save(comm,dirname)
+                    if comm.rank==0:
+                        print('time=',time.time()-t0)
             synchronize()
             self.testim += time.time() - start
 

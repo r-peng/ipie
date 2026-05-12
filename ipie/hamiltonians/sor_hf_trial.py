@@ -10,7 +10,7 @@ from ipie.trial_wavefunction.single_det_ghf import SingleDetGHF
 
 @plum.dispatch
 def walkers2tensor(walkers:UHFWalkers):
-    return xp.stack((walkers.phia.real,walkers.phib.real))
+    return xp.concatenate((walkers.phia.real,walkers.phib.real),axis=2)
 
 @plum.dispatch
 def walkers2tensor(walkers:GHFWalkers):
@@ -18,9 +18,10 @@ def walkers2tensor(walkers:GHFWalkers):
 
 @plum.dispatch
 def tensor2walkers(walkers:UHFWalkers,phi):
+    nu = walkers.nup
     phi = xp.asarray(phi)
-    walkers.phia = phi[0]
-    walkers.phib = phi[1]
+    walkers.phia = phi[:,:,:nu]
+    walkers.phib = phi[:,:,nu:]
     return walkers
 
 @plum.dispatch
@@ -38,18 +39,22 @@ def save_walkers(walkers,comm,dirname):
     sgn_ovlp = [to_host(walkers.sgn_ovlp)] + ([None] * (SIZE-1))
     for r in range(1,SIZE):
         phi[r],weights[r],sgn_ovlp[r] = comm.recv(source=r)
-    f = h5py.File(f'{dirname}/walkers.hdf5','w')
+    f = h5py.File(f'{dirname}/walkers.h5','w')
     f.create_dataset('phi',data=np.concatenate(phi,axis=0))
     f.create_dataset('log_weights',data=np.concatenate(weights,axis=0))
     f.create_dataset('sgn_ovlp',data=np.concatenate(sgn_ovlp,axis=0))
     f.close()
 
 def load_walkers(walkers,dirname):
-    f = h5py.File(f'{dirname}/walkers.hdf5','r')
+    f = h5py.File(f'{dirname}/walkers.h5','r')
     phi = f['phi'][:]
     log_weights = f['log_weights'][:]
     sgn_ovlp = f['sgn_ovlp'][:]
     f.close()
+    print(phi.shape)
+    print(log_weights.shape)
+    print(sgn_ovlp.shape)
+    exit()
 
     nw = log_weights.size
     b,r = nw//SIZE,nw%SIZE
@@ -253,22 +258,22 @@ def _rdm_intermediates(U,D,UD,full=True):
     return UDDtU,UDtDU,UDDDU
 
 def _compute_trial_ovlp(term,D):
-    ns,ds = term.ns,term.ds
+    n,d = term.n,term.d
     Dj = term.select(D,(1,2))
-    M = Dj+xp.diag(1./ds).reshape(1,ns,ns)
+    M = Dj+xp.diag(1./d).reshape(1,n,n)
     det = xp.linalg.det(M)
-    return det * ds.prod()
+    return det * d.prod()
 
 def _compute_M(term,D):
-    ns,ds = term.ns,term.ds
+    n,d = term.n,term.d
     # input matrix dim: walker,p,q
     Dj = term.select(D,(1,2))
-    M1 = Dj+xp.diag(1./ds).reshape(1,ns,ns)
+    M1 = Dj+xp.diag(1./d).reshape(1,n,n)
     M1 = xp.linalg.inv(M1)
 
     M2 = xp.einsum('wij,wjk->wik',M1,Dj)
-    M2 = xp.eye(ns).reshape(1,ns,ns) - M2
-    return M1,M2*ds.reshape(1,1,ns)
+    M2 = xp.eye(n).reshape(1,n,n) - M2
+    return M1,M2*d.reshape(1,1,n)
 
 class SORHFTrial(SumOfRotationBase):
 
@@ -301,7 +306,7 @@ class SORHFTrial(SumOfRotationBase):
                     continue
 
                 M1,M2 = _compute_M(term,UDU)
-                ovlp[kix] = term.ds.prod()/xp.linalg.det(M1)
+                ovlp[kix] = term.d.prod()/xp.linalg.det(M1)
 
                 tr = tr0.copy()
                 P1i = term.select(P1,(1,2))

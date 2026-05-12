@@ -57,8 +57,6 @@ class PhaselessLin(PhaselessBase):
         # use .sgn_ovlp to store signs for now
         # doesn't seemed to be used for anything else
         walkers.sgn_ovlp *= xp.sign(b) 
-        if abs(to_host(xp.sign(b).sum()/b.size)-1.)>1e-6:
-            print(to_host(b))
         synchronize()
         self.timer.tupdate += time.time() - start_time
     def apply_VHS(self, walkers, hamiltonian, xshifted):
