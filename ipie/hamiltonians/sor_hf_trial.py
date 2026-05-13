@@ -18,10 +18,9 @@ def walkers2tensor(walkers:GHFWalkers):
 
 @plum.dispatch
 def tensor2walkers(walkers:UHFWalkers,phi):
-    nu = walkers.nup
     phi = xp.asarray(phi)
-    walkers.phia = phi[:,:,:nu]
-    walkers.phib = phi[:,:,nu:]
+    walkers.phia = phi[0]
+    walkers.phib = phi[1]
     return walkers
 
 @plum.dispatch
@@ -39,14 +38,14 @@ def save_walkers(walkers,comm,dirname):
     sgn_ovlp = [to_host(walkers.sgn_ovlp)] + ([None] * (SIZE-1))
     for r in range(1,SIZE):
         phi[r],weights[r],sgn_ovlp[r] = comm.recv(source=r)
-    f = h5py.File(f'{dirname}/walkers.h5','w')
+    f = h5py.File(f'{dirname}/walkers.hdf5','w')
     f.create_dataset('phi',data=np.concatenate(phi,axis=0))
     f.create_dataset('log_weights',data=np.concatenate(weights,axis=0))
     f.create_dataset('sgn_ovlp',data=np.concatenate(sgn_ovlp,axis=0))
     f.close()
 
 def load_walkers(walkers,dirname):
-    f = h5py.File(f'{dirname}/walkers.h5','r')
+    f = h5py.File(f'{dirname}/walkers.hdf5','r')
     phi = f['phi'][:]
     log_weights = f['log_weights'][:]
     sgn_ovlp = f['sgn_ovlp'][:]
@@ -257,23 +256,27 @@ def _rdm_intermediates(U,D,UD,full=True):
         UDDDU = make_full(UDDDU[0],UDDDU[1])
     return UDDtU,UDtDU,UDDDU
 
-def _compute_trial_ovlp(term,D):
-    n,d = term.n,term.d
-    Dj = term.select(D,(1,2))
-    M = Dj+xp.diag(1./d).reshape(1,n,n)
-    det = xp.linalg.det(M)
-    return det * d.prod()
+def _batched_M1(Dj,ds):
+    n,r = ds.shape
+    idx = np.arange(r)
+    M = Dj.copy()
+    M[:,:,idx,idx] += (1./ds)[:,None,:]
+    return M
 
-def _compute_M(term,D):
-    n,d = term.n,term.d
-    # input matrix dim: walker,p,q
-    Dj = term.select(D,(1,2))
-    M1 = Dj+xp.diag(1./d).reshape(1,n,n)
+def _batched_trial_ovlp(Dj,ds):
+    M = _batched_M1(Dj,ds)
+    det = xp.linalg.det(M)
+    return det * ds.prod(axis=1)[:,None]
+
+def _batched_M(Dj,ds):
+    M1 = _batched_M1(Dj,ds)
     M1 = xp.linalg.inv(M1)
 
-    M2 = xp.einsum('wij,wjk->wik',M1,Dj)
-    M2 = xp.eye(n).reshape(1,n,n) - M2
-    return M1,M2*d.reshape(1,1,n)
+    n,r = ds.shape
+    idx = np.arange(r)
+    M2 = -xp.einsum('nwij,nwjk->nwik',M1,Dj)
+    M2[:,:,idx,idx] += xp.ones(r) 
+    return M1,M2*ds[:,None,None,:]
 
 class SORHFTrial(SumOfRotationBase):
 
@@ -292,62 +295,66 @@ class SORHFTrial(SumOfRotationBase):
         R = None
         if compute_R:
             R = xp.ones((self.nkeys,nw))
-        for d,terms in enumerate(self.terms):
-            U = self.chol_basis[d]
+        for d,batch in enumerate(self.batches):
+            U = batch.chol_basis
             UD = conjugate_chol_left(U,D0) 
             UDU = conjugate_chol_right(U,UD,full=True) 
             if compute_R:
                 P1,P2,P3 = _rdm_intermediates(U,D0,UD)
-
-            for i,term in enumerate(terms):
-                kix = self.key_map[d,i]
+            for r in batch.rs:
+                kix = batch.kix[r]
+                ps = batch.p[r]
+                ds = batch.d[r]
+                udu = xp.stack([UDU[:,pi][:,:,pi] for pi in ps])
                 if not compute_R:
-                    ovlp[kix] = _compute_trial_ovlp(term,UDU)
+                    ovlp[kix] = _batched_trial_ovlp(udu,ds)
                     continue
 
-                M1,M2 = _compute_M(term,UDU)
-                ovlp[kix] = term.d.prod()/xp.linalg.det(M1)
+                M1,M2 = _batched_M(udu,ds)
+                ovlp[kix] = ds.prod(axis=1)[:,None]/xp.linalg.det(M1)
 
-                tr = tr0.copy()
-                P1i = term.select(P1,(1,2))
-                P2i = term.select(P2,(1,2))
-                UDUi = term.select(UDU,(1,2))
+                p1 = xp.stack([P1[:,pi][:,:,pi] for pi in ps])
+                p2 = xp.stack([P2[:,pi][:,:,pi] for pi in ps])
 
-                t = xp.einsum('wij,wkj->wik',P1i,M1)
-                t -= 2*xp.einsum('wij,wkj->wik',UDUi,M2)
-                t = xp.einsum('wij,wjk->wik',t,P2i)
-                t = xp.einsum('wij,wji->w',t,M1)
-                tr += t 
+                t = xp.einsum('nwij,nwkj->nwik',p1,M1)
+                t -= 2*xp.einsum('nwij,nwkj->nwik',udu,M2)
+                t = xp.einsum('nwij,nwjk->nwik',t,p2)
+                t = xp.einsum('nwij,nwji->nw',t,M1)
+                tr = tr0[None,:] + t 
 
-                m = xp.einsum('wij,wkj->wik',M2,M2)
+                m = xp.einsum('nwij,nwkj->nwik',M2,M2)
                 m += 2*M2
-                tr += xp.einsum('wij,wji->w',P2i,m)
+                tr += xp.einsum('nwij,nwji->nw',p2,m)
 
-                P3i = term.select(P3,(1,2))
-                tr -= 2*xp.einsum('wij,wji->w',P3i,M1)
+                p3 = xp.stack([P3[:,pi][:,:,pi] for pi in ps])
+                tr -= 2*xp.einsum('nwij,nwji->nw',p3,M1)
 
                 R[kix] = 1./xp.sqrt(1.+self.eps_sq*tr)
         return ovlp,R0,R
 
     @plum.dispatch
     def update_walkers(self,keys,walkers:UHFWalkers):
-        for w,(d,i) in enumerate(keys):
-            term = self.terms[d][i] 
-            phi = [walkers.phia[w],walkers.phib[w]]
-            phi = term.apply_rotation(phi,self.chol_basis[d],self.nbasis)
-            walkers.phia[w] = phi[0]
-            walkers.phib[w] = phi[1]
+        C = walkers2uhf(walkers)
+        UC = [conjugate_chol_left(b.chol_basis,C) for b in self.batches]
+        for w,(d,r,i) in enumerate(keys):
+            batch = self.batches[d] 
+            C[:,w] = batch.apply_rotation(C[:,w],UC[d][:,w],r,i)
+        walkers.phia = C[0]
+        walkers.phib = C[1]
 
     @plum.dispatch
     def update_walkers(self,keys,walkers:GHFWalkers):
         nb = walkers.nbasis
-        for w,(d,i) in enumerate(keys):
-            term = self.terms[d][i] 
-            phi = [walkers.phi[w,:nb],walkers.phi[w,nb:]]
-            phi = term.apply_rotation(phi,self.chol_basis[d],nb)
-            walkers.phi[w] = xp.concatenate(phi,axis=0)
+        C = walkers2ghf(walkers)
+        C = xp.stack([C[:,:nb],C[:,nb:]])
+        UC = [conjugate_chol_left(b.chol_basis,C) for b in self.batches]
+        for w,(d,r,i) in enumerate(keys):
+            batch = self.batches[d] 
+            C[:,w] = batch.apply_rotation(C[:,w],UC[d][w],r,i)
+        walkers.phi = xp.concatenate([C[0],C[1]],axis=1)
 
     def _get_trial_ovlp_ratio(self,walkers,trial):
+        print('called')
         C = walkers2ghf(walkers)
         B = trial2ghf(trial)
         BdC = xp.einsum('xi,wxj->wij',B,C)
@@ -363,25 +370,37 @@ class SORHFTrial(SumOfRotationBase):
         nb = trial.nbasis 
         ovlp = xp.zeros((self.nkeys,nw)) 
         R = xp.ones((self.nkeys,nw))
-        for d,terms in enumerate(self.terms):
-            v = self.chol_basis[d]
-            if v is None:
-                v = xp.eye(self.nbasis)
-            for i,term in enumerate(terms):
-                kix = self.key_map[d,i]
-                U = term.get_rotation_matrix(v)
-                Ufull = xp.eye(nb*2)
-                if U[0] is not None:
-                    Ufull[:nb,:nb] = U[0]
-                if U[1] is not None:
-                    Ufull[nb:,nb:] = U[1]
-                C_ = xp.einsum('xy,wyi->wxi',Ufull,C) 
-                BdC = xp.einsum('xi,wxj->wij',B,C_)
-                ovlp[kix] = xp.linalg.det(BdC)/detBdC 
+        for d,batch in enumerate(self.batches):
+            for r in batch.rs:
+                for i in range(batch.p[r].shape[0]):
+                    kix = self.key_map[d,r,i]
+                    U = batch.get_rotation_matrix(r,i)
+                    Ufull = xp.eye(nb*2)
+                    if U[0] is not None:
+                        Ufull[:nb,:nb] = U[0]
+                    if U[1] is not None:
+                        Ufull[nb:,nb:] = U[1]
+                    C_ = xp.einsum('xy,wyi->wxi',Ufull,C) 
+                    BdC = xp.einsum('xi,wxj->wij',B,C_)
+                    ovlp[kix] = xp.linalg.det(BdC)/detBdC 
 
-                BdCinv = xp.linalg.inv(BdC)
-                D = xp.einsum('wxi,wij->wxj',C_,BdCinv)
-                D = xp.einsum('wxi,yi->wxy',D,B)
-                tr = xp.einsum('wxy->w',D**2)
-                R[kix] = 1./xp.sqrt(1.+self.eps_sq*tr)
+                    BdCinv = xp.linalg.inv(BdC)
+                    D = xp.einsum('wxi,wij->wxj',C_,BdCinv)
+                    D = xp.einsum('wxi,yi->wxy',D,B)
+                    tr = xp.einsum('wxy->w',D**2)
+                    R[kix] = 1./xp.sqrt(1.+self.eps_sq*tr)
         return ovlp,R0,R
+
+    def _update_walkers_slow(self,keys,walkers):
+        nb = self.nbasis
+        C = walkers2ghf(walkers)
+        for w,(d,r,i) in enumerate(keys):
+            batch = self.batches[d] 
+            U = batch.get_rotation_matrix(r,i)
+            Ufull = xp.eye(nb*2)
+            if U[0] is not None:
+                Ufull[:nb,:nb] = U[0]
+            if U[1] is not None:
+                Ufull[nb:,nb:] = U[1]
+            C[w] = xp.einsum('xy,yi->xi',Ufull,C[w]) 
+        return C

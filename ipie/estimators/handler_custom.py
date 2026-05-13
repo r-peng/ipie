@@ -26,7 +26,6 @@ from typing import Tuple, Union
 import h5py
 import numpy
 from ipie.utils.backend import arraylib as xp
-from ipie.utils.backend import to_host
 
 from ipie.config import config, MPI
 from ipie.estimators.energy_custom import EnergyEstimator
@@ -34,6 +33,7 @@ from ipie.estimators.estimator_base import EstimatorBase
 from ipie.estimators.handler import EstimatorHandler as EstimatorHandler_
 from ipie.estimators.utils import H5EstimatorHelper
 from ipie.utils.io import format_fixed_width_strings
+from ipie.utils.backend import to_host
 
 # Some supported (non-custom) estimators
 _predefined_estimators = {
@@ -129,8 +129,8 @@ class EstimatorHandler(EstimatorHandler_):
     def compute_weights(self,max_nprod,max_nsum,ntot=None):
         log_average_weights = self.log_average_weights if ntot is None else \
                               self.log_average_weights[:ntot]
-        log_average_weights = xp.asarray(log_average_weights).real
-        ntot = len(log_average_weights)
+        log_average_weights = xp.asarray(log_average_weights)
+        ntot = log_average_weights.size
         nprod = min(max_nprod,ntot)
         nsum = min(ntot-nprod+1,max_nsum)
         shift = ntot - nsum 
@@ -148,10 +148,8 @@ class EstimatorHandler(EstimatorHandler_):
         weights,shift,max_weight = self.compute_weights(max_nprod,max_nsum,ntot=ntot)
 
         output_string = " "
-        vals = xp.zeros(3)
-        vals[0] = xp.mean(weights)
-        vals[1] = max_weight
-        output_string += walker_factors.to_text(vals)
+        vals = to_host(xp.mean(weights)),to_host(max_weight),0.
+        output_string += walker_factors.to_text(numpy.array(vals))
         output_string += " "
 
         offset = self.num_walker_props

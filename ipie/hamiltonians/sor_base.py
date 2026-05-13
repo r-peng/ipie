@@ -82,60 +82,95 @@ def hubbard2MB(h1e,U,nelecs,basis=None,basis_map=None,thresh=1e-6):
     return H,basis,basis_map
 
 class Udiag:
-    def __init__(self,nbasis,pa=None,ga=None,pb=None,gb=None):
-        self.ps = [None] * 2
-        self.ds = [None] * 2
-        if pa is not None:
-            self.ps[0] = xp.asarray(pa)
-            self.ds[0] = xp.exp(xp.asarray(ga))-1.
-        if pb is not None:
-            self.ps[1] = xp.asarray(pb) 
-            self.ds[1] = xp.exp(xp.asarray(gb))-1.
-
-        if (pa is not None) and (pb is not None):
-            self.p = xp.concatenate([self.ps[0],self.ps[1]+nbasis])
-            self.d = xp.concatenate(self.ds)
-        elif pa is None:
-            self.p = self.ps[1]+nbasis
-            self.d = self.ds[1]
-        else:
-            self.p = self.ps[0]
-            self.d = self.ds[0]
-        self.n = self.d.size
-
+    def __init__(self,ai,ps,gs):
+        self.ai = ai
+        self.ps = ps
+        self.gs = xp.array(gs)
+        self.ds = xp.exp(self.gs)-1
+        self.ns = self.ds.size
     def select(self,D,axes):
         for ax in axes:
-            D = xp.take(D,self.p,axis=ax)
+            D = xp.take(D,self.ps,axis=ax)
         return D
-    def get_MB_kappa(self,v,basis):
-        nsite = v.shape[0]
-        kappa = [None] * 2
-        for s,p in enumerate(self.ps):
-            if p is None:
-                continue
-            ks = np.outer(v[:,p],v[:,p]*(self.ds[s]+1.))
-            kappa[s] = quadratic2MB(ks,basis,s) 
-        return kappa
-    def get_rotation_matrix(self,v):
-        nsite = v.shape[0]
-        U = [None] * 2
-        for s,p in enumerate(self.ps):
-            if p is None:
-                continue
-            diag = xp.ones(nsite)
-            diag[p] += self.ds[s]
-            U[s] = xp.einsum('xp,yp,p->xy',v,v,diag)
-        return U
-    def apply_rotation(self,phi,v,nsite):
-        for s,p in enumerate(self.ps):
-            if p is None:
-                continue
+    def apply_rotation(self,phi0,v,nsite):
+        phi = [phis.copy() for phis in phi0]
+        for p,d in zip(self.ps,self.ds):
+            s,ps = p//nsite,p%nsite
             if v is None:
-                phi[s][p] += self.ds[s]*phi[s][p]
+                phi[s][ps] += d*phi0[s][ps]
             else:
-                vec = xp.take(v,p,axis=1)
-                phi[s] += self.ds[s]*xp.outer(vec,xp.dot(vec,phi[s]))
+                vec = xp.take(v,ps,axis=1)
+                phi[s] += d*xp.outer(vec,xp.dot(vec,phi0[s]))
         return phi
+
+class BatchTerms:
+    def __init__(self,nbasis,chol_basis,rs=[1]):
+        self.nbasis = nbasis
+        self.chol_basis = chol_basis
+        self.rs = rs
+        self.p = {r:[] for r in rs}
+        self.d = {r:[] for r in rs}
+        self.g = {r:[] for r in rs}
+        self.a = {r:[] for r in rs}
+        self.kix = {r:[] for r in rs}
+
+    def add_term(self,ai,pi,gi):
+        r = len(pi)
+        self.a[r].append(ai)
+        pi = xp.asarray(pi,dtype=int)
+        gi = xp.asarray(gi)
+        di = xp.exp(gi)-1.
+        self.p[r].append(pi)
+        self.g[r].append(gi)
+        self.d[r].append(di)
+
+    def get_MB_kappa(self,r,i,basis):
+        v = self.chol_basis
+        if v is None:
+            v = np.eye(self.nbasis)
+        ps = self.p[r][i]
+        gs = self.g[r][i]
+
+        kappa = [None] * 2
+        for p,g in zip(ps,gs):
+            s,p_ = p//self.nbasis,p%self.nbasis
+            if kappa[s] is None:
+                kappa[s] = 0
+            ks = np.outer(v[:,p_],v[:,p_]*g)
+            kappa[s] += quadratic2MB(ks,basis,s) 
+        return kappa
+
+    def get_rotation_matrix(self,r,i):
+        v = self.chol_basis
+        if v is None:
+            v = np.eye(self.nbasis)
+        ps = self.p[r][i]
+        ds = self.d[r][i]
+
+        U = [None] * 2
+        for p,d in zip(ps,ds):
+            s,p_ = p//self.nbasis,p%self.nbasis
+            if U[s] is None:
+                U[s] = xp.ones(self.nbasis)
+            U[s][p_] = d+1
+        for s,Us in enumerate(U):
+            if Us is None:
+                continue
+            U[s] = xp.einsum('xp,yp,p->xy',v,v,Us)
+        return U
+
+    def apply_rotation(self,C,UC,r,i):
+        ps = self.p[r][i]
+        ds = self.d[r][i]
+        for p,d in zip(ps,ds):
+            s,p_ = p//self.nbasis,p%self.nbasis
+            if self.chol_basis is None:
+                C[s,p_] += d*UC[s,p_]
+            else:
+                left = d*self.chol_basis[:,p_]
+                right = UC[s,p_]
+                C[s] += xp.outer(left,right)
+        return C 
 
 class SumOfRotationBase(GenericBase):
 
@@ -144,10 +179,9 @@ class SumOfRotationBase(GenericBase):
         self.U = U 
         self.eps_sq = eps_sq
 
-        self.chol_basis = []
-        self.terms = []
-        self.bare_gf = []
-        self.Lambda = np.zeros(3)
+        self.batches = []
+        self.Lambda = xp.zeros(3)
+        self.H1 = xp.asarray(self.H1)
 
     def decompose_h1(self,at,thresh=1e-6,iprint=0):
         # hopping
@@ -155,9 +189,7 @@ class SumOfRotationBase(GenericBase):
             iprint = 0
 
         eks,vk = np.linalg.eigh(self.H1) 
-        self.chol_basis.append(vk)
-        terms = []
-        bare_gf = []
+        batch = BatchTerms(self.nbasis,vk,rs=[1])
         for k,ek in enumerate(eks):
             if np.fabs(ek)<thresh:
                 continue
@@ -169,14 +201,9 @@ class SumOfRotationBase(GenericBase):
             self.Lambda[0] += 2*ak
             if iprint>0:
                 print(f'band={k},ek={ek},gk={gk}')
-
-            terms.append(Udiag(self.nbasis,pa=[k],ga=[gk]))
-            bare_gf.append(ak)
-
-            terms.append(Udiag(self.nbasis,pb=[k],gb=[gk]))
-            bare_gf.append(ak)
-        self.terms.append(terms)
-        self.bare_gf.append(bare_gf)
+            batch.add_term(ak,[k],[gk])
+            batch.add_term(ak,[k+self.nbasis],[gk])
+        self.batches.append(batch)
         return eks
 
     def decompose_h2(self,gu,iprint=0,nelec=None):
@@ -184,9 +211,7 @@ class SumOfRotationBase(GenericBase):
         if RANK>0:
             iprint = 0
 
-        self.chol_basis.append(None)
-        terms = []
-        bare_gf = []
+        batch = BatchTerms(self.nbasis,None,rs=[2])
         ai = self.U/(np.cosh(gu)-1)/4
         if iprint>0:
             print('a_U=',ai)
@@ -194,42 +219,38 @@ class SumOfRotationBase(GenericBase):
         if nelec is not None:
             self.Lambda[1] += self.U*sum(nelec)/2 
         for i in range(self.nbasis): 
-            terms.append(Udiag(self.nbasis,pa=[i],pb=[i],ga=[gu],gb=[-gu]))
-            bare_gf.append(ai)
-            terms.append(Udiag(self.nbasis,pa=[i],pb=[i],ga=[-gu],gb=[gu]))
-            bare_gf.append(ai)
-        self.terms.append(terms)
-        self.bare_gf.append(bare_gf)
+            batch.add_term(ai,[i,i+self.nbasis],[gu,-gu])
+            batch.add_term(ai,[i,i+self.nbasis],[-gu,gu])
+        self.batches.append(batch)
 
     def parse_decomposition(self):
         self.Lambda[2] = self.Lambda[0] + self.Lambda[1]
-        self.keys = [(d,i) for d,terms in enumerate(self.terms) for i in range(len(terms))]
-        self.bare_gf = np.array([ai for bare_gf in self.bare_gf for ai in bare_gf])/self.Lambda[2]
-        self.nkeys = len(self.keys)
-        self.key_map = {key:kix for kix,key in enumerate(self.keys)} 
+        self.keys = []
+        self.bare_gf = [] 
         self.E1_kix = []
         self.E2_kix = []
-        for (d,i),kix in self.key_map.items():
-            if d==0:
-                self.E1_kix.append(kix)
-            else:
-                self.E2_kix.append(kix)
-        self.E1_kix = np.array(self.E1_kix)
-        self.E2_kix = np.array(self.E2_kix)
+        kix = 0
+        for d,batch in enumerate(self.batches):
+            for r in batch.rs:
+                batch.p[r] = xp.stack(batch.p[r])
+                batch.d[r] = xp.stack(batch.d[r])
+                batch.g[r] = xp.stack(batch.g[r])
+                for i,ai in enumerate(batch.a[r]):
+                    self.keys.append((d,r,i))
+                    self.bare_gf.append(ai)
+                    if d==0:
+                        self.E1_kix.append(kix)
+                    else:
+                        self.E2_kix.append(kix)
+                    batch.kix[r].append(kix)
+                    kix += 1
+                batch.kix[r] = xp.asarray(batch.kix[r]) 
 
-        self.cast_to_cupy()
-
-    def cast_to_cupy(self, verbose=False):
-        if not config.get_option("use_gpu"):
-            return
-        if verbose:
-            print(f"# {self.__class__.__name__}: moving SOR arrays to GPU")
-        self.H1 = xp.asarray(self.H1)
-        self.Lambda = xp.asarray(self.Lambda)
+        self.key_map = {key:kix for kix,key in enumerate(self.keys)} 
+        self.nkeys = len(self.keys)
+        self.bare_gf = xp.asarray(self.bare_gf)/self.Lambda[2]
         self.E1_kix = xp.asarray(self.E1_kix)
         self.E2_kix = xp.asarray(self.E2_kix)
-        self.bare_gf = xp.asarray(self.bare_gf)
-        self.chol_basis = [None if basis is None else xp.asarray(basis) for basis in self.chol_basis]
 
     def calc_gf(self,walkers,trial):
         ovlp,R0,R = self.calc_trial_ovlp_ratio(walkers,trial)
@@ -240,7 +261,7 @@ class SumOfRotationBase(GenericBase):
 
     def sample_from_gf(self,gf):
         sign = xp.sign(gf)
-        nminus = int(to_host(xp.sum(sign < -0.5)))
+        #nminus = int(to_host(xp.sum(sign < -0.5)))
         #if nminus>0:
         #    print('number of minus=',nminus)
         #    #exit()
@@ -260,10 +281,8 @@ class SumOfRotationBase(GenericBase):
     
     def local_energy(self,walkers,trial):
         ovlp,R0,_ = self.calc_trial_ovlp_ratio(walkers,trial,compute_R=False)
-
-        E = [xp.dot(self.bare_gf[kixs],ovlp[kixs])*self.Lambda[2] for kixs in (self.E1_kix,self.E2_kix)]
-        E1 = self.Lambda[0] - E[0]
-        E2 = self.Lambda[1] - E[1]
+        E1 = self.Lambda[0]-xp.dot(self.bare_gf[self.E1_kix],ovlp[self.E1_kix])*self.Lambda[2]
+        E2 = self.Lambda[1]-xp.dot(self.bare_gf[self.E2_kix],ovlp[self.E2_kix])*self.Lambda[2]
         if R0 is not None:
             if RANK==0:
                 print('R0 mean=',to_host(xp.mean(R0)))
@@ -271,21 +290,20 @@ class SumOfRotationBase(GenericBase):
 
     def _get_MB_gf(self,basis):
         H = 0
-        for d,terms in enumerate(self.terms): 
-            for i,term in enumerate(terms):
-                v = self.chol_basis[d]
-                if v is None:
-                    v = np.eye(self.nbasis)
-                kappa = term.get_MB_kappa(v,basis)
-                U = None
-                for spin,k in enumerate(kappa):
-                    if k is None:
-                        continue
-                    Us = scipy.linalg.expm(k)
-                    if U is None:
-                        U = Us
-                    else:
-                        U = np.dot(U,Us)
-                kix = self.key_map[d,i]
-                H += self.bare_gf[kix]*U
+        print('called')
+        for d,batch in enumerate(self.batches): 
+            for r in batch.rs:
+                for i in range(len(batch.a[r])):
+                    kappa = batch.get_MB_kappa(r,i,basis)
+                    U = None
+                    for spin,k in enumerate(kappa):
+                        if k is None:
+                            continue
+                        Us = scipy.linalg.expm(k)
+                        if U is None:
+                            U = Us
+                        else:
+                            U = np.dot(U,Us)
+                    kix = self.key_map[d,r,i]
+                    H += self.bare_gf[kix]*U
         return H
