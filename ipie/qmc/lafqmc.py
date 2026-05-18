@@ -31,7 +31,7 @@ from ipie.config import config
 from ipie.estimators.estimator_base import EstimatorBase
 from ipie.estimators.handler_custom import EstimatorHandler
 from ipie.hamiltonians.utils import get_hamiltonian
-from ipie.hamiltonians.sor_hf_trial import save_walkers
+from ipie.hamiltonians.walkers_utils import save_walkers
 from ipie.propagation.propagator import Propagator
 from ipie.qmc.options import QMCParams
 from ipie.qmc.utils import set_rng_seed
@@ -342,7 +342,6 @@ class LAFQMC(AFQMC):
         self.accumulators.update(self.walkers)
         self.estimators.print_block(comm, 0, self.accumulators)
         self.accumulators.zero()
-
 
     def post_pop_ctr(self,comm,log_average_weight):
         if self.params.pop_control_method!='stochastic_reconfiguration':
