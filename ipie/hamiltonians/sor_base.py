@@ -166,25 +166,25 @@ class SumOfRotationBase(GenericBase):
             return gf
         return gf*R0.reshape(1,walkers.nwalkers)/R
 
-    def sample_from_gf(self,gf):
-        sign = xp.sign(gf)
-        #nminus = int(to_host(xp.sum(sign < -0.5)))
-        #if nminus>0:
-        #    print('number of minus=',nminus)
-        #    #exit()
+    #def sample_from_gf(self,gf):
+    #    sign = xp.sign(gf)
+    #    #nminus = int(to_host(xp.sum(sign < -0.5)))
+    #    #if nminus>0:
+    #    #    print('number of minus=',nminus)
+    #    #    #exit()
 
-        p = xp.fabs(gf)
-        b = p.sum(axis=0)
-        nwalker = b.size
-        p /= b.reshape(1,nwalker)
-        cdf = xp.cumsum(p, axis=0)
-        sample = xp.random.random(nwalker)
-        kixs = xp.sum(cdf < sample.reshape(1,nwalker), axis=0).astype(xp.int64)
-        kixs = xp.minimum(kixs, self.nkeys - 1)
-        b *= sign[kixs, xp.arange(nwalker)]
-        keys = [self.keys[int(kix)] for kix in to_host(kixs)]
-        self.b = b
-        return keys,b
+    #    p = xp.fabs(gf)
+    #    b = p.sum(axis=0)
+    #    nwalker = b.size
+    #    p /= b.reshape(1,nwalker)
+    #    cdf = xp.cumsum(p, axis=0)
+    #    sample = xp.random.random(nwalker)
+    #    kixs = xp.sum(cdf < sample.reshape(1,nwalker), axis=0).astype(xp.int64)
+    #    kixs = xp.minimum(kixs, self.nkeys - 1)
+    #    b *= sign[kixs, xp.arange(nwalker)]
+    #    keys = [self.keys[int(kix)] for kix in to_host(kixs)]
+    #    self.b = b
+    #    return keys,b
     
     def local_energy(self,walkers,trial):
         ovlp,R0,_ = self.calc_trial_ovlp_ratio(walkers,trial,compute_R=False)

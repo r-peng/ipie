@@ -269,7 +269,8 @@ class SORHFTrial(SumOfRotationBase):
         return ovlp,R0,R
 
     @plum.dispatch
-    def update_walkers(self,keys,walkers:UHFWalkers):
+    def update_walkers(self,kixs,walkers:UHFWalkers):
+        keys = [self.keys[int(kix)] for kix in to_host(kixs)]
         C = walkers2uhf(walkers)
         UC = [conjugate_chol_left(b.chol_basis,C) for b in self.batches]
         for w,(d,r,i) in enumerate(keys):
@@ -279,7 +280,8 @@ class SORHFTrial(SumOfRotationBase):
         walkers.phib = C[1]
 
     @plum.dispatch
-    def update_walkers(self,keys,walkers:GHFWalkers):
+    def update_walkers(self,kixs,walkers:GHFWalkers):
+        keys = [self.keys[int(kix)] for kix in to_host(kixs)]
         nb = walkers.nbasis
         C = walkers2ghf(walkers)
         C = xp.stack([C[:,:nb],C[:,nb:]])
