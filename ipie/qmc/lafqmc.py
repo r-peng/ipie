@@ -30,26 +30,74 @@ from typing import Dict, Optional, Tuple
 from ipie.config import config
 from ipie.estimators.estimator_base import EstimatorBase
 from ipie.estimators.handler_custom import EstimatorHandler
-from ipie.hamiltonians.utils import get_hamiltonian
+#from ipie.hamiltonians.utils import get_hamiltonian
 from ipie.hamiltonians.walkers_utils import save_walkers
-from ipie.propagation.propagator import Propagator
+#from ipie.propagation.phaseless_lin import propagate_walkers
 from ipie.qmc.options import QMCParams
-from ipie.qmc.utils import set_rng_seed
-from ipie.systems.generic import Generic
-from ipie.trial_wavefunction.utils import get_trial_wavefunction
+#from ipie.qmc.utils import set_rng_seed
+#from ipie.systems.generic import Generic
+#from ipie.trial_wavefunction.utils import get_trial_wavefunction
 from ipie.utils.backend import arraylib as xp
-from ipie.utils.backend import get_host_memory, synchronize
-from ipie.utils.io import to_json
-from ipie.utils.misc import get_git_info, print_env_info
+from ipie.utils.backend import synchronize
+#from ipie.utils.io import to_json
+#from ipie.utils.misc import get_git_info, print_env_info
 from ipie.utils.mpi import MPIHandler
 from ipie.walkers.base_walkers import WalkerAccumulator
 from ipie.walkers.pop_controller_custom import PopController
-from ipie.walkers.walkers_dispatch import get_initial_walker, UHFWalkersTrial
-from ipie.trial_wavefunction.particle_hole import ParticleHole
-from ipie.qmc.afqmc import AFQMC
+#from ipie.walkers.walkers_dispatch import get_initial_walker, UHFWalkersTrial
+#from ipie.trial_wavefunction.particle_hole import ParticleHole
+from ipie.qmc.afqmc import AFQMCBase
+
+def sample_from_gf(gf):
+    nkeys,nw = gf.shape
+    sign = xp.sign(gf)
+
+    p = xp.fabs(gf)
+    b = p.sum(axis=0)
+    p /= b.reshape(1,nw)
+    cdf = xp.cumsum(p, axis=0)
+    sample = xp.random.random(nw)
+    kixs = xp.sum(cdf < sample.reshape(1,nw), axis=0).astype(xp.int64)
+    kixs = xp.minimum(kixs, nkeys - 1)
+    sign = sign[kixs, xp.arange(nw)]
+    return kixs,b,sign
+
+def update_weight(walkers,b,sign,constraint_path=True,thresh=1e-15):
+    minus_idx = xp.nonzero(sign<-0.5)
+    minus_val = -1
+    zero_idx = xp.nonzero(b<thresh)
+    if constraint_path:
+        b[minus_idx] = thresh
+        minus_val = 0
+    walkers.weight += xp.log(b)
+    # use .sgn_ovlp to store signs for now
+    # doesn't seemed to be used for anything else
+    walkers.sgn_ovlp[minus_idx] *= minus_val 
+    walkers.sgn_ovlp[zero_idx] = 0
+
+def propagate_walkers(walkers, hamiltonian, trial, constraint_path=True):
+    # 1.compute dressed gf
+    synchronize()
+    #start_time = time.time()
+    gf = hamiltonian.calc_gf(walkers,trial)
+    synchronize()
+    #self.timer.tgf += time.time() - start_time
+
+    # 2.update walker
+    kixs,b,sign = sample_from_gf(gf)
+    #start_time = time.time()
+    hamiltonian.update_walkers(kixs,walkers)
+    synchronize()
+    #self.timer.tgemm += time.time() - start_time
+
+    # 3.update weight
+    #start_time = time.time()
+    update_weight(walkers,b,sign,constraint_path=constraint_path)
+    synchronize()
+    #self.timer.tupdate += time.time() - start_time
 
 
-class LAFQMC(AFQMC):
+class LAFQMC(AFQMCBase):
     """AFQMC driver for zero temperature open ended random walk.
 
     Parameters
@@ -183,49 +231,49 @@ class LAFQMC(AFQMC):
             walkermap_filepath=walkermap_filepath,
         )
         # 2. Calculation objects.
-        system = Generic(num_elec)
+        #system = Generic(num_elec)
         # TODO: do logic and logging in the function.
-        if trial_wavefunction.compute_trial_energy:
-            trial_wavefunction.calculate_energy(system, hamiltonian)
-            trial_wavefunction.e1b = comm.bcast(trial_wavefunction.e1b, root=0)
-            trial_wavefunction.e2b = comm.bcast(trial_wavefunction.e2b, root=0)
-        comm.barrier()
-        if walkers is None:
-            _, initial_walker = get_initial_walker(trial_wavefunction)
-            # TODO this is a factory method not a class
-            walkers = UHFWalkersTrial(
-                trial_wavefunction,
-                initial_walker,
-                system.nup,
-                system.ndown,
-                hamiltonian.nbasis,
-                num_walkers,
-                mpi_handler,
-            )
-            walkers.build(
-                trial_wavefunction
-            )  # any intermediates that require information from trial_wavefunction
+        #if trial_wavefunction.compute_trial_energy:
+        #    trial_wavefunction.calculate_energy(system, hamiltonian)
+        #    trial_wavefunction.e1b = comm.bcast(trial_wavefunction.e1b, root=0)
+        #    trial_wavefunction.e2b = comm.bcast(trial_wavefunction.e2b, root=0)
+        #comm.barrier()
+        #if walkers is None:
+        #    _, initial_walker = get_initial_walker(trial_wavefunction)
+        #    # TODO this is a factory method not a class
+        #    walkers = UHFWalkersTrial(
+        #        trial_wavefunction,
+        #        initial_walker,
+        #        system.nup,
+        #        system.ndown,
+        #        hamiltonian.nbasis,
+        #        num_walkers,
+        #        mpi_handler,
+        #    )
+        #    walkers.build(
+        #        trial_wavefunction
+        #    )  # any intermediates that require information from trial_wavefunction
         # TODO: this is a factory not a class
-        propagator = Propagator[type(hamiltonian)](
-            params.timestep, params.ene_bound_const, params.fb_bound
-        )
-        propagator.build(hamiltonian, trial_wavefunction, walkers, mpi_handler)
-        if not math.isclose(params.timestep, params.eq_timestep, rel_tol=1e-8):
-            eq_propagator = Propagator[type(hamiltonian)](
-                params.eq_timestep, params.ene_bound_const, params.fb_bound
-            )
-            eq_propagator.build(hamiltonian, trial_wavefunction, walkers, mpi_handler)
-        else:
-            eq_propagator = propagator
+        #propagator = Propagator[type(hamiltonian)](
+        #    params.timestep, params.ene_bound_const, params.fb_bound
+        #)
+        #propagator.build(hamiltonian, trial_wavefunction, walkers, mpi_handler)
+        #if not math.isclose(params.timestep, params.eq_timestep, rel_tol=1e-8):
+        #    eq_propagator = Propagator[type(hamiltonian)](
+        #        params.eq_timestep, params.ene_bound_const, params.fb_bound
+        #    )
+        #    eq_propagator.build(hamiltonian, trial_wavefunction, walkers, mpi_handler)
+        #else:
+        #    eq_propagator = propagator
         return LAFQMC(
-            system,
+            None,
             hamiltonian,
             trial_wavefunction,
             walkers,
-            propagator,
+            None,
             mpi_handler,
             params,
-            eq_propagator,
+            None,
             verbose=(verbose and comm.rank == 0),
         )
 
@@ -312,6 +360,22 @@ class LAFQMC(AFQMC):
             mpi_handler=mpi_handler,
         )
 
+    def copy_to_gpu(self):
+        comm = self.mpi_handler.comm
+        if config.get_option("use_gpu"):
+            ngpus = xp.cuda.runtime.getDeviceCount()
+            _ = xp.cuda.runtime.getDeviceProperties(0)
+            # xp.cuda.runtime.setDevice(self.shared_comm.rank % 4)
+            xp.cuda.runtime.setDevice(comm.rank % ngpus)
+            if comm.rank == 0:
+                if ngpus > comm.size:
+                    print(
+                        f"# There are unused GPUs ({comm.size} MPI tasks but {ngpus} GPUs). "
+                        " Check if this is really what you wanted."
+                    )
+            self.trial.cast_to_cupy(self.verbose and comm.rank == 0)
+            self.walkers.cast_to_cupy(self.verbose and comm.rank == 0)
+
     def setup_estimators(
         self, filename, additional_estimators: Optional[Dict[str, EstimatorBase]] = None
     ):
@@ -321,7 +385,7 @@ class LAFQMC(AFQMC):
         comm = self.mpi_handler.comm
         self.estimators = EstimatorHandler(
             self.mpi_handler.comm,
-            self.system,
+            None,
             self.hamiltonian,
             self.trial,
             walker_state=self.accumulators,
@@ -456,28 +520,28 @@ class LAFQMC(AFQMC):
                     self.tortho += time.time() - start
             start = time.time()
             if step <= num_eqlb_steps:
-                self.eq_propagator.propagate_walkers(
+                propagate_walkers(
                     self.walkers, self.hamiltonian, self.trial, constraint_path=constraint_path 
                 )
-                self.tprop_fbias = self.eq_propagator.timer.tfbias
-                self.tprop_ovlp = self.eq_propagator.timer.tovlp
-                self.tprop_update = self.eq_propagator.timer.tupdate
-                self.tprop_gf = self.eq_propagator.timer.tgf
-                self.tprop_vhs = self.eq_propagator.timer.tvhs
-                self.tprop_gemm = self.eq_propagator.timer.tgemm
+                #self.tprop_fbias = self.eq_propagator.timer.tfbias
+                #self.tprop_ovlp = self.eq_propagator.timer.tovlp
+                #self.tprop_update = self.eq_propagator.timer.tupdate
+                #self.tprop_gf = self.eq_propagator.timer.tgf
+                #self.tprop_vhs = self.eq_propagator.timer.tvhs
+                #self.tprop_gemm = self.eq_propagator.timer.tgemm
             else:
                 if discard_weights_aftereq:
                     if step == num_eqlb_steps + 1:
                         self.walkers.weight.fill(1.0)
-                self.propagator.propagate_walkers(
+                propagate_walkers(
                     self.walkers, self.hamiltonian, self.trial, constraint_path=constraint_path 
                 )
-                self.tprop_fbias = self.propagator.timer.tfbias
-                self.tprop_ovlp = self.propagator.timer.tovlp
-                self.tprop_update = self.propagator.timer.tupdate
-                self.tprop_gf = self.propagator.timer.tgf
-                self.tprop_vhs = self.propagator.timer.tvhs
-                self.tprop_gemm = self.propagator.timer.tgemm
+                #self.tprop_fbias = self.propagator.timer.tfbias
+                #self.tprop_ovlp = self.propagator.timer.tovlp
+                #self.tprop_update = self.propagator.timer.tupdate
+                #self.tprop_gf = self.propagator.timer.tgf
+                #self.tprop_vhs = self.propagator.timer.tvhs
+                #self.tprop_gemm = self.propagator.timer.tgemm
 
             start_clip = time.time()
             if step > 1 and step <= num_eqlb_steps:

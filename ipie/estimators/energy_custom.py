@@ -15,9 +15,7 @@
 # Author: Fionn Malone <fmalone@google.com>
 #
 
-from typing import Union
-
-import plum,h5py
+import h5py
 
 from ipie.utils.backend import arraylib as xp
 from ipie.utils.backend import to_host
@@ -38,6 +36,7 @@ class EnergyEstimator(EnergyEstimator_):
         weight = xp.exp(walkers.weight) * walkers.sgn_ovlp
         if R0 is not None:
             weight *= R0 
+            print('R0 mean=',to_host(xp.mean(R0)))
         nw = walkers.nwalkers
         if abs(walkers.sgn_ovlp.sum()/nw-1.)>1e-6:
             print(walkers.sgn_ovlp)
@@ -56,17 +55,15 @@ class EnergyEstimator(EnergyEstimator_):
     def save_sr_data(self,dirname='.'): 
         if dirname is None:
             return
-        f = h5py.File(f'{dirname}/energy.h5','w')
-        for key,data in self._sr_data.items():
-            f.create_dataset(key,data=to_host(xp.asarray(data)))
-        f.close()
+        with h5py.File(f'{dirname}/energy.h5','w') as f:
+            for key,data in self._sr_data.items():
+                f.create_dataset(key,data=to_host(xp.asarray(data)))
     def load_sr_data(self,dirname,rank):
         if rank>0:
             return
-        f = h5py.File(f'{dirname}/energy.h5','r')
-        for key in self._sr_data:
-            self._sr_data[key] = list(f[key][:])
-        f.close()
+        with h5py.File(f'{dirname}/energy.h5','r') as f:
+            for key in self._sr_data:
+                self._sr_data[key] = list(f[key][:])
     def compute_estimator_sr(self,weight,rank,shift,ntot=None):
         if rank>0:
             return

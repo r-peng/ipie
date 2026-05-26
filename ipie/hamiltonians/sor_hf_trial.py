@@ -1,26 +1,19 @@
 import numpy as np
-import scipy,itertools,plum,h5py
-from ipie.hamiltonians.sor_base import SumOfRotationBase 
-from ipie.hamiltonians.walkers_utils import *
+import plum
+from ipie.hamiltonians.sor_base import SumOfRotationBase
+from ipie.hamiltonians.walkers_utils import (
+        walkers2uhf,
+        walkers2ghf,
+        conjugate_chol_left,
+        conjugate_chol_right,
+        make_full,
+)
+from ipie.utils.backend import arraylib as xp
+from ipie.utils.backend import to_host
+from ipie.walkers.uhf_walkers import UHFWalkers
+from ipie.walkers.ghf_walkers import GHFWalkers
 from ipie.trial_wavefunction.single_det import SingleDet 
 from ipie.trial_wavefunction.single_det_ghf import SingleDetGHF
-
-@plum.dispatch
-def walkers2uhf(walkers:UHFWalkers):
-    return xp.stack((walkers.phia.real,walkers.phib.real))
-
-@plum.dispatch
-def walkers2ghf(walkers:UHFWalkers):
-    nw,nb = walkers.nwalkers,walkers.nbasis
-    nu,nd = walkers.nup,walkers.ndown
-    C = xp.zeros((nw,nb*2,nu+nd))
-    C[:,:nb,:nu] = walkers.phia.real
-    C[:,nb:,nu:] = walkers.phib.real
-    return C 
-
-@plum.dispatch
-def walkers2ghf(walkers:GHFWalkers):
-    return walkers.phi.real
 
 @plum.dispatch
 def trial2uhf(trial:SingleDet):
@@ -38,17 +31,6 @@ def trial2ghf(trial:SingleDet):
 @plum.dispatch
 def trial2ghf(trial:SingleDetGHF):
     return trial.psi0.real
-
-def make_full(Daa,Dbb,Dab=None,Dba=None):
-    nw,n1,n2 = Daa.shape 
-    D = xp.zeros((nw,n1*2,n2*2))
-    D[:,:n1,:n2] = Daa
-    D[:,n1:,n2:] = Dbb
-    if Dab is not None:
-        D[:,:n1,n2:] = Dab
-    if Dba is not None:
-        D[:,n1:,:n2] = Dba
-    return D
 
 @plum.dispatch
 def _ovlp(walkers:UHFWalkers,inv=True):
@@ -127,42 +109,6 @@ def _D0(walkers:GHFWalkers,trial:SingleDetGHF,ovlp=False):
         return D
     return D,1./xp.linalg.det(CdBinv)
 
-def conjugate_chol_left(U,D,full=False):
-    if U is None:
-        if len(D.shape)==4 and full:
-            return make_full(D[0],D[1])
-        return D
-
-    if len(D.shape)==4:
-        UD = xp.einsum('xp,swxy->swpy',U,D)
-        if full:
-            UD = make_full(UD[0],UD[1])
-        return UD
-    nw,_,sh2 = D.shape
-    nb,_ = U.shape
-    UD = xp.zeros((nw,nb*2,sh2))
-    UD[:,:nb] = xp.einsum('xp,wxy->wpy',U,D[:,:nb])
-    UD[:,nb:] = xp.einsum('xp,wxy->wpy',U,D[:,nb:])
-    return UD
-
-def conjugate_chol_right(U,D,full=False):
-    if U is None:
-        if len(D.shape)==4 and full:
-            return make_full(D[0],D[1])
-        return D
-
-    if len(D.shape)==4:
-        DU = xp.einsum('swxy,yq->swxq',D,U)
-        if full:
-            DU = make_full(DU[0],DU[1])
-        return DU
-    nw,sh1,_ = D.shape
-    nb,_ = U.shape
-    DU = xp.zeros((nw,sh1,nb*2))
-    DU[:,:,:nb] = xp.einsum('wxy,yq->wxq',D[:,:,:nb],U)
-    DU[:,:,nb:] = xp.einsum('wxy,yq->wxq',D[:,:,nb:],U)
-    return DU
-
 def _trace_regularize(D0):
     if len(D0.shape)==3:
         return xp.einsum('wxy->w',D0**2)
@@ -194,7 +140,7 @@ def _rdm_intermediates(U,D,UD,full=True):
 
 def _batched_M1(Dj,ds):
     n,r = ds.shape
-    idx = np.arange(r)
+    idx = xp.arange(r)
     M = Dj.copy()
     M[:,:,idx,idx] += (1./ds)[:,None,:]
     return M
@@ -209,7 +155,7 @@ def _batched_M(Dj,ds):
     M1 = xp.linalg.inv(M1)
 
     n,r = ds.shape
-    idx = np.arange(r)
+    idx = xp.arange(r)
     M2 = -xp.einsum('nwij,nwjk->nwik',M1,Dj)
     M2[:,:,idx,idx] += xp.ones(r) 
     return M1,M2*ds[:,None,None,:]
@@ -268,29 +214,6 @@ class SORHFTrial(SumOfRotationBase):
                 R[kix] = 1./xp.sqrt(1.+self.eps_sq*tr)
         return ovlp,R0,R
 
-    @plum.dispatch
-    def update_walkers(self,kixs,walkers:UHFWalkers):
-        keys = [self.keys[int(kix)] for kix in to_host(kixs)]
-        C = walkers2uhf(walkers)
-        UC = [conjugate_chol_left(b.chol_basis,C) for b in self.batches]
-        for w,(d,r,i) in enumerate(keys):
-            batch = self.batches[d] 
-            C[:,w] = batch.apply_rotation(C[:,w],UC[d][:,w],r,i)
-        walkers.phia = C[0]
-        walkers.phib = C[1]
-
-    @plum.dispatch
-    def update_walkers(self,kixs,walkers:GHFWalkers):
-        keys = [self.keys[int(kix)] for kix in to_host(kixs)]
-        nb = walkers.nbasis
-        C = walkers2ghf(walkers)
-        C = xp.stack([C[:,:nb],C[:,nb:]])
-        UC = [conjugate_chol_left(b.chol_basis,C) for b in self.batches]
-        for w,(d,r,i) in enumerate(keys):
-            batch = self.batches[d] 
-            C[:,w] = batch.apply_rotation(C[:,w],UC[d][w],r,i)
-        walkers.phi = xp.concatenate([C[0],C[1]],axis=1)
-
     def _get_trial_ovlp_ratio(self,walkers,trial):
         print('called')
         C = walkers2ghf(walkers)
@@ -329,7 +252,8 @@ class SORHFTrial(SumOfRotationBase):
                     R[kix] = 1./xp.sqrt(1.+self.eps_sq*tr)
         return ovlp,R0,R
 
-    def _update_walkers_slow(self,keys,walkers):
+    def _update_walkers_slow(self,kixs,walkers):
+        keys = [self.keys[int(kix)] for kix in to_host(kixs)]
         nb = self.nbasis
         C = walkers2ghf(walkers)
         for w,(d,r,i) in enumerate(keys):

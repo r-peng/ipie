@@ -1,16 +1,23 @@
 import numpy as np
-import scipy,itertools
-#from ipie.config import config
-from ipie.hamiltonians.bitstring_utils import * 
-from ipie.hamiltonians.generic_base import GenericBase
+import scipy,itertools,plum
+from ipie.hamiltonians.bitstring_utils import (
+        get_all_configs_u11,
+        string_act,
+        count_double_occupancy, 
+)
+from ipie.hamiltonians.walkers_utils import (
+        walkers2uhf,
+        walkers2ghf,
+        conjugate_chol_left,
+        conjugate_chol_right,
+)
+from ipie.walkers.uhf_walkers import UHFWalkers
+from ipie.walkers.ghf_walkers import GHFWalkers
 from ipie.utils.backend import arraylib as xp
 from ipie.utils.backend import to_host
-from mpi4py import MPI
-COMM = MPI.COMM_WORLD
-RANK = COMM.Get_rank()
-SIZE = COMM.Get_size()
 
 class BatchTerms:
+
     def __init__(self,nbasis,chol_basis,rs=[1]):
         self.nbasis = nbasis
         self.chol_basis = chol_basis
@@ -79,59 +86,80 @@ class BatchTerms:
                 C[s] += xp.outer(left,right)
         return C 
 
-class SumOfRotationBase(GenericBase):
+class SumOfRotationBase:
 
-    def __init__(self,h1e,U,eps_sq=None):
-        super().__init__(h1e)
-        self.U = U 
+    def __init__(self,eps_sq=None):
         self.eps_sq = eps_sq
-
         self.batches = []
         self.Lambda = xp.zeros(3)
-        self.H1 = xp.asarray(self.H1)
 
-    def decompose_h1(self,at,thresh=1e-6,iprint=0):
-        # hopping
-        if RANK>0:
-            iprint = 0
+    def decompose_h1(self,h1e,at,thresh=1e-6,iprint=0):
+        h1e = xp.asarray(h1e)
+        self.nbasis = h1e.shape[0]
 
-        eks,vk = np.linalg.eigh(self.H1) 
-        batch = BatchTerms(self.nbasis,vk,rs=[1])
-        for k,ek in enumerate(eks):
-            if np.fabs(ek)<thresh:
-                continue
-            ak = at
-            gk = 1.-ek/ak
-            if gk<0:
-                raise ValueError
-            gk = np.log(gk)
-            self.Lambda[0] += 2*ak
-            if iprint>0:
-                print(f'band={k},ek={ek},gk={gk}')
-            batch.add_term(ak,[k],[gk])
-            batch.add_term(ak,[k+self.nbasis],[gk])
-        self.batches.append(batch)
-        return eks
-
-    def decompose_h2(self,gu,iprint=0,nelec=None):
-        # onsite interaction
-        if RANK>0:
-            iprint = 0
-
-        batch = BatchTerms(self.nbasis,None,rs=[2])
-        ai = self.U/(np.cosh(gu)-1)/4
+        ek,vk = xp.linalg.eigh(h1e) 
+        assert at>xp.amax(xp.fabs(ek))
+        nonzero_bands = xp.nonzero(ek)[0]
         if iprint>0:
-            print('a_U=',ai)
+            print('at=',at)
+            print('bands=',ek)
+        eta = xp.log(1.-ek/at)
+
+        batch = BatchTerms(self.nbasis,vk,rs=[1])
+        self.Lambda[0] += at*2*nonzero_bands.size
+        for k in nonzero_bands:
+            batch.add_term(at,[k],[eta[k]])
+            batch.add_term(at,[k+self.nbasis],[eta[k]])
+        self.batches.append(batch)
+        return ek
+
+    def decompose_hubbard_h2(self,U,gu,iprint=0,nelec=None):
+        batch = BatchTerms(self.nbasis,None,rs=[2])
+        ai = U/(np.cosh(gu)-1)/4
+        if iprint>0:
+            print('ai=',ai)
         self.Lambda[1] += 2*ai*self.nbasis
         if nelec is not None:
-            self.Lambda[1] += self.U*sum(nelec)/2 
+            self.Lambda[1] += U*sum(nelec)/2 
         for i in range(self.nbasis): 
             batch.add_term(ai,[i,i+self.nbasis],[gu,-gu])
             batch.add_term(ai,[i,i+self.nbasis],[-gu,gu])
         self.batches.append(batch)
 
-    def parse_decomposition(self):
+    def decompose_qc_h2(self,chol,ai,thresh=1e-6,iprint=0):
+        chol = xp.asarray(chol)
+        aisq = ai**2/2
+        if iprint>0:
+            print('ai=',ai)
+        for i,L in enumerate(chol):
+            ek,vk = xp.linalg.eigh(L) 
+            assert ai>xp.amax(xp.fabs(ek))
+            if iprint>0:
+                print(f'chol={i},bands={ek}')
+            nonzero_bands = xp.nonzero(ek)[0]
+            self.Lambda[1] += (ai*2*nonzero_bands.size)**2/2.
+            eta_plus = xp.log(1.+ek/ai) 
+            eta_minus = xp.log(1.-ek/ai) 
+
+            batch = BatchTerms(self.nbasis,vk,rs=[1,2])
+            for p,q in itertools.product(nonzero_bands,repeat=2):
+                gi = [eta_minus[p],eta_plus[q]]
+                if p==q:
+                    batch.add_term(aisq,[p],[eta_plus[p]+eta_minus[p]])
+                    batch.add_term(aisq,[p+self.nbasis],[eta_plus[p]+eta_minus[p]])
+                    batch.add_term(aisq,[p,p+self.nbasis],gi)
+                    batch.add_term(aisq,[p+self.nbasis,p],gi)
+                else:
+                    batch.add_term(aisq,[p,q],gi)
+                    batch.add_term(aisq,[p,q+self.nbasis],gi)
+                    batch.add_term(aisq,[p+self.nbasis,q],gi)
+                    batch.add_term(aisq,[p+self.nbasis,q+self.nbasis],gi)
+            self.batches.append(batch)
+
+    def parse_decomposition(self,iprint=0):
         self.Lambda[2] = self.Lambda[0] + self.Lambda[1]
+        if iprint>0:
+            print('Lambda=',self.Lambda)
         self.keys = []
         self.bare_gf = [] 
         self.E1_kix = []
@@ -166,33 +194,33 @@ class SumOfRotationBase(GenericBase):
             return gf
         return gf*R0.reshape(1,walkers.nwalkers)/R
 
-    #def sample_from_gf(self,gf):
-    #    sign = xp.sign(gf)
-    #    #nminus = int(to_host(xp.sum(sign < -0.5)))
-    #    #if nminus>0:
-    #    #    print('number of minus=',nminus)
-    #    #    #exit()
+    @plum.dispatch
+    def update_walkers(self,kixs,walkers:UHFWalkers):
+        keys = [self.keys[int(kix)] for kix in to_host(kixs)]
+        C = walkers2uhf(walkers)
+        UC = [conjugate_chol_left(b.chol_basis,C) for b in self.batches]
+        for w,(d,r,i) in enumerate(keys):
+            batch = self.batches[d] 
+            C[:,w] = batch.apply_rotation(C[:,w],UC[d][:,w],r,i)
+        walkers.phia = C[0]
+        walkers.phib = C[1]
 
-    #    p = xp.fabs(gf)
-    #    b = p.sum(axis=0)
-    #    nwalker = b.size
-    #    p /= b.reshape(1,nwalker)
-    #    cdf = xp.cumsum(p, axis=0)
-    #    sample = xp.random.random(nwalker)
-    #    kixs = xp.sum(cdf < sample.reshape(1,nwalker), axis=0).astype(xp.int64)
-    #    kixs = xp.minimum(kixs, self.nkeys - 1)
-    #    b *= sign[kixs, xp.arange(nwalker)]
-    #    keys = [self.keys[int(kix)] for kix in to_host(kixs)]
-    #    self.b = b
-    #    return keys,b
-    
+    @plum.dispatch
+    def update_walkers(self,kixs,walkers:GHFWalkers):
+        keys = [self.keys[int(kix)] for kix in to_host(kixs)]
+        nb = walkers.nbasis
+        C = walkers2ghf(walkers)
+        C = xp.stack([C[:,:nb],C[:,nb:]])
+        UC = [conjugate_chol_left(b.chol_basis,C) for b in self.batches]
+        for w,(d,r,i) in enumerate(keys):
+            batch = self.batches[d] 
+            C[:,w] = batch.apply_rotation(C[:,w],UC[d][w],r,i)
+        walkers.phi = xp.concatenate([C[0],C[1]],axis=1)
+
     def local_energy(self,walkers,trial):
         ovlp,R0,_ = self.calc_trial_ovlp_ratio(walkers,trial,compute_R=False)
         E1 = self.Lambda[0]-xp.dot(self.bare_gf[self.E1_kix],ovlp[self.E1_kix])*self.Lambda[2]
         E2 = self.Lambda[1]-xp.dot(self.bare_gf[self.E2_kix],ovlp[self.E2_kix])*self.Lambda[2]
-        if R0 is not None:
-            if RANK==0:
-                print('R0 mean=',to_host(xp.mean(R0)))
         return E1+E2,E1,E2,R0
 
     def _get_MB_gf(self,basis):
@@ -232,6 +260,7 @@ def quadratic2MB(M,basis,spin,thresh=1e-6):
             ix2 = basis_map[cf2]
             H[ix2,ix1] += M[p,q]*sign
     return H
+
 def bcs2MB(A,B,u,v,basis=None,basis_map=None): 
     nsite,npair = A.shape
     if basis is None:
@@ -252,6 +281,7 @@ def bcs2MB(A,B,u,v,basis=None,basis_map=None):
     for k in range(nocc-1,-1,-1):
         psi = apply_cre(k,psi,B)
     return psi,basis,basis_map
+
 def det2MB(B,basis=None,basis_map=None,order=1):
     nsite,nocc = B.shape
     if basis is None:
@@ -267,45 +297,31 @@ def det2MB(B,basis=None,basis_map=None,order=1):
     for k in ks:
         psi = apply_cre(k,psi,B)
     return psi,basis,basis_map
-def hubbard2MB(h1e,U,nelecs,basis=None,basis_map=None,thresh=1e-6):
+
+def hubbard2MB(h1e,U,nelecs=None,basis=None,basis_map=None,thresh=1e-6):
     nsite = h1e.shape[0]
     if basis is None:
         basis = get_all_configs_u11((nsite,nsite),nelecs)
     if basis_map is None:
         basis_map = {cf:i for i,cf in enumerate(basis)}
 
-    H = np.zeros((len(basis),)*2)
-    for ix1,cf1 in enumerate(basis):
-        for i,j in itertools.product(range(nsite),repeat=2):
-            if np.fabs(h1e[i,j])<thresh:
-                continue
-            for s in (0,1):
-                ops = (2*i+s,'cre'),(2*j+s,'des') 
-                cf2,sign = string_act(cf1,ops)
-                if cf2 is not None:
-                    ix2 = basis_map[cf2]
-                    H[ix2,ix1] += h1e[i,j]*sign
-        H[ix1,ix1] += U*count_double_occupancy(cf1,nsite)
+    H = quadratic2MB(h1e,basis,0,thresh=thresh)
+    H += quadratic2MB(h1e,basis,1,thresh=thresh)
+    for ix,cf in enumerate(basis):
+        H[ix,ix] += U*count_double_occupancy(cf,nsite)
     return H,basis,basis_map
 
-#class Udiag:
-#    def __init__(self,ai,ps,gs):
-#        self.ai = ai
-#        self.ps = ps
-#        self.gs = xp.array(gs)
-#        self.ds = xp.exp(self.gs)-1
-#        self.ns = self.ds.size
-#    def select(self,D,axes):
-#        for ax in axes:
-#            D = xp.take(D,self.ps,axis=ax)
-#        return D
-#    def apply_rotation(self,phi0,v,nsite):
-#        phi = [phis.copy() for phis in phi0]
-#        for p,d in zip(self.ps,self.ds):
-#            s,ps = p//nsite,p%nsite
-#            if v is None:
-#                phi[s][ps] += d*phi0[s][ps]
-#            else:
-#                vec = xp.take(v,ps,axis=1)
-#                phi[s] += d*xp.outer(vec,xp.dot(vec,phi0[s]))
-#        return phi
+def chol2MB(h1e,chol,nelecs=None,basis=None,basis_map=None,thresh=1e-6):
+    nsite = h1e.shape[0]
+    if basis is None:
+        basis = get_all_configs_u11((nsite,nsite),nelecs)
+    if basis_map is None:
+        basis_map = {cf:i for i,cf in enumerate(basis)}
+
+    H = quadratic2MB(h1e,basis,0,thresh=thresh)
+    H += quadratic2MB(h1e,basis,1,thresh=thresh)
+    for i,L in enumerate(chol):
+        L_ = quadratic2MB(L,basis,0,thresh=thresh)
+        L_ += quadratic2MB(L,basis,1,thresh=thresh)
+        H += np.dot(L_,L_)/2.
+    return H,basis,basis_map

@@ -18,22 +18,16 @@
 
 """Routines and classes for estimation of observables."""
 
-from __future__ import print_function
-
 import os
 from typing import Tuple, Union
 
-import h5py
 import numpy
 from ipie.utils.backend import arraylib as xp
+from ipie.utils.backend import to_host
 
 from ipie.config import config, MPI
 from ipie.estimators.energy_custom import EnergyEstimator
-from ipie.estimators.estimator_base import EstimatorBase
 from ipie.estimators.handler import EstimatorHandler as EstimatorHandler_
-from ipie.estimators.utils import H5EstimatorHelper
-from ipie.utils.io import format_fixed_width_strings
-from ipie.utils.backend import to_host
 
 # Some supported (non-custom) estimators
 _predefined_estimators = {
