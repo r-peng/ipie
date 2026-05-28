@@ -5,74 +5,54 @@ from ipie.utils.backend import to_host
 from ipie.walkers.uhf_walkers import UHFWalkers
 from ipie.walkers.ghf_walkers import GHFWalkers
 
-@plum.dispatch
-def walkers2uhf(walkers:UHFWalkers):
-    print(walkers.phia)
-    print(walkers.phib)
-    return xp.stack((walkers.phia.real,walkers.phib.real))
-
-@plum.dispatch
-def walkers2ghf(walkers:UHFWalkers):
-    nw,nb = walkers.nwalkers,walkers.nbasis
-    nu,nd = walkers.nup,walkers.ndown
-    C = xp.zeros((nw,nb*2,nu+nd))
-    C[:,:nb,:nu] = walkers.phia.real
-    C[:,nb:,nu:] = walkers.phib.real
-    return C 
-
-@plum.dispatch
-def walkers2ghf(walkers:GHFWalkers):
-    return walkers.phi.real
-
 def make_full(Daa,Dbb,Dab=None,Dba=None):
     nw,n1,n2 = Daa.shape 
     D = xp.zeros((nw,n1*2,n2*2))
     D[:,:n1,:n2] = Daa
-    D[:,n1:,n2:] = Dbb
+    if Dbb is not None:
+        D[:,n1:,n2:] = Dbb
     if Dab is not None:
         D[:,:n1,n2:] = Dab
     if Dba is not None:
         D[:,n1:,:n2] = Dba
     return D
 
-def conjugate_chol_left(U,D,full=False):
+def _conjugate_chol(U,D,axis):
+    if D is None:
+        return None
     if U is None:
-        if len(D.shape)==4 and full:
+        return D
+    if axis==1:
+        return xp.einsum('xp,wxy->wpy',U,D)
+    elif axis==2:
+        return xp.einsum('wxy,yq->wxq',D,U)
+    else:
+        raise ValueError
+
+def conjugate_chol(U,D,axis,full=False):
+    if U is None:
+        if isinstance(D,list) and full:
             return make_full(D[0],D[1])
         return D
-
-    if len(D.shape)==4:
-        UD = xp.einsum('xp,swxy->swpy',U,D)
+    if isinstance(D,list):
+        D = [_conjugate_chol(U,Di,axis) for Di in D]
         if full:
-            UD = make_full(UD[0],UD[1])
-        return UD
-    nw,_,sh2 = D.shape
-    nb,_ = U.shape
-    UD = xp.zeros((nw,nb*2,sh2))
-    UD[:,:nb] = xp.einsum('xp,wxy->wpy',U,D[:,:nb])
-    UD[:,nb:] = xp.einsum('xp,wxy->wpy',U,D[:,nb:])
-    return UD
-
-def conjugate_chol_right(U,D,full=False):
-    if U is None:
-        if len(D.shape)==4 and full:
-            return make_full(D[0],D[1])
+            D = make_full(D[0],D[1])
         return D
-
-    if len(D.shape)==4:
-        DU = xp.einsum('swxy,yq->swxq',D,U)
-        if full:
-            DU = make_full(DU[0],DU[1])
-        return DU
-    nw,sh1,_ = D.shape
     nb,_ = U.shape
-    DU = xp.zeros((nw,sh1,nb*2))
-    DU[:,:,:nb] = xp.einsum('wxy,yq->wxq',D[:,:,:nb],U)
-    DU[:,:,nb:] = xp.einsum('wxy,yq->wxq',D[:,:,nb:],U)
-    return DU
+    if axis==1:
+        D = D[:,:nb],D[:,nb:]
+    elif axis==2:
+        D = D[:,:,:nb],D[:,:,nb:]
+    else:
+        raise ValueError
+    D = [_conjugate_chol(U,Di,axis) for Di in D]
+    return xp.concatenate(D,axis=axis)
 
 @plum.dispatch
 def walkers2tensor(walkers:UHFWalkers):
+    if walkers.ndown==0:
+        return walkers.phia
     return xp.concatenate((walkers.phia.real,walkers.phib.real),axis=2)
 
 @plum.dispatch
@@ -82,8 +62,10 @@ def walkers2tensor(walkers:GHFWalkers):
 @plum.dispatch
 def tensor2walkers(walkers:UHFWalkers,phi):
     phi = xp.asarray(phi)
-    walkers.phia = phi[0]
-    walkers.phib = phi[1]
+    walkers.phia = phi[:,:,:walkers.nup]
+    walkers.phib = None
+    if walkers.ndown>0:
+        walkers.phib = phi[:,:,walkers.nup:]
     return walkers
 
 @plum.dispatch

@@ -2,10 +2,7 @@ import numpy as np
 import plum
 from ipie.hamiltonians.sor_base import SumOfRotationBase
 from ipie.hamiltonians.walkers_utils import (
-        walkers2uhf,
-        walkers2ghf,
-        conjugate_chol_left,
-        conjugate_chol_right,
+        conjugate_chol,
         make_full,
 )
 from ipie.utils.backend import arraylib as xp
@@ -16,8 +13,18 @@ from ipie.trial_wavefunction.single_det import SingleDet
 from ipie.trial_wavefunction.single_det_ghf import SingleDetGHF
 
 @plum.dispatch
-def trial2uhf(trial:SingleDet):
-    return xp.stack((trial.psi0a.real,trial.psi0b.real))
+def walkers2ghf(walkers:UHFWalkers):
+    nw = walkers.nwalkers
+    nb = walkers.nbasis
+    nu,nd = walkers.nup,walkers.ndown 
+    C = xp.zeros((nw,nb*2,nu+nd))
+    C[:,:nb,:nu] = walkers.phia.real
+    C[:,nb:,nu:] = walkers.phib.real
+    return C 
+
+@plum.dispatch
+def walkers2ghf(walkers:GHFWalkers):
+    return walkers.phi
 
 @plum.dispatch
 def trial2ghf(trial:SingleDet):
@@ -32,58 +39,84 @@ def trial2ghf(trial:SingleDet):
 def trial2ghf(trial:SingleDetGHF):
     return trial.psi0.real
 
+def _ovlp_simple(C,B=None):
+    if C is None:
+        return None
+    if B is None:
+        return xp.einsum('wxi,wxj->wij',C,C)
+    return xp.einsum('wxi,xj->wij',C,B)
+
+def _inv_simple(ovlp):
+    if ovlp is None:
+        return None
+    return xp.linalg.inv(ovlp)
+
 @plum.dispatch
 def _ovlp(walkers:UHFWalkers,inv=True):
-    C = walkers2uhf(walkers)
-    CdC = xp.einsum('swxi,swxj->swij',C,C)
-    if inv:
-        CdC = xp.linalg.inv(CdC)
-    return C,CdC
+    C = walkers.phia.real,walkers.phib.real
+    CdC = [_ovlp_simple(Ci) for Ci in C]
+    if not inv:
+        return CdC
+    return [_inv_simple(oi) for oi in CdC]
 
 @plum.dispatch
 def _ovlp(walkers:UHFWalkers,trial:SingleDet,inv=True):
-    C = walkers2uhf(walkers)
-    B = trial2uhf(trial)
-    CdB = xp.einsum('swxi,sxj->swij',C,B)
-    if inv:
-        CdB = xp.linalg.inv(CdB)
-    return C,B,CdB 
+    C = walkers.phia.real,walkers.phib.real
+    B = trial.psi0a.real,trial.psi0b.real
+    CdB = [_ovlp_simple(Ci,B=Bi) for Ci,Bi in zip(C,B)] 
+    if not inv:
+        return CdB
+    return [_inv_simple(oi) for oi in CdB]
 
 @plum.dispatch
 def _ovlp(walkers:UHFWalkers,trial:SingleDetGHF,inv=True):
-    nw = walkers.nwalkers
-    nu,nd = trial.nelec
-    CdB = xp.zeros((nw,nu+nd,nu+nd))
-    CdB[:,:nu] = xp.einsum('wxi,xj->wij',walkers.phia.real,trial.psi0a.real)
-    CdB[:,nu:] = xp.einsum('wxi,xj->wij',walkers.phib.real,trial.psi0b.real)
+    C = walkers.phia.real,walkers.phib.real
+    B = trial.psi0a.real,trial.psi0b.real
+    CdB = [_ovlp_simple(Ci,B=Bi) for Ci,Bi in zip(C,B)] 
+    CdB = xp.concatenate(CdB,axis=1)
     if inv:
         CdB = xp.linalg.inv(CdB)
     return CdB
 
 @plum.dispatch
 def _ovlp(walkers:GHFWalkers,trial:SingleDetGHF,inv=True):
-    CdB = xp.einsum('wxi,xj->wij',walkers.phi.real,trial.psi0.real)
+    CdB = _ovlp_simple(walkers.phi.real,B=trial.psi0.real)
     if inv:
         CdB = xp.linalg.inv(CdB)
     return CdB
 
+def _D0_simple(ovlp,C,B=None):
+    if C is None:
+        return None
+    if B is None:
+        D0 = xp.einsum('wxi,wij->wxj',C,ovlp) 
+    else:
+        D0 = xp.einsum('xi,wij->wxj',B,ovlp) 
+    return xp.einsum('wxj,wyj->wxy',D0,C) 
+
+def _det_inv(ovlp):
+    if ovlp is None:
+        return None
+    return 1./xp.linalg.det(ovlp)
+
 @plum.dispatch
 def _D0(walkers:UHFWalkers,ovlp=False):
-    C,CdCinv = _ovlp(walkers)
-    D = xp.einsum('swxi,swij->swxj',C,CdCinv) 
-    D = xp.einsum('swxj,swyj->swxy',D,C) 
+    CdCinv = _ovlp(walkers)
+    C = walkers.phia.real,walkers.phib.real
+    D = [_D0_simple(oi,Ci) for oi,Ci in zip(CdCinv,C)] 
     if not ovlp:
         return D
-    return D,1./xp.linalg.det(CdCinv)
+    return D,[_det_inv(oi) for oi in CdCinv]
 
 @plum.dispatch
 def _D0(walkers:UHFWalkers,trial:SingleDet,ovlp=False):
-    C,B,CdBinv = _ovlp(walkers,trial)
-    D = xp.einsum('sxi,swij->swxj',B,CdBinv) 
-    D = xp.einsum('swxj,swyj->swxy',D,C) 
+    CdBinv = _ovlp(walkers,trial)
+    C = walkers.phia.real,walkers.phib.real
+    B = trial.psi0a.real,trial.psi0b.real
+    D = [_D0_simple(oi,Ci,B=Bi) for oi,Ci,Bi in zip(CdBinv,C,B)] 
     if not ovlp:
         return D
-    return D,1./xp.linalg.det(CdBinv)
+    return D,[_det_inv(oi) for oi in CdBinv]
 
 @plum.dispatch
 def _D0(walkers:UHFWalkers,trial:SingleDetGHF,ovlp=False):
@@ -103,40 +136,48 @@ def _D0(walkers:UHFWalkers,trial:SingleDetGHF,ovlp=False):
 @plum.dispatch
 def _D0(walkers:GHFWalkers,trial:SingleDetGHF,ovlp=False):
     CdBinv = _ovlp(walkers,trial)
-    D = xp.einsum('xi,wij->wxj',trial.psi0,CdBinv) 
-    D = xp.einsum('wxj,wyj->wxy',D,walkers.phi.real) 
+    D = _D0_simple(CdBinv,walkers.phi.real,B=trial.psi0.real)
     if not ovlp:
         return D
     return D,1./xp.linalg.det(CdBinv)
 
-def _trace_regularize(D0):
-    if len(D0.shape)==3:
-        return xp.einsum('wxy->w',D0**2)
-    return xp.einsum('swxy->w',D0**2)
+def _trace_simple(D0):
+    if D0 is None:
+        return 0
+    return xp.einsum('wxy->w',D0**2)
 
-def _rdm_intermediates(U,D,UD,full=True):
-    DU = conjugate_chol_right(U,D)
-    if len(D.shape)==3:
-        UDDtU = xp.einsum('wpx,wqx->wpq',UD,UD)
-        UDtDU = xp.einsum('wxp,wxq->wpq',DU,DU)
-        if U is None:
-            UDDt = UDDtU
-        else:
-            UDDt = xp.einsum('wpx,wyx->wpy',UD,D)
-        UDDDU = xp.einsum('wpx,wxq->wpq',UDDt,DU)
-        return UDDtU,UDtDU,UDDDU
-    UDDtU = xp.einsum('swpx,swqx->swpq',UD,UD)
-    UDtDU = xp.einsum('swxp,swxq->swpq',DU,DU)
+def _trace_regularize(D0):
+    if isinstance(D0,list):
+        return _trace_simple(D0[0])+_trace_simple(D0[1]) 
+    return _trace_simple(D0)
+
+def _rdm_simple(U,D,DU,UD):
+    if D is None:
+        return None,None,None
+    UDDtU = xp.einsum('wpx,wqx->wpq',UD,UD)
+    UDtDU = xp.einsum('wxp,wxq->wpq',DU,DU)
     if U is None:
         UDDt = UDDtU
     else:
-        UDDt = xp.einsum('swpx,swyx->swpy',UD,D)
-    UDDDU = xp.einsum('swpx,swxq->swpq',UDDt,DU)
-    if full:
-        UDDtU = make_full(UDDtU[0],UDDtU[1])
-        UDtDU = make_full(UDtDU[0],UDtDU[1])
-        UDDDU = make_full(UDDDU[0],UDDDU[1])
+        UDDt = xp.einsum('wpx,wyx->wpy',UD,D)
+    UDDDU = xp.einsum('wpx,wxq->wpq',UDDt,DU)
     return UDDtU,UDtDU,UDDDU
+
+def _rdm_intermediates(U,D,UD,full=True):
+    DU = conjugate_chol(U,D,2)
+    if isinstance(D,list):
+        UDDtU = [None] * 2
+        UDtDU = [None] * 2
+        UDDDU = [None] * 2
+        UDDtU[0],UDtDU[0],UDDDU[0] = _rdm_simple(U,D[0],DU[0],UD[0])
+        UDDtU[1],UDtDU[1],UDDDU[1] = _rdm_simple(U,D[1],DU[1],UD[1])
+        if full:
+            UDDtU = make_full(UDDtU[0],UDDtU[1])
+            UDtDU = make_full(UDtDU[0],UDtDU[1])
+            UDDDU = make_full(UDDDU[0],UDDDU[1])
+        return UDDtU,UDtDU,UDDDU
+    else:
+        return _rdm_simple(U,D,DU,UD)
 
 def _batched_M1(Dj,ds):
     n,r = ds.shape
@@ -179,8 +220,8 @@ class SORHFTrial(SumOfRotationBase):
             R = xp.ones((self.nkeys,nw))
         for d,batch in enumerate(self.batches):
             U = batch.chol_basis
-            UD = conjugate_chol_left(U,D0) 
-            UDU = conjugate_chol_right(U,UD,full=True) 
+            UD = conjugate_chol(U,D0,1) 
+            UDU = conjugate_chol(U,UD,2,full=True) 
             if compute_R:
                 P1,P2,P3 = _rdm_intermediates(U,D0,UD)
             for r in batch.rs:

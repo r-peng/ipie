@@ -5,12 +5,6 @@ from ipie.hamiltonians.bitstring_utils import (
         string_act,
         count_double_occupancy, 
 )
-from ipie.hamiltonians.walkers_utils import (
-        walkers2uhf,
-        walkers2ghf,
-        conjugate_chol_left,
-        conjugate_chol_right,
-)
 from ipie.walkers.uhf_walkers import UHFWalkers
 from ipie.walkers.ghf_walkers import GHFWalkers
 from ipie.utils.backend import arraylib as xp
@@ -73,17 +67,18 @@ class BatchTerms:
             U[s] = xp.einsum('xp,yp,p->xy',v,v,Us)
         return U
 
-    def apply_rotation(self,C,UC,r,i):
+    def apply_rotation(self,C,r,i):
         ps = self.p[r][i]
         ds = self.d[r][i]
         for p,d in zip(ps,ds):
             s,p_ = p//self.nbasis,p%self.nbasis
+            if C[s] is None:
+                continue
             if self.chol_basis is None:
-                C[s,p_] += d*UC[s,p_]
+                C[s][p_] += d*C[s][p_]
             else:
-                left = d*self.chol_basis[:,p_]
-                right = UC[s,p_]
-                C[s] += xp.outer(left,right)
+                vec = self.chol_basis[:,p_]
+                C[s] += xp.outer(d*vec,xp.dot(vec,C[s]))
         return C 
 
 class SumOfRotationBase:
@@ -197,24 +192,27 @@ class SumOfRotationBase:
     @plum.dispatch
     def update_walkers(self,kixs,walkers:UHFWalkers):
         keys = [self.keys[int(kix)] for kix in to_host(kixs)]
-        C = walkers2uhf(walkers)
-        UC = [conjugate_chol_left(b.chol_basis,C) for b in self.batches]
+        Ca = walkers.phia.copy()
+        if walkers.ndown==0:
+            Cb = [None] * walkers.nwalkers
+        else:
+            Cb = walkers.phib.copy()
         for w,(d,r,i) in enumerate(keys):
             batch = self.batches[d] 
-            C[:,w] = batch.apply_rotation(C[:,w],UC[d][:,w],r,i)
-        walkers.phia = C[0]
-        walkers.phib = C[1]
+            Cnew = [Ca[w],Cb[w]]
+            Cnew = batch.apply_rotation(Cnew,r,i)
+            walkers.phia[w] = Cnew[0]
+            if walkers.ndown>0:
+                walkers.phib[w] = Cnew[1]
 
     @plum.dispatch
     def update_walkers(self,kixs,walkers:GHFWalkers):
         keys = [self.keys[int(kix)] for kix in to_host(kixs)]
         nb = walkers.nbasis
-        C = walkers2ghf(walkers)
-        C = xp.stack([C[:,:nb],C[:,nb:]])
-        UC = [conjugate_chol_left(b.chol_basis,C) for b in self.batches]
+        C = xp.stack([walkers.phi[:,:nb],walkers.phi[:,nb:]])
         for w,(d,r,i) in enumerate(keys):
             batch = self.batches[d] 
-            C[:,w] = batch.apply_rotation(C[:,w],UC[d][w],r,i)
+            C[:,w] = batch.apply_rotation(C[:,w],r,i)
         walkers.phi = xp.concatenate([C[0],C[1]],axis=1)
 
     def local_energy(self,walkers,trial):
