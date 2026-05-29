@@ -6,7 +6,6 @@ from ipie.hamiltonians.walkers_utils import (
         make_full,
 )
 from ipie.utils.backend import arraylib as xp
-from ipie.utils.backend import to_host
 from ipie.walkers.uhf_walkers import UHFWalkers
 from ipie.walkers.ghf_walkers import GHFWalkers
 from ipie.trial_wavefunction.single_det import SingleDet 
@@ -94,10 +93,13 @@ def _D0_simple(ovlp,C,B=None):
         D0 = xp.einsum('xi,wij->wxj',B,ovlp) 
     return xp.einsum('wxj,wyj->wxy',D0,C) 
 
-def _det_inv(ovlp):
+def _det(ovlp,inv=True):
     if ovlp is None:
         return None
-    return 1./xp.linalg.det(ovlp)
+    det = xp.linalg.det(ovlp)
+    if inv:
+        det = 1./det
+    return det
 
 @plum.dispatch
 def _D0(walkers:UHFWalkers,ovlp=False):
@@ -106,7 +108,10 @@ def _D0(walkers:UHFWalkers,ovlp=False):
     D = [_D0_simple(oi,Ci) for oi,Ci in zip(CdCinv,C)] 
     if not ovlp:
         return D
-    return D,[_det_inv(oi) for oi in CdCinv]
+    ovlp = _det(CdCinv[0])
+    if CdCinv[1] is not None:
+        ovlp *= _det(CdCinv[1])
+    return D,ovlp
 
 @plum.dispatch
 def _D0(walkers:UHFWalkers,trial:SingleDet,ovlp=False):
@@ -116,7 +121,10 @@ def _D0(walkers:UHFWalkers,trial:SingleDet,ovlp=False):
     D = [_D0_simple(oi,Ci,B=Bi) for oi,Ci,Bi in zip(CdBinv,C,B)] 
     if not ovlp:
         return D
-    return D,[_det_inv(oi) for oi in CdBinv]
+    ovlp = _det(CdBinv[0])
+    if CdBinv[1] is not None:
+        ovlp *= _det(CdBinv[1])
+    return D,ovlp
 
 @plum.dispatch
 def _D0(walkers:UHFWalkers,trial:SingleDetGHF,ovlp=False):
@@ -202,6 +210,22 @@ def _batched_M(Dj,ds):
     return M1,M2*ds[:,None,None,:]
 
 class SORHFTrial(SumOfRotationBase):
+
+    def compute_guiding_fxn(self,walkers,trial):
+        if self.eps_sq is None:
+            CdB = _ovlp(walkers,trial,inv=False)
+            if isinstance(CdB,list):
+                ovlp = _det(CdB[0],inv=False)
+                if CdB[1] is not None:
+                    ovlp *= _det(CdB[1],inv=False)
+            else:
+                ovlp = xp.linalg.det(CdB)
+        else:
+            D0,ovlp = _D0(walkers,trial,ovlp=True)
+            tr0 = _trace_regularize(D0)
+            R0 = 1./xp.sqrt(1.+self.eps_sq*tr0)
+            ovlp /= R0
+        walkers.ovlp = ovlp
 
     def calc_trial_ovlp_ratio(self,walkers,trial,compute_R0=True,compute_R=True):
         D0 = _D0(walkers,trial)
@@ -293,8 +317,7 @@ class SORHFTrial(SumOfRotationBase):
                     R[kix] = 1./xp.sqrt(1.+self.eps_sq*tr)
         return ovlp,R0,R
 
-    def _update_walkers_slow(self,kixs,walkers):
-        keys = [self.keys[int(kix)] for kix in to_host(kixs)]
+    def _update_walkers_slow(self,keys,walkers):
         nb = self.nbasis
         C = walkers2ghf(walkers)
         for w,(d,r,i) in enumerate(keys):

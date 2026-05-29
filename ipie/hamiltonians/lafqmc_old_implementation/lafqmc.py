@@ -54,6 +54,39 @@ def update_weight(walkers,b,constraint_path=True,thresh=1e-15):
     walkers.sgn_ovlp[minus_idx] *= minus_val 
     walkers.sgn_ovlp[zero_idx] = 0
 
+def propagate_walkers_slow(walkers, hamiltonian, trial, constraint_path=True):
+    # 1.compute dressed gf
+    synchronize()
+    #start_time = time.time()
+    gf = hamiltonian.calc_gf(walkers,trial)
+    synchronize()
+    #self.timer.tgf += time.time() - start_time
+
+    # 2.sample from gf
+    nkeys,nw = gf.shape
+    sign = xp.sign(gf)
+    p = xp.fabs(gf)
+    b = p.sum(axis=0)
+    p /= b.reshape(1,nw)
+    cdf = xp.cumsum(p, axis=0)
+    sample = xp.random.random(nw)
+    kixs = xp.sum(cdf < sample.reshape(1,nw), axis=0).astype(xp.int64)
+    kixs = xp.minimum(kixs, nkeys - 1)
+    sign = sign[kixs, xp.arange(nw)]
+    keys = [hamiltonian.keys[int(kix)] for kix in to_host(kixs)]
+
+    # 3.update walker
+    #start_time = time.time()
+    hamiltonian.update_walkers(keys,walkers)
+    synchronize()
+    #self.timer.tgemm += time.time() - start_time
+
+    # 4.update weight
+    #start_time = time.time()
+    update_weight(walkers,b*sign,constraint_path=constraint_path)
+    synchronize()
+    #self.timer.tupdate += time.time() - start_time
+
 def propagate_walkers(walkers, hamiltonian, trial, constraint_path=True):
     # 1.compute gf
     gf = hamiltonian.bare_gf
@@ -69,7 +102,7 @@ def propagate_walkers(walkers, hamiltonian, trial, constraint_path=True):
     #start_time = time.time()
     ovlp_old = walkers.ovlp
     #keys = [hamiltonian.keys[int(kix)] for kix in to_host(kixs)]
-    hamiltonian.update_walkers(to_host(kixs),walkers)
+    hamiltonian.update_walkers(kixs,walkers)
     hamiltonian.compute_guiding_fxn(walkers,trial)
     synchronize()
     #self.timer.tgemm += time.time() - start_time
@@ -215,6 +248,41 @@ class LAFQMC(AFQMCBase):
             reference_run=reference_run,
             walkermap_filepath=walkermap_filepath,
         )
+        # 2. Calculation objects.
+        #system = Generic(num_elec)
+        # TODO: do logic and logging in the function.
+        #if trial_wavefunction.compute_trial_energy:
+        #    trial_wavefunction.calculate_energy(system, hamiltonian)
+        #    trial_wavefunction.e1b = comm.bcast(trial_wavefunction.e1b, root=0)
+        #    trial_wavefunction.e2b = comm.bcast(trial_wavefunction.e2b, root=0)
+        #comm.barrier()
+        #if walkers is None:
+        #    _, initial_walker = get_initial_walker(trial_wavefunction)
+        #    # TODO this is a factory method not a class
+        #    walkers = UHFWalkersTrial(
+        #        trial_wavefunction,
+        #        initial_walker,
+        #        system.nup,
+        #        system.ndown,
+        #        hamiltonian.nbasis,
+        #        num_walkers,
+        #        mpi_handler,
+        #    )
+        #    walkers.build(
+        #        trial_wavefunction
+        #    )  # any intermediates that require information from trial_wavefunction
+        # TODO: this is a factory not a class
+        #propagator = Propagator[type(hamiltonian)](
+        #    params.timestep, params.ene_bound_const, params.fb_bound
+        #)
+        #propagator.build(hamiltonian, trial_wavefunction, walkers, mpi_handler)
+        #if not math.isclose(params.timestep, params.eq_timestep, rel_tol=1e-8):
+        #    eq_propagator = Propagator[type(hamiltonian)](
+        #        params.eq_timestep, params.ene_bound_const, params.fb_bound
+        #    )
+        #    eq_propagator.build(hamiltonian, trial_wavefunction, walkers, mpi_handler)
+        #else:
+        #    eq_propagator = propagator
         return LAFQMC(
             None,
             hamiltonian,
