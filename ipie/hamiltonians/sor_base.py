@@ -39,27 +39,23 @@ def tensor2walkers(walkers:GHFWalkers,phi):
 def save_walkers(walkers,comm,dirname):
     RANK,SIZE = comm.rank,comm.size
     if RANK>0:
-        obj = to_host(walkers2tensor(walkers)),to_host(walkers.weight),to_host(walkers.sgn_ovlp)
+        obj = to_host(walkers2tensor(walkers)),to_host(walkers.weight)
         comm.send(obj,0)
         return
     phi = [to_host(walkers2tensor(walkers))] + ([None] * (SIZE-1))
     weights = [to_host(walkers.weight)] + ([None] * (SIZE-1))
-    sgn_ovlp = [to_host(walkers.sgn_ovlp)] + ([None] * (SIZE-1))
     for r in range(1,SIZE):
-        phi[r],weights[r],sgn_ovlp[r] = comm.recv(source=r)
+        phi[r],weights[r] = comm.recv(source=r)
     with h5py.File(f'{dirname}/walkers.hdf5','w') as f:
         f.create_dataset('phi',data=np.concatenate(phi,axis=0))
-        f.create_dataset('log_weights',data=np.concatenate(weights,axis=0))
-        f.create_dataset('sgn_ovlp',data=np.concatenate(sgn_ovlp,axis=0))
+        f.create_dataset('weights',data=np.concatenate(weights,axis=0))
 
 def load_walkers(walkers,comm,dirname):
     with h5py.File(f'{dirname}/walkers.hdf5','r') as f:
         phi = f['phi'][:]
-        log_weights = f['log_weights'][:]
-        sgn_ovlp = f['sgn_ovlp'][:]
+        weights = f['weights'][:]
     print(phi.shape)
-    print(log_weights.shape)
-    print(sgn_ovlp.shape)
+    print(weights.shape)
     exit()
 
     RANK,SIZE = comm.rank,comm.size
@@ -399,7 +395,7 @@ class HubbardSOR(SumOfRotationBase):
         super().__init__(eps_sq=eps_sq)
         self.h1e = xp.asarray(h1e)
         self.U = U
-        self.v0 = 0.
+        self.v0 = -0.5*U*xp.eye(self.h1e.shape[0]) 
 
     def decompose_h2(self,gu,iprint=0,nelec=None):
         self.chol_basis.append(xp.eye(self.nbasis))

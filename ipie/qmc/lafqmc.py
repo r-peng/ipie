@@ -40,19 +40,19 @@ from ipie.walkers.base_walkers import WalkerAccumulator
 from ipie.walkers.pop_controller_custom import PopController
 from ipie.qmc.afqmc import AFQMCBase
 
-def update_weight(walkers,b,constraint_path=True,thresh=1e-15):
-    minus_idx = xp.nonzero(b<-thresh)
-    minus_val = -1
-    b_abs = xp.fabs(b)
-    zero_idx = xp.nonzero(b_abs<thresh)
-    if constraint_path:
-        b[minus_idx] = thresh
-        minus_val = 0
-    walkers.weight += xp.log(b_abs)
-    # use .sgn_ovlp to store signs for now
-    # doesn't seemed to be used for anything else
-    walkers.sgn_ovlp[minus_idx] *= minus_val 
-    walkers.sgn_ovlp[zero_idx] = 0
+#def update_weight(walkers,b,constraint_path=True,thresh=1e-15):
+#    minus_idx = xp.nonzero(b<-thresh)
+#    minus_val = -1
+#    b_abs = xp.fabs(b)
+#    zero_idx = xp.nonzero(b_abs<thresh)
+#    if constraint_path:
+#        b[minus_idx] = thresh
+#        minus_val = 0
+#    walkers.weight += xp.log(b_abs)
+#    # use .sgn_ovlp to store signs for now
+#    # doesn't seemed to be used for anything else
+#    walkers.sgn_ovlp[minus_idx] *= minus_val 
+#    walkers.sgn_ovlp[zero_idx] = 0
 
 def propagate_walkers(walkers, hamiltonian, trial, constraint_path=True):
     # 1.compute gf
@@ -77,7 +77,9 @@ def propagate_walkers(walkers, hamiltonian, trial, constraint_path=True):
     # 4.update weight
     #start_time = time.time()
     b = sign*walkers.ovlp/ovlp_old
-    update_weight(walkers,b,constraint_path=constraint_path)
+    if constraint_path:
+        xp.clip(b, a_min=0.0, a_max=None, out=b)  # in-place clipping (cosine projection)
+    walkers.weight *= b 
     synchronize()
     #self.timer.tupdate += time.time() - start_time
 
@@ -357,13 +359,13 @@ class LAFQMC(AFQMCBase):
         self.estimators.print_block(comm, 0, self.accumulators)
         self.accumulators.zero()
 
-    def post_pop_ctr(self,comm,log_average_weight):
+    def post_pop_ctr(self,comm,average_weight):
         if self.params.pop_control_method!='stochastic_reconfiguration':
             return
         self.estimators.compute_estimators(
             self.system, self.hamiltonian, self.trial, self.walkers
         )
-        self.estimators.post_sr(comm,self.accumulators,log_average_weight)
+        self.estimators.post_sr(comm,self.accumulators,average_weight)
 
     def estimate_energy(self,comm,block,max_nprod,max_nsum):
         if self.params.pop_control_method=='stochastic_reconfiguration':
@@ -411,7 +413,6 @@ class LAFQMC(AFQMCBase):
         tzero_setup = time.time()
         if walkers is not None:
             self.walkers = walkers
-        self.walkers.weight = xp.log(self.walkers.weight) # use log(weight)
         self.setup_timers()
         eshift = 0.0
         self.walkers.orthogonalise()
@@ -519,7 +520,7 @@ class LAFQMC(AFQMCBase):
             if step <= num_eqlb_steps:
                 if step % self.params.eq_pop_control_freq == 0:
                     start = time.time()
-                    log_average_weight = self.pcontrol_eq.pop_control(self.walkers, comm)
+                    average_weight = self.pcontrol_eq.pop_control(self.walkers, comm)
                     synchronize()
                     self.tpopc += time.time() - start
                     self.tpopc_send = self.pcontrol_eq.timer.send_time
@@ -529,7 +530,7 @@ class LAFQMC(AFQMCBase):
             else:
                 if step % self.params.pop_control_freq == 0:
                     start = time.time()
-                    log_average_weight = self.pcontrol.pop_control(self.walkers, comm)
+                    average_weight = self.pcontrol.pop_control(self.walkers, comm)
                     synchronize()
                     self.tpopc += time.time() - start
                     self.tpopc_send = self.pcontrol.timer.send_time
@@ -546,10 +547,10 @@ class LAFQMC(AFQMCBase):
             # post poppulation control accumulation
             if step <= num_eqlb_steps:
                 if step % self.params.eq_pop_control_freq == 0:
-                    self.post_pop_ctr(comm,log_average_weight)
+                    self.post_pop_ctr(comm,average_weight)
             else:
                 if step % self.params.pop_control_freq == 0:
-                    self.post_pop_ctr(comm,log_average_weight)
+                    self.post_pop_ctr(comm,average_weight)
 
             # calculate estimators
             start = time.time()
