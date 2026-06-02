@@ -32,12 +32,12 @@ class EnergyEstimator(EnergyEstimator_):
                 }
     def compute_estimator(self, system=None, walkers=None, hamiltonian=None, trial=None):
         # Need to be able to dispatch here
-        Etot,E1,E2,R = hamiltonian.local_energy(walkers,trial)
-        if R is None:
+        Etot,E1,E2 = hamiltonian.local_energy(walkers)
+        if walkers.R is None:
             weight = walkers.weight
         else:
-            weight = walkers.weight * R 
-            print('R mean=',to_host(xp.mean(R)))
+            weight = walkers.weight * walkers.R 
+            #print('R mean=',to_host(xp.mean(R)))
 
         self._data["ENumer"] = xp.sum(weight * Etot)
         self._data["EDenom"] = xp.sum(weight)

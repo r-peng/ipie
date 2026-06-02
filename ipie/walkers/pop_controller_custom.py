@@ -20,7 +20,7 @@ class PopController(PopController_):
             super().pop_control(walkers,comm)
             return None
         #self.timer.start_time()
-        walkers.sgn_ovlp = xp.sign(walkers.weight)
+        walkers.phase = xp.sign(walkers.weight)
         walkers.weight = xp.fabs(walkers.weight)
 
         global_max = xp.amax(walkers.weight) 
@@ -28,11 +28,11 @@ class PopController(PopController_):
         global_max = comm.bcast(global_max, root=0)
         #global_max = 0.
 
+        walkers.weight /= global_max
         walkers.unscaled_weight = walkers.weight
-        walkers.weight = walkers.weight/global_max
         stochastic_reconfiguration(walkers, comm, self.timer, self.pop_control_counter)
         average_weight = walkers.weight[0]
-        walkers.weight = walkers.sgn_ovlp 
-        #print('global_max,log_ave',global_max,average_weight)
-        return average_weight * global_max
+        walkers.weight = walkers.phase
+        #print('global_max,ave',global_max,average_weight)
+        return xp.log(average_weight * global_max)
 

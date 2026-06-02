@@ -5,18 +5,74 @@ from ipie.hamiltonians.bitstring_utils import (
         string_act,
         count_double_occupancy, 
 )
-from ipie.walkers.walkers_utils import (
-        compute_rdm1,
-        update_walkers,
-        compute_regularization,
-        update_rdm1,
-)
 from ipie.walkers.uhf_walkers import UHFWalkers
 from ipie.walkers.ghf_walkers import GHFWalkers
 from ipie.trial_wavefunction.single_det import SingleDet 
 from ipie.trial_wavefunction.single_det_ghf import SingleDetGHF
 from ipie.utils.backend import to_host
 from ipie.utils.backend import arraylib as xp
+
+@plum.dispatch
+def walkers2tensor(walkers:UHFWalkers):
+    if walkers.ndown==0:
+        return walkers.phia
+    return xp.concatenate((walkers.phia.real,walkers.phib.real),axis=2)
+
+@plum.dispatch
+def walkers2tensor(walkers:GHFWalkers):
+    return walkers.phi.real
+
+@plum.dispatch
+def tensor2walkers(walkers:UHFWalkers,phi):
+    phi = xp.asarray(phi)
+    walkers.phia = phi[:,:,:walkers.nup]
+    walkers.phib = None
+    if walkers.ndown>0:
+        walkers.phib = phi[:,:,walkers.nup:]
+    return walkers
+
+@plum.dispatch
+def tensor2walkers(walkers:GHFWalkers,phi):
+    walkers.phi = xp.asarray(phi)
+    return walkers 
+
+def save_walkers(walkers,comm,dirname):
+    RANK,SIZE = comm.rank,comm.size
+    if RANK>0:
+        obj = to_host(walkers2tensor(walkers)),to_host(walkers.weight)
+        comm.send(obj,0)
+        return
+    phi = [to_host(walkers2tensor(walkers))] + ([None] * (SIZE-1))
+    weights = [to_host(walkers.weight)] + ([None] * (SIZE-1))
+    for r in range(1,SIZE):
+        phi[r],weights[r] = comm.recv(source=r)
+    with h5py.File(f'{dirname}/walkers.hdf5','w') as f:
+        f.create_dataset('phi',data=np.concatenate(phi,axis=0))
+        f.create_dataset('weights',data=np.concatenate(weights,axis=0))
+
+def load_walkers(walkers,comm,dirname):
+    with h5py.File(f'{dirname}/walkers.hdf5','r') as f:
+        phi = f['phi'][:]
+        weights = f['weights'][:]
+    print(phi.shape)
+    print(weights.shape)
+    exit()
+
+    RANK,SIZE = comm.rank,comm.size
+
+    nw = log_weights.size
+    b,r = nw//SIZE,nw%SIZE
+    counts = np.array([b]*SIZE)
+    if r>0:
+        counts[:r] += 1
+    counts = np.cumsum(counts)
+    start = 0 if RANK==0 else counts[RANK-1]
+    stop = counts[RANK]
+    print(f'RANK={RANK},start={start},stop={stop}')
+    walkers = tensor2walkers(walkers,phi[start:stop])
+    walkers.weight = xp.exp(xp.asarray(log_weights[start:stop]))
+    walkers.sgn_ovlp = xp.asarray(sgn_ovlp[start:stop])
+    return walkers
 
 class Rotation:
 
@@ -58,6 +114,134 @@ class Rotation:
             U[s] = xp.einsum('xp,yp,p->xy',v,v,diag)
         return U
 
+def _update_walkers(C,d,u,w):
+    if d is None:
+        return C
+    right = xp.einsum('wr,wxr,wxi->wri',d,u,C[w])
+    C[w] += xp.einsum('wxr,wri->wxi',u,right)
+    return C
+
+def _ovlp(C,B=None):
+    if C is None:
+        return None
+    if B is None:
+        return xp.einsum('wxi,wxj->wij',C,C)
+    return xp.einsum('wxi,xj->wij',C,B)
+
+def _inv(ovlp):
+    if ovlp is None:
+        return None
+    return xp.linalg.inv(ovlp)
+
+@plum.dispatch
+def compute_ovlp(walkers:UHFWalkers,inv=True):
+    C = walkers.phia.real,walkers.phib.real
+    CdC = [_ovlp(Ci) for Ci in C]
+    if not inv:
+        return CdC
+    return [_inv(oi) for oi in CdC]
+
+@plum.dispatch
+def compute_ovlp(walkers:UHFWalkers,trial:SingleDet,inv=True):
+    C = walkers.phia.real,walkers.phib.real
+    B = trial.psi0a.real,trial.psi0b.real
+    CdB = [_ovlp(Ci,B=Bi) for Ci,Bi in zip(C,B)] 
+    if not inv:
+        return CdB
+    return [_inv(oi) for oi in CdB]
+
+@plum.dispatch
+def compute_ovlp(walkers:UHFWalkers,trial:SingleDetGHF,inv=True):
+    C = walkers.phia.real,walkers.phib.real
+    B = trial.psi0a.real,trial.psi0b.real
+    CdB = [_ovlp(Ci,B=Bi) for Ci,Bi in zip(C,B)] 
+    CdB = xp.concatenate(CdB,axis=1)
+    if inv:
+        CdB = xp.linalg.inv(CdB)
+    return CdB
+
+@plum.dispatch
+def compute_ovlp(walkers:GHFWalkers,trial:SingleDetGHF,inv=True):
+    CdB = _ovlp(walkers.phi.real,B=trial.psi0.real)
+    if inv:
+        CdB = xp.linalg.inv(CdB)
+    return CdB
+
+def _rdm1(ovlp,C,B=None):
+    if C is None:
+        return None
+    if B is None:
+        D = xp.einsum('wxi,wij->wxj',C,ovlp) 
+    else:
+        D = xp.einsum('xi,wij->wxj',B,ovlp) 
+    return xp.einsum('wxj,wyj->wxy',D,C) 
+
+def _det(ovlp,inv=True):
+    if ovlp is None:
+        return None
+    det = xp.linalg.det(ovlp)
+    if inv:
+        det = 1./det
+    return det
+
+@plum.dispatch
+def compute_rdm1(walkers:UHFWalkers,ovlp=False):
+    CdCinv = compute_ovlp(walkers)
+    C = walkers.phia.real,walkers.phib.real
+    D = [_rdm1(oi,Ci) for oi,Ci in zip(CdCinv,C)] 
+    if not ovlp:
+        return D
+    ovlp = _det(CdCinv[0])
+    if CdCinv[1] is not None:
+        ovlp *= _det(CdCinv[1])
+    return D,ovlp
+
+@plum.dispatch
+def compute_rdm1(walkers:UHFWalkers,trial:SingleDet,ovlp=False):
+    CdBinv = compute_ovlp(walkers,trial)
+    C = walkers.phia.real,walkers.phib.real
+    B = trial.psi0a.real,trial.psi0b.real
+    D = [_rdm1(oi,Ci,B=Bi) for oi,Ci,Bi in zip(CdBinv,C,B)] 
+    if not ovlp:
+        return D
+    ovlp = _det(CdBinv[0])
+    if CdBinv[1] is not None:
+        ovlp *= _det(CdBinv[1])
+    return D,ovlp
+
+@plum.dispatch
+def compute_rdm1(walkers:UHFWalkers,trial:SingleDetGHF,ovlp=False):
+    CdBinv = compute_ovlp(walkers,trial)
+    tmp = xp.einsum('xi,wij->wxj',trial.psi0.real,CdBinv) 
+
+    nw = walkers.nwalkers
+    nu,nd = trial.nelec
+    nb = trial.nbasis
+    D = xp.zeros((nw,nb*2,nb*2))
+    D[:,:,:nb] = xp.einsum('wxj,wyj->wxy',tmp[:,:,:nu],walkers.phia.real)
+    D[:,:,nb:] = xp.einsum('wxj,wyj->wxy',tmp[:,:,nu:],walkers.phib.real)
+    if not ovlp:
+        return D
+    return D,1./xp.linalg.det(CdBinv)
+
+@plum.dispatch
+def compute_rdm1(walkers:GHFWalkers,trial:SingleDetGHF,ovlp=False):
+    CdBinv = compute_ovlp(walkers,trial)
+    D = _rdm1(CdBinv,walkers.phi.real,B=trial.psi0.real)
+    if not ovlp:
+        return D
+    return D,1./xp.linalg.det(CdBinv)
+
+def _trace(D):
+    if D is None:
+        return 0
+    return xp.einsum('wxy->w',D**2)
+
+def compute_trace(D):
+    if isinstance(D,list):
+        return  _trace(D[0])+_trace(D[1]) 
+    return _trace(D)
+
 class SumOfRotationBase:
 
     def __init__(self,eps_sq=None):
@@ -97,6 +281,22 @@ class SumOfRotationBase:
         if iprint>0:
             print('normalization=',xp.fabs(self.bare_gf).sum())
 
+    def compute_guiding_fxn(self,walkers,trial):
+        if self.eps_sq is None:
+            CdB = compute_ovlp(walkers,trial,inv=False)
+            if isinstance(CdB,list):
+                ovlp = _det(CdB[0],inv=False)
+                if CdB[1] is not None:
+                    ovlp *= _det(CdB[1],inv=False)
+            else:
+                ovlp = xp.linalg.det(CdB)
+        else:
+            D,ovlp = compute_rdm1(walkers,trial,ovlp=True)
+            R = compute_trace(D)
+            R = 1./xp.sqrt(1.+self.eps_sq*R)
+            ovlp /= R
+        walkers.ovlp = ovlp
+
     def _parse_sampled_rotations(self,kixs):
         dmap = {(s,r):[] for s in (0,1) for r in (1,2)}
         umap = {(s,r):[] for s in (0,1) for r in (1,2)}
@@ -125,37 +325,18 @@ class SumOfRotationBase:
     @plum.dispatch
     def update_walkers(self,kixs,walkers:UHFWalkers):
         dmap,umap,wmap = self._parse_sampled_rotations(kixs)
-        nb = walkers.nbasis
         for r in (1,2):
-            walkers.phia = update_walkers(walkers.phia,dmap[0,r],umap[0,r],wmap[0,r])
+            walkers.phia = _update_walkers(walkers.phia.real,dmap[0,r],umap[0,r],wmap[0,r])
             if walkers.phib is not None:
-                walkers.phib = update_walkers(walkers.phib,dmap[1,r],umap[1,r],wmap[1,r])
-
-        ovlp_ratio = xp.ones(walkers.nwalkers)
-        for s,r in itertools.product((0,1),(1,2)):
-            walkers.D,ovlp_ratio = update_rdm1(walkers.D,ovlp_ratio,dmap[s,r],umap[s,r],wmap[s,r],s)
-        if self.eps_sq is not None:
-            Rold = walkers.R.copy()
-            walkers.R = compute_regularization(walkers.D,eps_sq=self.eps_sq)
-            ovlp_ratio *= Rold/walkers.R
-        return ovlp_ratio
+                walkers.phib = _update_walkers(walkers.phib.real,dmap[1,r],umap[1,r],wmap[1,r])
 
     @plum.dispatch
     def update_walkers(self,kixs,walkers:GHFWalkers):
         dmap,umap,wmap = self._parse_sampled_rotations(kixs)
         nb = walkers.nbasis
         for r in (1,2):
-            walkers.phi[:,:nb] = update_walkers(walkers.phi[:,:nb],dmap[0,r],umap[0,r],wmap[0,r])
-            walkers.phi[:,nb:] = update_walkers(walkers.phi[:,nb:],dmap[1,r],umap[1,r],wmap[1,r])
-
-        ovlp_ratio = xp.ones(walkers.nwalkers)
-        for s,r in itertools.product((0,1),(1,2)):
-            walkers.D,ovlp_ratio = update_rdm1(walkers.D,ovlp_ratio,dmap[s,r],umap[s,r],wmap[s,r],s)
-        if self.eps_sq is not None:
-            Rold = walkers.R.copy()
-            walkers.R = compute_regularization(walkers.D,eps_sq=self.eps_sq)
-            ovlp_ratio *= Rold/walkers.R
-        return ovlp_ratio
+            walkers.phi[:,:nb] = _update_walkers(walkers.phi[:,:nb].real,dmap[0,r],umap[0,r],wmap[0,r])
+            walkers.phi[:,nb:] = _update_walkers(walkers.phi[:,nb:].real,dmap[1,r],umap[1,r],wmap[1,r])
 
     @plum.dispatch
     def _update_walkers_slow(self,kixs,walkers:UHFWalkers):
@@ -173,21 +354,13 @@ class SumOfRotationBase:
                     phib[w] = xp.dot(U[1],phib[w])
         return phia,phib
 
-    @plum.dispatch
-    def _update_walkers_slow(self,kixs,walkers:GHFWalkers):
-        phi = walkers.phi.real.copy()
-        nb = walkers.nbasis
-        for w,kix in enumerate(kixs):
-            term = self.terms[kix]
-            U = term.get_rotation_matrix(self.chol_basis[term.chol_idx])
-            if U[0] is not None:
-                phi[w,:nb] = xp.dot(U[0],phi[w,:nb])
-            if U[1] is not None:
-                phi[w,nb:] = xp.dot(U[1],phi[w,nb:])
-        return phi
+    def local_energy(self,walkers,trial):
+        D = compute_rdm1(walkers,trial)
+        R = None 
+        if self.eps_sq is not None:
+            R = compute_trace(D)
+            R = 1./xp.sqrt(1.+self.eps_sq*R)
 
-    def local_energy(self,walkers):
-        D = walkers.D 
         if isinstance(D,list):
             Daa,Dbb = D
             Dab = Dba = None
@@ -197,10 +370,7 @@ class SumOfRotationBase:
 
         E1 = xp.einsum('ij,wij->w',self.h1e,Daa+Dbb)
         E2 = self.compute_E2(Daa,Dbb,Dab=Dab,Dba=Dba)
-        return E1+E2,E1,E2
-
-    def compute_rdm1(self,walkers,trial):
-        compute_rdm1(walkers,trial,eps_sq=self.eps_sq)
+        return E1+E2,E1,E2,R
 
     def _get_MB_gf(self,basis):
         H = 0

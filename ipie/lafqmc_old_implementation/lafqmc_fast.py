@@ -30,6 +30,7 @@ from typing import Dict, Optional, Tuple
 from ipie.config import config
 from ipie.estimators.estimator_base import EstimatorBase
 from ipie.estimators.handler_custom import EstimatorHandler
+from ipie.hamiltonians.sor_base import save_walkers
 from ipie.qmc.options import QMCParams
 from ipie.utils.backend import arraylib as xp
 from ipie.utils.backend import to_host
@@ -38,12 +39,20 @@ from ipie.utils.mpi import MPIHandler
 from ipie.walkers.base_walkers import WalkerAccumulator
 from ipie.walkers.pop_controller_custom import PopController
 from ipie.qmc.afqmc import AFQMCBase
-from ipie.walkers.walkers_utils import (
-        preprocess_walkers,
-        preprocess_trial,
-        save_walkers,
-)
 
+#def update_weight(walkers,b,constraint_path=True,thresh=1e-15):
+#    minus_idx = xp.nonzero(b<-thresh)
+#    minus_val = -1
+#    b_abs = xp.fabs(b)
+#    zero_idx = xp.nonzero(b_abs<thresh)
+#    if constraint_path:
+#        b[minus_idx] = thresh
+#        minus_val = 0
+#    walkers.weight += xp.log(b_abs)
+#    # use .sgn_ovlp to store signs for now
+#    # doesn't seemed to be used for anything else
+#    walkers.sgn_ovlp[minus_idx] *= minus_val 
+#    walkers.sgn_ovlp[zero_idx] = 0
 
 def propagate_walkers(walkers, hamiltonian, trial, constraint_path=True):
     # 1.compute gf
@@ -58,13 +67,16 @@ def propagate_walkers(walkers, hamiltonian, trial, constraint_path=True):
 
     # 3.update walker
     #start_time = time.time()
-    ovlp_ratio = hamiltonian.update_walkers(to_host(kixs),walkers)
+    ovlp_old = walkers.ovlp
+    hamiltonian.update_walkers(to_host(kixs),walkers)
+    hamiltonian.compute_guiding_fxn(walkers,trial)
     synchronize()
     #self.timer.tgemm += time.time() - start_time
 
     # 4.update weight
     #start_time = time.time()
-    b = sign*ovlp_ratio
+    b = sign*walkers.ovlp/ovlp_old
+    #print(b)
     if constraint_path:
         xp.clip(b, a_min=0.0, a_max=None, out=b)  # in-place clipping (cosine projection)
     walkers.weight *= b 
@@ -404,23 +416,6 @@ class LAFQMC(AFQMCBase):
         self.setup_timers()
         eshift = 0.0
         self.walkers.orthogonalise()
-        preprocess_walkers(self.walkers)
-        preprocess_trial(self.trial)
-        self.hamiltonian.compute_rdm1(self.walkers,self.trial)
-
-        # TODO: This magic value of 2 is pretty much never controlled on input.
-        # Moreover I'm not convinced having a two stage shift update actually
-        # matters at all.
-        # num_eqlb_steps = 2.0 / self.params.timestep
-        num_eqlb_steps = self.params.num_eq_blocks * self.params.eq_num_steps_per_block
-        total_steps = self.params.num_steps_per_block * self.params.num_blocks + num_eqlb_steps
-        if self.mpi_handler.comm.rank==0:
-            print('num_eqlb_steps=',num_eqlb_steps)
-            print('num_eq_stblz=',self.params.num_eq_stblz)
-            print('num_stblz=',self.params.num_stblz)
-            #print('discard_weights_aftereq=',discard_weights_aftereq)
-            print('eq_pop_control_freq=',self.params.eq_pop_control_freq)
-            print('pop_control_freq=',self.params.pop_control_freq)
 
         self.pcontrol_eq = PopController(
             self.params.num_walkers,
@@ -446,10 +441,25 @@ class LAFQMC(AFQMCBase):
         self.copy_to_gpu()
         self.setup_estimators(estimator_filename, additional_estimators=additional_estimators)
 
+        # TODO: This magic value of 2 is pretty much never controlled on input.
+        # Moreover I'm not convinced having a two stage shift update actually
+        # matters at all.
+        # num_eqlb_steps = 2.0 / self.params.timestep
+        num_eqlb_steps = self.params.num_eq_blocks * self.params.eq_num_steps_per_block
+
+        total_steps = self.params.num_steps_per_block * self.params.num_blocks + num_eqlb_steps
+
         synchronize()
         comm = self.mpi_handler.comm
         self.tsetup += time.time() - tzero_setup
 
+        if comm.rank==0:
+            print('num_eqlb_steps=',num_eqlb_steps)
+            print('num_eq_stblz=',self.params.num_eq_stblz)
+            print('num_stblz=',self.params.num_stblz)
+            print('discard_weights_aftereq=',discard_weights_aftereq)
+            print('eq_pop_control_freq=',self.params.eq_pop_control_freq)
+            print('pop_control_freq=',self.params.pop_control_freq)
         t0 = time.time()
         for step in range(1, total_steps + 1):
             synchronize()
@@ -478,9 +488,9 @@ class LAFQMC(AFQMCBase):
                 #self.tprop_vhs = self.eq_propagator.timer.tvhs
                 #self.tprop_gemm = self.eq_propagator.timer.tgemm
             else:
-                #if discard_weights_aftereq:
-                #    if step == num_eqlb_steps + 1:
-                #        self.walkers.weight.fill(1.0)
+                if discard_weights_aftereq:
+                    if step == num_eqlb_steps + 1:
+                        self.walkers.weight.fill(1.0)
                 propagate_walkers(
                     self.walkers, self.hamiltonian, self.trial, constraint_path=constraint_path 
                 )
@@ -519,7 +529,6 @@ class LAFQMC(AFQMCBase):
                     start = time.time()
                     log_average_weight = self.pcontrol_eq.pop_control(self.walkers, comm)
                     self.post_pop_ctr(comm,log_average_weight)
-                    self.hamiltonian.compute_rdm1(self.walkers,self.trial)
                     synchronize()
                     self.tpopc += time.time() - start
                     self.tpopc_send = self.pcontrol_eq.timer.send_time
@@ -531,7 +540,6 @@ class LAFQMC(AFQMCBase):
                     start = time.time()
                     log_average_weight = self.pcontrol.pop_control(self.walkers, comm)
                     self.post_pop_ctr(comm,log_average_weight)
-                    self.hamiltonian.compute_rdm1(self.walkers,self.trial)
                     synchronize()
                     self.tpopc += time.time() - start
                     self.tpopc_send = self.pcontrol.timer.send_time

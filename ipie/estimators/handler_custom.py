@@ -91,26 +91,26 @@ class EstimatorHandler(EstimatorHandler_):
         if verbose:
             print("# Finished settting up estimator object.")
 
-        self.average_weights = []
+        self.log_average_weights = []
     def load(self,dirname,rank):
         if rank>0:
             return
-        self.average_weights = list(numpy.load(f'{dirname}/average_weights.npy'))
+        self.log_average_weights = list(numpy.load(f'{dirname}/log_average_weights.npy'))
         for k,e in self.items():
             e.load_sr_data(dirname,rank)
     def save(self,dirname='.'):
         if dirname is None:
             return
-        numpy.save(f'{dirname}/average_weights.npy',to_host(xp.asarray(self.average_weights)))
+        numpy.save(f'{dirname}/log_average_weights.npy',to_host(xp.asarray(self.log_average_weights)))
         for k,e in self.items():
             e.save_sr_data(dirname=dirname)
-    def post_sr(self,comm,walker_factors,average_weight,dirname='.'):
+    def post_sr(self,comm,walker_factors,log_average_weight,dirname='.'):
         self.local_estimates[: walker_factors.size] = walker_factors.buffer
         comm.Reduce(self.local_estimates, self.global_estimates, op=MPI.SUM)
         if comm.rank > 0:
             self.zero()
             return
-        self.average_weights.append(average_weight)
+        self.log_average_weights.append(log_average_weight)
         # Get walker data.
         offset = walker_factors.size
         #walker_factors.post_reduce_hook(self.global_estimates[:offset], 0)
@@ -121,10 +121,10 @@ class EstimatorHandler(EstimatorHandler_):
             e.process_sr_data(est_data,dirname)
         self.zero()
     def compute_weights(self,max_nprod,max_nsum,ntot=None):
-        average_weights = self.average_weights if ntot is None else \
-                          self.average_weights[:ntot]
-        average_weights = xp.asarray(average_weights)
-        ntot = average_weights.size
+        log_average_weights = self.log_average_weights if ntot is None else \
+                              self.log_average_weights[:ntot]
+        log_average_weights = xp.asarray(log_average_weights)
+        ntot = log_average_weights.size
         nprod = min(max_nprod,ntot)
         nsum = min(ntot-nprod+1,max_nsum)
         shift = ntot - nsum 
@@ -133,9 +133,9 @@ class EstimatorHandler(EstimatorHandler_):
         for i in range(nsum):
             stop = i+shift+1
             start = stop-nprod
-            weight[i] = average_weights[start:stop].prod()
+            weight[i] = log_average_weights[start:stop].sum()
         max_weight = xp.amax(xp.fabs(weight))
-        return weight/max_weight,shift,max_weight
+        return xp.exp(weight-max_weight),shift,max_weight
     def print_block_sr(self,comm,block,walker_factors,max_nprod,max_nsum,ntot=None):
         if comm.rank>0:
             return
