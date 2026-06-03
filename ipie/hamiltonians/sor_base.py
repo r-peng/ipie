@@ -1,21 +1,10 @@
 import numpy as np
-import scipy,itertools,plum,h5py
+import scipy,itertools
 from ipie.hamiltonians.bitstring_utils import (
         get_all_configs_u11,
         string_act,
         count_double_occupancy, 
 )
-from ipie.walkers.walkers_utils import (
-        compute_rdm1,
-        update_walkers,
-        compute_regularization,
-        update_rdm1,
-)
-from ipie.walkers.uhf_walkers import UHFWalkers
-from ipie.walkers.ghf_walkers import GHFWalkers
-from ipie.trial_wavefunction.single_det import SingleDet 
-from ipie.trial_wavefunction.single_det_ghf import SingleDetGHF
-from ipie.utils.backend import to_host
 from ipie.utils.backend import arraylib as xp
 
 class Rotation:
@@ -60,12 +49,11 @@ class Rotation:
 
 class SumOfRotationBase:
 
-    def __init__(self,eps_sq=None):
-        self.eps_sq = eps_sq
+    def __init__(self):
         self.chol_basis = []
         self.terms = [] 
         self.bare_gf = []
-        self.Lambda = 0 
+        self.Lambda = 0. 
 
     def decompose_h1(self,at,thresh=1e-6,iprint=0):
         self.nbasis = self.h1e.shape[0]
@@ -97,7 +85,7 @@ class SumOfRotationBase:
         if iprint>0:
             print('normalization=',xp.fabs(self.bare_gf).sum())
 
-    def _parse_sampled_rotations(self,kixs):
+    def parse_sampled_rotations(self,kixs):
         dmap = {(s,r):[] for s in (0,1) for r in (1,2)}
         umap = {(s,r):[] for s in (0,1) for r in (1,2)}
         wmap = {(s,r):[] for s in (0,1) for r in (1,2)}
@@ -122,69 +110,12 @@ class SumOfRotationBase:
             wmap[s,r] = xp.asarray(wmap[s,r])
         return dmap,umap,wmap
 
-    @plum.dispatch
-    def update_walkers(self,kixs,walkers:UHFWalkers):
-        dmap,umap,wmap = self._parse_sampled_rotations(kixs)
-        nb = walkers.nbasis
-        for r in (1,2):
-            walkers.phia = update_walkers(walkers.phia,dmap[0,r],umap[0,r],wmap[0,r])
-            if walkers.phib is not None:
-                walkers.phib = update_walkers(walkers.phib,dmap[1,r],umap[1,r],wmap[1,r])
-
-        ovlp_ratio = xp.ones(walkers.nwalkers)
-        for s,r in itertools.product((0,1),(1,2)):
-            walkers.D,ovlp_ratio = update_rdm1(walkers.D,ovlp_ratio,dmap[s,r],umap[s,r],wmap[s,r],s)
-        if self.eps_sq is not None:
-            Rold = walkers.R.copy()
-            walkers.R = compute_regularization(walkers.D,eps_sq=self.eps_sq)
-            ovlp_ratio *= Rold/walkers.R
-        return ovlp_ratio
-
-    @plum.dispatch
-    def update_walkers(self,kixs,walkers:GHFWalkers):
-        dmap,umap,wmap = self._parse_sampled_rotations(kixs)
-        nb = walkers.nbasis
-        for r in (1,2):
-            walkers.phi[:,:nb] = update_walkers(walkers.phi[:,:nb],dmap[0,r],umap[0,r],wmap[0,r])
-            walkers.phi[:,nb:] = update_walkers(walkers.phi[:,nb:],dmap[1,r],umap[1,r],wmap[1,r])
-
-        ovlp_ratio = xp.ones(walkers.nwalkers)
-        for s,r in itertools.product((0,1),(1,2)):
-            walkers.D,ovlp_ratio = update_rdm1(walkers.D,ovlp_ratio,dmap[s,r],umap[s,r],wmap[s,r],s)
-        if self.eps_sq is not None:
-            Rold = walkers.R.copy()
-            walkers.R = compute_regularization(walkers.D,eps_sq=self.eps_sq)
-            ovlp_ratio *= Rold/walkers.R
-        return ovlp_ratio
-
-    @plum.dispatch
-    def _update_walkers_slow(self,kixs,walkers:UHFWalkers):
-        phia = walkers.phia.real.copy()
-        phib = None
-        if walkers.phib is not None:
-            phib = walkers.phib.real.copy()
+    def parse_sampled_rotations_slow(self,kixs):
+        Us = [None] * len(kixs)
         for w,kix in enumerate(kixs):
             term = self.terms[kix]
-            U = term.get_rotation_matrix(self.chol_basis[term.chol_idx])
-            if U[0] is not None:
-                phia[w] = xp.dot(U[0],phia[w])
-            if phib is not None:
-                if U[1] is not None:
-                    phib[w] = xp.dot(U[1],phib[w])
-        return phia,phib
-
-    @plum.dispatch
-    def _update_walkers_slow(self,kixs,walkers:GHFWalkers):
-        phi = walkers.phi.real.copy()
-        nb = walkers.nbasis
-        for w,kix in enumerate(kixs):
-            term = self.terms[kix]
-            U = term.get_rotation_matrix(self.chol_basis[term.chol_idx])
-            if U[0] is not None:
-                phi[w,:nb] = xp.dot(U[0],phi[w,:nb])
-            if U[1] is not None:
-                phi[w,nb:] = xp.dot(U[1],phi[w,nb:])
-        return phi
+            Us[w] = term.get_rotation_matrix(self.chol_basis[term.chol_idx])
+        return Us
 
     def local_energy(self,walkers):
         D = walkers.D 
@@ -198,9 +129,6 @@ class SumOfRotationBase:
         E1 = xp.einsum('ij,wij->w',self.h1e,Daa+Dbb)
         E2 = self.compute_E2(Daa,Dbb,Dab=Dab,Dba=Dba)
         return E1+E2,E1,E2
-
-    def compute_rdm1(self,walkers,trial):
-        compute_rdm1(walkers,trial,eps_sq=self.eps_sq)
 
     def _get_MB_gf(self,basis):
         H = 0
@@ -221,8 +149,8 @@ class SumOfRotationBase:
 
 class HubbardSOR(SumOfRotationBase):
 
-    def __init__(self,h1e,U,eps_sq=None):
-        super().__init__(eps_sq=eps_sq)
+    def __init__(self,h1e,U):
+        super().__init__()
         self.h1e = xp.asarray(h1e)
         self.U = U
         self.v0 = -0.5*U*xp.eye(self.h1e.shape[0]) 
@@ -251,8 +179,8 @@ class HubbardSOR(SumOfRotationBase):
 
 class QCSOR(SumOfRotationBase):
 
-    def __init__(self,h1e,chol,eps_sq=None):
-        super().__init__(eps_sq=eps_sq)
+    def __init__(self,h1e,chol):
+        super().__init__()
         self.h1e = xp.asarray(h1e)
         self.chol = xp.asarray(chol)
         self.v0 = .5*xp.einsum('npr,nrs->ps',self.chol,self.chol) 

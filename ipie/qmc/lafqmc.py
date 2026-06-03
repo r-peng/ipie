@@ -25,7 +25,7 @@ import time
 import uuid
 import math
 from typing import Dict, Optional, Tuple
-
+from functools import partial
 
 from ipie.config import config
 from ipie.estimators.estimator_base import EstimatorBase
@@ -42,35 +42,10 @@ from ipie.walkers.walkers_utils import (
         preprocess_walkers,
         preprocess_trial,
         save_walkers,
+        update_walkers,
+        update_rdm1_and_ovlp,
+        compute_rdm1,
 )
-
-
-def propagate_walkers(walkers, hamiltonian, trial, constraint_path=True):
-    # 1.compute gf
-    gf = hamiltonian.bare_gf
-
-    # 2.sample from gf
-    sign = xp.sign(gf)
-    p = xp.fabs(gf)
-    p /= p.sum()
-    kixs = xp.random.choice(gf.size,size=walkers.nwalkers,replace=True,p=p)
-    sign = sign[kixs] 
-
-    # 3.update walker
-    #start_time = time.time()
-    ovlp_ratio = hamiltonian.update_walkers(to_host(kixs),walkers)
-    synchronize()
-    #self.timer.tgemm += time.time() - start_time
-
-    # 4.update weight
-    #start_time = time.time()
-    b = sign*ovlp_ratio
-    if constraint_path:
-        xp.clip(b, a_min=0.0, a_max=None, out=b)  # in-place clipping (cosine projection)
-    walkers.weight *= b 
-    synchronize()
-    #self.timer.tupdate += time.time() - start_time
-
     
 class LAFQMC(AFQMCBase):
     """AFQMC driver for zero temperature open ended random walk.
@@ -102,21 +77,17 @@ class LAFQMC(AFQMCBase):
     @staticmethod
     # TODO: wavefunction type, trial type, hamiltonian type
     def build(
-        num_elec: Tuple[int, int],
         hamiltonian,
         trial_wavefunction,
-        walkers=None,
-        num_walkers: int = 100,
+        walkers,
         seed: Optional[int] = None,
         num_steps_per_block: int = 25,
         num_blocks: int = 100,
-        timestep: float = 0.005,
         stabilize_freq=5,
         eq_stabilize_freq=2,
         pop_control_method="stochastic_reconfiguration",
         pop_control_freq=5,
         eq_pop_control_freq=2,
-        eq_timestep=None,
         eq_num_steps_per_block=None,
         num_eq_blocks: int = 0,
         ene_bound_const: float = 2.0,
@@ -184,19 +155,20 @@ class LAFQMC(AFQMCBase):
             comm = mpi_handler.comm
         else:
             comm = mpi_handler.comm
+        num_walkers = walkers.nwalkers
         params = QMCParams(
             num_walkers=num_walkers,
             total_num_walkers=num_walkers * comm.size,
             num_blocks=num_blocks,
             num_steps_per_block=num_steps_per_block,
-            timestep=timestep,
+            timestep=None,
             num_stblz=stabilize_freq,
             pop_control_method=pop_control_method,
             num_eq_stblz=eq_stabilize_freq,
             pop_control_freq=pop_control_freq,
             eq_pop_control_freq=eq_pop_control_freq,
             rng_seed=seed,
-            eq_timestep=eq_timestep,
+            eq_timestep=None,
             eq_num_steps_per_block=eq_num_steps_per_block,
             num_eq_blocks=num_eq_blocks,
             fb_bound=fb_bound,
@@ -215,89 +187,6 @@ class LAFQMC(AFQMCBase):
             params,
             None,
             verbose=(verbose and comm.rank == 0),
-        )
-
-    @staticmethod
-    # TODO: wavefunction type, trial type, hamiltonian type
-    def build_from_hdf5(
-        num_elec: Tuple[int, int],
-        ham_file,
-        wfn_file,
-        num_walkers: int = 100,
-        seed: Optional[int] = None,
-        num_steps_per_block: int = 25,
-        num_blocks: int = 100,
-        timestep: float = 0.005,
-        stabilize_freq=5,
-        pop_control_freq=5,
-        num_dets_chunk=1,
-        num_dets_for_trial_props=100,
-        pack_cholesky=True,
-        verbose=True,
-    ) -> "AFQMC":
-        """Factory method to build AFQMC driver from hamiltonian and trial wavefunction.
-
-        Parameters
-        ----------
-        num_elec: tuple(int, int)
-            Number of alpha and beta electrons.
-        ham_file : str
-            Path to Hamiltonian describing the system.
-        wfn_file : str
-            Path to Trial wavefunction
-        num_walkers : int
-            Number of walkers per MPI process used in the simulation. The TOTAL
-                number of walkers is num_walkers * number of processes.
-        num_steps_per_block : int
-            Number of Monte Carlo steps before estimators are evaluatied.
-                Default 25.
-        num_blocks : int
-            Number of blocks to perform. Total number of steps = num_blocks *
-                num_steps_per_block.
-        timestep : float
-            Imaginary timestep. Default 0.005.
-        stabilize_freq : float
-            Frequency at which to perform QR factorization of walkers (in units
-                of steps.) Default 25.
-        pop_control_freq : int
-            Frequency at which to perform population control (in units of
-                steps.) Default 25.
-        num_det_chunks : int
-            Size of chunks of determinants to process during batching. Default=1 (no batching).
-        num_dets_for_trial_props: int
-            Number of determinants to use to evaluate trial wavefunction properties.
-        pack_cholesky : bool
-            Use symmetry to reduce memory consumption of integrals. Default True.
-        verbose : bool
-            Log verbosity. Default True i.e. print information to stdout.
-        """
-        mpi_handler = MPIHandler()
-        _verbose = verbose and mpi_handler.comm.rank == 0
-        ham = get_hamiltonian(
-            ham_file, mpi_handler.scomm, verbose=_verbose, pack_chol=pack_cholesky
-        )
-        trial = get_trial_wavefunction(
-            num_elec,
-            ham.nbasis,
-            wfn_file,
-            ndet_chunks=num_dets_chunk,
-            ndets_props=num_dets_for_trial_props,
-            verbose=_verbose,
-        )
-        trial.half_rotate(ham, mpi_handler.scomm)
-        return LAFQMC.build(
-            trial.nelec,
-            ham,
-            trial,
-            num_walkers=num_walkers,
-            seed=seed,
-            num_steps_per_block=num_steps_per_block,
-            num_blocks=num_blocks,
-            timestep=timestep,
-            stabilize_freq=stabilize_freq,
-            pop_control_freq=pop_control_freq,
-            verbose=verbose,
-            mpi_handler=mpi_handler,
         )
 
     def copy_to_gpu(self):
@@ -347,33 +236,6 @@ class LAFQMC(AFQMCBase):
         self.estimators.print_block(comm, 0, self.accumulators)
         self.accumulators.zero()
 
-    def post_pop_ctr(self,comm,log_average_weight):
-        if self.params.pop_control_method!='stochastic_reconfiguration':
-            return
-        self.estimators.compute_estimators(
-            self.system, self.hamiltonian, self.trial, self.walkers
-        )
-        self.estimators.post_sr(comm,self.accumulators,log_average_weight)
-
-    def estimate_energy(self,comm,block,max_nprod,max_nsum):
-        if self.params.pop_control_method=='stochastic_reconfiguration':
-            self.estimators.print_block_sr(comm,block,self.accumulators,max_nprod,max_nsum)
-        else:
-            self.estimators.compute_estimators(
-                self.system, self.hamiltonian, self.trial, self.walkers
-            )
-            self.estimators.print_block(comm, block, self.accumulators)
-
-    def save(self,comm,dirname='.'):
-        if dirname is None:
-            return
-        save_walkers(self.walkers,comm,dirname)
-        if self.params.pop_control_method!='stochastic_reconfiguration':
-            return
-        if comm.rank>0:
-            return
-        self.estimators.save(dirname)
-
     def run(
         self,
         walkers=None,
@@ -382,6 +244,8 @@ class LAFQMC(AFQMCBase):
         discard_weights_aftereq=False,
         additional_estimators: Optional[Dict[str, EstimatorBase]] = None,
         constraint_path=True,
+        eps_sq=None,
+        num_update_per_block=1,
         max_nprod=20,
         max_nsum=500,
         dirname='.',
@@ -397,6 +261,22 @@ class LAFQMC(AFQMCBase):
         additional_estimators : dict
             Dictionary of additional estimators to evaluate.
         """
+        # parsing propagation parameters.
+        num_eqlb_steps = self.params.num_eq_blocks * self.params.eq_num_steps_per_block
+        total_steps = self.params.num_steps_per_block * self.params.num_blocks + num_eqlb_steps
+        self.num_update_per_block = num_update_per_block
+        self.eps_sq = eps_sq
+        if self.num_update_per_block==1:
+            self.scalar_ovlp = False
+        else:
+            self.scalar_ovlp = True 
+        if self.mpi_handler.comm.rank==0:
+            print('num_eqlb_steps=',num_eqlb_steps)
+            print('num_eq_stblz=',self.params.num_eq_stblz)
+            print('num_stblz=',self.params.num_stblz)
+            print('eq_pop_control_freq=',self.params.eq_pop_control_freq)
+            print('pop_control_freq=',self.params.pop_control_freq)
+
         self.setup_timers()
         tzero_setup = time.time()
         if walkers is not None:
@@ -406,21 +286,7 @@ class LAFQMC(AFQMCBase):
         self.walkers.orthogonalise()
         preprocess_walkers(self.walkers)
         preprocess_trial(self.trial)
-        self.hamiltonian.compute_rdm1(self.walkers,self.trial)
-
-        # TODO: This magic value of 2 is pretty much never controlled on input.
-        # Moreover I'm not convinced having a two stage shift update actually
-        # matters at all.
-        # num_eqlb_steps = 2.0 / self.params.timestep
-        num_eqlb_steps = self.params.num_eq_blocks * self.params.eq_num_steps_per_block
-        total_steps = self.params.num_steps_per_block * self.params.num_blocks + num_eqlb_steps
-        if self.mpi_handler.comm.rank==0:
-            print('num_eqlb_steps=',num_eqlb_steps)
-            print('num_eq_stblz=',self.params.num_eq_stblz)
-            print('num_stblz=',self.params.num_stblz)
-            #print('discard_weights_aftereq=',discard_weights_aftereq)
-            print('eq_pop_control_freq=',self.params.eq_pop_control_freq)
-            print('pop_control_freq=',self.params.pop_control_freq)
+        compute_rdm1(self.walkers,self.trial,scalar_ovlp=self.scalar_ovlp,eps_sq=self.eps_sq)
 
         self.pcontrol_eq = PopController(
             self.params.num_walkers,
@@ -468,9 +334,7 @@ class LAFQMC(AFQMCBase):
                     self.tortho += time.time() - start
             start = time.time()
             if step <= num_eqlb_steps:
-                propagate_walkers(
-                    self.walkers, self.hamiltonian, self.trial, constraint_path=constraint_path 
-                )
+                self.propagate_walkers(constraint_path=constraint_path)
                 #self.tprop_fbias = self.eq_propagator.timer.tfbias
                 #self.tprop_ovlp = self.eq_propagator.timer.tovlp
                 #self.tprop_update = self.eq_propagator.timer.tupdate
@@ -481,9 +345,7 @@ class LAFQMC(AFQMCBase):
                 #if discard_weights_aftereq:
                 #    if step == num_eqlb_steps + 1:
                 #        self.walkers.weight.fill(1.0)
-                propagate_walkers(
-                    self.walkers, self.hamiltonian, self.trial, constraint_path=constraint_path 
-                )
+                self.propagate_walkers(constraint_path=constraint_path)
                 #self.tprop_fbias = self.propagator.timer.tfbias
                 #self.tprop_ovlp = self.propagator.timer.tovlp
                 #self.tprop_update = self.propagator.timer.tupdate
@@ -519,7 +381,6 @@ class LAFQMC(AFQMCBase):
                     start = time.time()
                     log_average_weight = self.pcontrol_eq.pop_control(self.walkers, comm)
                     self.post_pop_ctr(comm,log_average_weight)
-                    self.hamiltonian.compute_rdm1(self.walkers,self.trial)
                     synchronize()
                     self.tpopc += time.time() - start
                     self.tpopc_send = self.pcontrol_eq.timer.send_time
@@ -531,7 +392,6 @@ class LAFQMC(AFQMCBase):
                     start = time.time()
                     log_average_weight = self.pcontrol.pop_control(self.walkers, comm)
                     self.post_pop_ctr(comm,log_average_weight)
-                    self.hamiltonian.compute_rdm1(self.walkers,self.trial)
                     synchronize()
                     self.tpopc += time.time() - start
                     self.tpopc_send = self.pcontrol.timer.send_time
@@ -590,3 +450,63 @@ class LAFQMC(AFQMCBase):
             #    eshift += self.accumulators.eshift - eshift
             #synchronize()
             #self.tstep += time.time() - start_step
+
+    def propagate_walkers(self, constraint_path=True):
+        b = xp.ones(self.walkers.nwalkers)
+        # 1.compute gf
+        gf = self.hamiltonian.bare_gf
+        nw = self.walkers.nwalkers
+        # 2.sample from gf
+        sign = xp.sign(gf)
+        p = xp.fabs(gf)
+        p /= p.sum()
+        for _ in range(self.num_update_per_block): 
+            kixs = xp.random.choice(p.size,size=nw,replace=True,p=p)
+            b *= sign[kixs] 
+    
+            # 3.update walker
+            dmap,umap,wmap = self.hamiltonian.parse_sampled_rotations(to_host(kixs))
+            update_walkers(self.walkers,dmap,umap,wmap)
+            if not self.scalar_ovlp:
+                b = update_rdm1_and_ovlp(self.walkers,b,dmap,umap,wmap,eps_sq=self.eps_sq)
+        synchronize()
+    
+        # 4.update weight
+        if self.scalar_ovlp:
+            b /= self.walkers.psi_g
+            compute_rdm1(self.walkers,self.trial,scalar_ovlp=self.scalar_ovlp,eps_sq=self.eps_sq)
+            b *= self.walkers.psi_g
+        if constraint_path:
+            xp.clip(b, a_min=0.0, a_max=None, out=b)  # in-place clipping (cosine projection)
+        self.walkers.weight *= b 
+        synchronize()
+
+    def post_pop_ctr(self,comm,log_average_weight):
+        if self.params.pop_control_method!='stochastic_reconfiguration':
+            return
+        compute_rdm1(self.walkers,self.trial,scalar_ovlp=False,eps_sq=self.eps_sq)
+        self.estimators.compute_estimators(
+            self.system, self.hamiltonian, self.trial, self.walkers
+        )
+        self.estimators.post_sr(comm,self.accumulators,log_average_weight)
+
+    def estimate_energy(self,comm,block,max_nprod,max_nsum):
+        if self.params.pop_control_method=='stochastic_reconfiguration':
+            self.estimators.print_block_sr(comm,block,self.accumulators,max_nprod,max_nsum)
+        else:
+            compute_rdm1(self.walkers,self.trial,scalar_ovlp=False,eps_sq=self.eps_sq)
+            self.estimators.compute_estimators(
+                self.system, self.hamiltonian, self.trial, self.walkers
+            )
+            self.estimators.print_block(comm, block, self.accumulators)
+
+    def save(self,comm,dirname='.'):
+        if dirname is None:
+            return
+        save_walkers(self.walkers,comm,dirname)
+        if self.params.pop_control_method!='stochastic_reconfiguration':
+            return
+        if comm.rank>0:
+            return
+        self.estimators.save(dirname)
+
