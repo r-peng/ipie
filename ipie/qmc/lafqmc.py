@@ -245,7 +245,7 @@ class LAFQMC(AFQMCBase):
         additional_estimators: Optional[Dict[str, EstimatorBase]] = None,
         constraint_path=True,
         eps_sq=None,
-        num_update_per_block=1,
+        num_updates_per_step=1,
         max_nprod=20,
         max_nsum=500,
         dirname='.',
@@ -264,9 +264,9 @@ class LAFQMC(AFQMCBase):
         # parsing propagation parameters.
         num_eqlb_steps = self.params.num_eq_blocks * self.params.eq_num_steps_per_block
         total_steps = self.params.num_steps_per_block * self.params.num_blocks + num_eqlb_steps
-        self.num_update_per_block = num_update_per_block
         self.eps_sq = eps_sq
-        if self.num_update_per_block==1:
+        self.num_updates_per_step = num_updates_per_step
+        if self.num_updates_per_step==1:
             self.scalar_ovlp = False
         else:
             self.scalar_ovlp = True 
@@ -405,14 +405,6 @@ class LAFQMC(AFQMCBase):
             synchronize()
             self.testim += time.time() - start  # we dump this time into estimator
 
-            # post poppulation control accumulation
-            #if step <= num_eqlb_steps:
-            #    if step % self.params.eq_pop_control_freq == 0:
-            #        self.post_pop_ctr(comm,log_average_weight)
-            #else:
-            #    if step % self.params.pop_control_freq == 0:
-            #        self.post_pop_ctr(comm,log_average_weight)
-
             # calculate estimators
             start = time.time()
             if step > num_eqlb_steps:
@@ -460,7 +452,7 @@ class LAFQMC(AFQMCBase):
         sign = xp.sign(gf)
         p = xp.fabs(gf)
         p /= p.sum()
-        for _ in range(self.num_update_per_block): 
+        for _ in range(self.num_updates_per_step): 
             kixs = xp.random.choice(p.size,size=nw,replace=True,p=p)
             b *= sign[kixs] 
     
@@ -473,11 +465,19 @@ class LAFQMC(AFQMCBase):
     
         # 4.update weight
         if self.scalar_ovlp:
-            b /= self.walkers.psi_g
+            b /= self.walkers.ovlp
+            if self.eps_sq is not None:
+                b *= self.walkers.R
             compute_rdm1(self.walkers,self.trial,scalar_ovlp=self.scalar_ovlp,eps_sq=self.eps_sq)
-            b *= self.walkers.psi_g
+            b *= self.walkers.ovlp
+            if self.eps_sq is not None:
+                b /= self.walkers.R
+
+        nminus = len(b[b<0])
+        if nminus>0: 
+            print('number of minus=',nminus)
         if constraint_path:
-            xp.clip(b, a_min=0.0, a_max=None, out=b)  # in-place clipping (cosine projection)
+            xp.clip(b, a_min=0.0, a_max=None, out=b)  
         self.walkers.weight *= b 
         synchronize()
 

@@ -9,7 +9,7 @@ from ipie.utils.backend import arraylib as xp
 
 class Rotation:
 
-    def __init__(self,chol_idx,pa=None,ga=None,pb=None,gb=None):
+    def __init__(self,chol_idx,pa=None,ga=None,pb=None,gb=None,thresh=1e-6):
         self.chol_idx = chol_idx
         self.p = [None,None]
         self.g = [None,None]
@@ -19,11 +19,13 @@ class Rotation:
             self.p[0] = xp.asarray(pa,dtype=int)
             self.g[0] = xp.asarray(ga)
             self.d[0] = xp.exp(self.g[0])-1.
+            assert xp.fabs(self.d[0])>thresh
             self.r[0] = len(pa)
         if pb is not None:
             self.p[1] = xp.asarray(pb,dtype=int)
             self.g[1] = xp.asarray(gb)
             self.d[1] = xp.exp(self.g[1])-1.
+            assert xp.fabs(self.d[1])>thresh
             self.r[1] = len(pb)
 
     def get_MB_kappa(self,v,basis):
@@ -66,7 +68,7 @@ class SumOfRotationBase:
             print('at=',at)
             print('bands=',ek)
         assert at>xp.amax(xp.fabs(ek))
-        nonzero_bands = xp.nonzero(ek)[0]
+        nonzero_bands = xp.nonzero(xp.fabs(ek)>thresh)[0]
         eta = xp.log(1.-ek/at)
 
         self.bare_gf += [at] * (2*nonzero_bands.size)
@@ -161,7 +163,7 @@ class HubbardSOR(SumOfRotationBase):
 
         ai = self.U/(np.cosh(gu)-1)/4
         if iprint>0:
-            print('ai=',ai)
+            print(f'eta={gu},ai={ai}')
         self.bare_gf += [ai] * (2*self.nbasis)
         self.Lambda += 2*ai*self.nbasis
         if nelec is not None:
@@ -197,7 +199,7 @@ class QCSOR(SumOfRotationBase):
             if iprint>0:
                 print(f'chol={i},bands={ek}')
             assert ai>xp.amax(xp.fabs(ek))
-            nonzero_bands = xp.nonzero(ek)[0]
+            nonzero_bands = xp.nonzero(xp.fabs(ek)>thresh)[0]
             self.Lambda += (ai*2*nonzero_bands.size)**2/2.
             eta_plus = xp.log(1.+ek/ai) 
             eta_minus = xp.log(1.-ek/ai) 

@@ -128,12 +128,13 @@ class EstimatorHandler(EstimatorHandler_):
         nprod = min(max_nprod,ntot)
         nsum = min(ntot-nprod+1,max_nsum)
         shift = ntot - nsum 
+        #print(f'ntot={ntot},nprod={nprod},nsum={nsum},shift={shift}')
         weight = xp.zeros(nsum)
         for i in range(nsum):
             stop = i+shift+1
             start = stop-nprod
             weight[i] = log_average_weights[start:stop].sum()
-        max_weight = xp.amax(xp.fabs(weight))
+        max_weight = xp.amax(weight)
         return xp.exp(weight-max_weight),shift,max_weight
     def print_block_sr(self,comm,block,walker_factors,max_nprod,max_nsum,ntot=None):
         if comm.rank>0:

@@ -8,9 +8,9 @@ from ipie.utils.backend import to_host
 from ipie.utils.backend import arraylib as xp
 
 def _preprocess_walkers(walkers):
-    walkers.buff_names += ['weight','phase','psi_g']
+    walkers.buff_names += ['weight','phase','ovlp']
     walkers.phase = xp.ones(walkers.nwalkers) 
-    walkers.psi_g = xp.ones(walkers.nwalkers) 
+    walkers.ovlp = xp.ones(walkers.nwalkers) 
     walkers.R = None 
     walkers.sgn_ovlp = None
     walkers.eloc = None
@@ -38,7 +38,6 @@ def preprocess_walkers(walkers:GHFWalkers):
     _preprocess_walkers(walkers)
 
 def _preprocess_trial(trial):
-    trial.psi = None
     trial.psi0 = None
     trial.psi0a = None
     trial.psi0b = None
@@ -47,12 +46,12 @@ def _preprocess_trial(trial):
 
 @plum.dispatch
 def preprocess_trial(trial:SingleDet):
-    trial.B = [trial.psi0a.real,trial.psi0b.real]
+    trial.psi = [trial.psi0a.real,trial.psi0b.real]
     _preprocess_trial(trial)
 
 @plum.dispatch
 def preprocess_trial(trial:SingleDetGHF):
-    trial.B = trial.psi0.real
+    trial.psi = trial.psi0.real
     _preprocess_trial(trial)
 
 @plum.dispatch
@@ -139,11 +138,11 @@ def _inv(ovlp):
 @plum.dispatch
 def compute_ovlp(walkers:UHFWalkers,trial:SingleDet,inv=True,scalar_ovlp=False):
     C = walkers.phia.real,walkers.phib.real
-    CdB = [_ovlp(Ci,B=Bi) for Ci,Bi in zip(C,trial.B)] 
+    CdB = [_ovlp(Ci,B=Bi) for Ci,Bi in zip(C,trial.psi)] 
     if scalar_ovlp:
-        walkers.psi_g = xp.linalg.det(CdB[0])
+        walkers.ovlp = xp.linalg.det(CdB[0])
         if CdB[1] is not None:
-            walkers.psi_g *= xp.linalg.det(CdB[1])
+            walkers.ovlp *= xp.linalg.det(CdB[1])
     if inv:
         CdB = [_inv(oi) for oi in CdB]
     return CdB
@@ -152,20 +151,20 @@ def compute_ovlp(walkers:UHFWalkers,trial:SingleDet,inv=True,scalar_ovlp=False):
 def compute_ovlp(walkers:UHFWalkers,trial:SingleDetGHF,inv=True,scalar_ovlp=False):
     C = walkers.phia,walkers.phib
     nb = trial.nbasis
-    B = trial.B[:nb],trial.B[nb:]
+    B = trial.psi[:nb],trial.psi[nb:]
     CdB = [_ovlp(Ci,B=Bi) for Ci,Bi in zip(C,B)] 
     CdB = xp.concatenate(CdB,axis=1)
     if scalar_ovlp:
-        walkers.psi_g = xp.linalg.det(CdB)
+        walkers.ovlp = xp.linalg.det(CdB)
     if inv:
         CdB = xp.linalg.inv(CdB)
     return CdB
 
 @plum.dispatch
 def compute_ovlp(walkers:GHFWalkers,trial:SingleDetGHF,inv=True,scalar_ovlp=False):
-    CdB = _ovlp(walkers.phi,B=trial.B)
+    CdB = _ovlp(walkers.phi,B=trial.psi)
     if scalar_ovlp:
-        walkers.psi_g = xp.linalg.det(CdB)
+        walkers.ovlp = xp.linalg.det(CdB)
     if inv:
         CdB = xp.linalg.inv(CdB)
     return CdB
@@ -189,16 +188,13 @@ def _rdm1(ovlp,C,B=None):
 def compute_rdm1(walkers:UHFWalkers,trial:SingleDet,scalar_ovlp=False,eps_sq=None):
     CdBinv = compute_ovlp(walkers,trial,scalar_ovlp=scalar_ovlp)
     C = walkers.phia,walkers.phib
-    walkers.D = [_rdm1(oi,Ci,B=Bi) for oi,Ci,Bi in zip(CdBinv,C,trial.B)] 
+    walkers.D = [_rdm1(oi,Ci,B=Bi) for oi,Ci,Bi in zip(CdBinv,C,trial.psi)] 
     compute_regularization(walkers,eps_sq=eps_sq)
-    if scalar_ovlp:
-        if walkers.R is not None:
-            walkers.psi_g /= walkers.R
 
 @plum.dispatch
 def compute_rdm1(walkers:UHFWalkers,trial:SingleDetGHF,scalar_ovlp=False,eps_sq=None):
     CdBinv = compute_ovlp(walkers,trial,scalar_ovlp=scalar_ovlp)
-    tmp = xp.einsum('xi,wij->wxj',trial.B,CdBinv) 
+    tmp = xp.einsum('xi,wij->wxj',trial.psi,CdBinv) 
 
     nw = walkers.nwalkers
     nu,nd = trial.nelec
@@ -208,18 +204,12 @@ def compute_rdm1(walkers:UHFWalkers,trial:SingleDetGHF,scalar_ovlp=False,eps_sq=
     D[:,:,nb:] = xp.einsum('wxj,wyj->wxy',tmp[:,:,nu:],walkers.phib)
     walkers.D = D
     compute_regularization(walkers,eps_sq=eps_sq)
-    if scalar_ovlp:
-        if walkers.R is not None:
-            walkers.psi_g /= walkers.R
 
 @plum.dispatch
 def compute_rdm1(walkers:GHFWalkers,trial:SingleDetGHF,scalar_ovlp=False,eps_sq=None):
     CdBinv = compute_ovlp(walkers,trial,scalar_ovlp=scalar_ovlp)
-    walkers.D = _rdm1(CdBinv,walkers.phi.real,B=trial.B)
+    walkers.D = _rdm1(CdBinv,walkers.phi.real,B=trial.psi)
     compute_regularization(walkers,eps_sq=eps_sq)
-    if scalar_ovlp:
-        if walkers.R is not None:
-            walkers.psi_g /= walkers.R
 
 def _trace(D):
     if D is None:
