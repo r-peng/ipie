@@ -15,7 +15,7 @@
 # Author: Fionn Malone <fmalone@google.com>
 #
 
-import h5py
+import h5py,numpy
 
 from ipie.utils.backend import arraylib as xp
 from ipie.utils.backend import to_host
@@ -30,36 +30,41 @@ class EnergyEstimator(EnergyEstimator_):
                 'E1Body':[],
                 'E2Body':[],
                 }
+
     def compute_estimator(self, system=None, walkers=None, hamiltonian=None, trial=None):
         # Need to be able to dispatch here
         Etot,E1,E2 = hamiltonian.local_energy(walkers)
         if walkers.R is None:
-            weight = walkers.weight
+            weight = walkers.weight.copy()
         else:
             weight = walkers.weight * walkers.R 
-            #print('R mean=',to_host(xp.mean(R)))
+        weight /= walkers.nwalkers
 
         self._data["ENumer"] = xp.sum(weight * Etot)
         self._data["EDenom"] = xp.sum(weight)
         self._data["E1Body"] = xp.sum(weight * E1)
         self._data["E2Body"] = xp.sum(weight * E2)
         return self.data
+
     def process_sr_data(self,data,dirname='.'):
         for key in self._sr_data: 
             ix = self._data_index[key]
             self._sr_data[key].append(data[ix])
+
     def save_sr_data(self,dirname='.'): 
         if dirname is None:
             return
         with h5py.File(f'{dirname}/energy.h5','w') as f:
             for key,data in self._sr_data.items():
-                f.create_dataset(key,data=to_host(xp.asarray(data)))
+                f.create_dataset(key,data=numpy.asarray(data))
+
     def load_sr_data(self,dirname,rank):
         if rank>0:
             return
         with h5py.File(f'{dirname}/energy.h5','r') as f:
             for key in self._sr_data:
                 self._sr_data[key] = list(f[key][:])
+
     def compute_estimator_sr(self,weight,rank,shift,ntot=None):
         if rank>0:
             return
@@ -67,5 +72,5 @@ class EnergyEstimator(EnergyEstimator_):
         for key,data in self._sr_data.items():
             ix = self._data_index[key]
             dat = data[shift:] if ntot is None else data[shift:ntot]
-            est_data[ix] = xp.dot(weight,xp.asarray(dat))
+            est_data[ix] = numpy.dot(weight,numpy.asarray(dat))
         return est_data

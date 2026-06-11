@@ -9,53 +9,88 @@ from ipie.utils.backend import arraylib as xp
 
 class Rotation:
 
-    def __init__(self,chol_idx,pa=None,ga=None,pb=None,gb=None,thresh=1e-6):
+    def __init__(self,chol_idx,typ,p,g,d,d2):
         self.chol_idx = chol_idx
-        self.p = [None,None]
-        self.g = [None,None]
-        self.d = [None,None]
-        self.r = [None,None]
-        if pa is not None:
-            self.p[0] = xp.asarray(pa,dtype=int)
-            self.g[0] = xp.asarray(ga)
-            self.d[0] = xp.exp(self.g[0])-1.
-            assert xp.fabs(self.d[0])>thresh
-            self.r[0] = len(pa)
-        if pb is not None:
-            self.p[1] = xp.asarray(pb,dtype=int)
-            self.g[1] = xp.asarray(gb)
-            self.d[1] = xp.exp(self.g[1])-1.
-            assert xp.fabs(self.d[1])>thresh
-            self.r[1] = len(pb)
+        assert typ in ['h1a','h1b','h2a','h2b','h2ab']
+        self.typ = typ
 
+        self.p = p 
+        self.g = g
+        self.d = d
+        self.d2 = d2
+        
     def get_MB_kappa(self,v,basis):
         kappa = [None] * 2
-        for s in (0,1):
-            p,g = self.p[s],self.g[s]
-            if p is None:
-                continue
-            ks = np.einsum('xr,yr,r->xy',v[:,p],v[:,p],g)
+        if self.typ=='h2ab':
+            for s,p in enumerate(self.p):
+                ks = np.outer(v[:,p],v[:,p]*self.g[s])
+                kappa[s] = quadratic2MB(ks,basis,s) 
+        else:
+            s = 0 if self.typ[-1]=='a' else 1
+            ks = np.einsum('xr,yr,r->xy',v[:,self.p],v[:,self.p],self.g)
             kappa[s] = quadratic2MB(ks,basis,s) 
         return kappa
 
     def get_rotation_matrix(self,v):
         U = [None] * 2
-        for s in (0,1):
-            p,d = self.p[s],self.d[s]
-            if p is None:
-                continue
+        if self.typ=='h2ab':
+            for s,p in enumerate(self.p):
+                diag = xp.ones(v.shape[0])
+                diag[p] += self.d[s]
+                U[s] = xp.einsum('xp,yp,p->xy',v,v,diag)
+        else:
             diag = xp.ones(v.shape[0])
-            diag[p] += d
+            diag[self.p] += self.d
+            s = 0 if self.typ[-1]=='a' else 1
             U[s] = xp.einsum('xp,yp,p->xy',v,v,diag)
         return U
 
 class SumOfRotationBase:
 
-    def __init__(self):
+    def __init__(self,sample_method=0):
         self.chol_basis = []
         self.terms = [] 
-        self.bare_gf = []
-        self.Lambda = 0. 
+        self.coeffs = []
+        self.sample_method = sample_method
+
+        # additional saved quantites 
+        if self.sample_method==0:
+            return
+        elif self.sample_method==1:
+            # sample with a_i*det(I_r+d_i)
+            self.importance_factor = []
+        else:
+            raise NotImplementedError
+        #if self.sample_method==2:
+        #    # sample with a_i*det(I_r+d_i*D0[i])
+        #    self.kix_map = {1:[],2:[]}
+        #    self.dmap = {1:[],2:[]}
+        #    self.pmap = {1:[],2:[]}
+
+    def add_term(self,ai,chol_idx,typ,p,g,thresh=1e-6):
+        p = xp.asarray(p,dtype=int)
+        g = xp.asarray(g)
+        d = xp.exp(g)-1.
+        zeros = d[xp.fabs(d)<thresh]
+        if zeros.size>0:
+            return
+
+        d2 = 2*d+d**2
+        neg = d2+1.
+        neg = neg[neg<thresh]
+        if neg.size>0:
+            print(f'incompatible d={d} for low rank lowdn.')
+            raise ValueError
+
+        self.terms.append(Rotation(chol_idx,typ,p,g,d,d2))
+        self.coeffs.append(ai)
+
+        if self.sample_method==1:
+            self.importance_factor.append((d+1.).prod())
+            #print(g,d,self.importance_factor[-1])
+        #if self.sample_method==2:
+        #    r = p.size
+        #    self.kix_map
 
     def decompose_h1(self,at,thresh=1e-6,iprint=0):
         self.nbasis = self.h1e.shape[0]
@@ -68,49 +103,57 @@ class SumOfRotationBase:
             print('at=',at)
             print('bands=',ek)
         assert at>xp.amax(xp.fabs(ek))
-        nonzero_bands = xp.nonzero(xp.fabs(ek)>thresh)[0]
         eta = xp.log(1.-ek/at)
 
-        self.bare_gf += [at] * (2*nonzero_bands.size)
-        self.Lambda += at*2*nonzero_bands.size
-        for k in nonzero_bands:
-            self.terms.append(Rotation(chol_idx,pa=[k],ga=[eta[k]]))
-            self.terms.append(Rotation(chol_idx,pb=[k],gb=[eta[k]]))
+        for k,eta_k in enumerate(eta):
+            self.add_term(at,chol_idx,'h1a',[k],[eta_k])
+            self.add_term(at,chol_idx,'h1b',[k],[eta_k])
         return ek
 
     def parse_decomposition(self,iprint=0):
+        self.chol_basis = xp.asarray(self.chol_basis)
+        self.coeffs = xp.asarray(self.coeffs)
+        self.Lambda = self.coeffs.sum()
+        self.coeffs /= self.Lambda
+        self.nterms = len(self.terms) 
+        assert self.coeffs.size==self.nterms
         if iprint>0:
             print('Lambda=',self.Lambda)
-        self.chol_basis = xp.asarray(self.chol_basis)
-        self.bare_gf = xp.asarray(self.bare_gf)/self.Lambda
-        assert self.bare_gf.size==len(self.terms)
-        if iprint>0:
-            print('normalization=',xp.fabs(self.bare_gf).sum())
+            print('normalization=',xp.fabs(self.coeffs).sum())
+            print('number of terms=',self.nterms)
+
+        if self.sample_method==1:
+            self.importance_factor = xp.asarray(self.importance_factor)
+            assert self.importance_factor.size==self.nterms
+
+    def compute_prob(self,D=None):
+        if self.sample_method==0:
+            p = self.coeffs
+        elif self.sample_method==1:
+            p = self.coeffs * self.importance_factor 
+        else:
+            raise NotImplementedError
+
+        p = xp.fabs(p)
+        p /= p.sum()
+        sign = self.coeffs / p
+        return p,sign
 
     def parse_sampled_rotations(self,kixs):
-        dmap = {(s,r):[] for s in (0,1) for r in (1,2)}
-        umap = {(s,r):[] for s in (0,1) for r in (1,2)}
-        wmap = {(s,r):[] for s in (0,1) for r in (1,2)}
+        rotations = dict()
         for w,kix in enumerate(kixs):
             term = self.terms[kix]
-            for s in (0,1):
-                p = term.p[s]
-                if p is None:
-                    continue
-                r = term.r[s]
-                dmap[s,r].append(term.d[s])
-                umap[s,r].append(self.chol_basis[term.chol_idx][:,p])
-                wmap[s,r].append(w)
-        for s,r in itertools.product((0,1),(1,2)):
-            if len(dmap[s,r])==0:
-                dmap[s,r] = None
-                umap[s,r] = None
-                wmap[s,r] = None
-                continue
-            dmap[s,r] = xp.asarray(dmap[s,r])
-            umap[s,r] = xp.asarray(umap[s,r])
-            wmap[s,r] = xp.asarray(wmap[s,r])
-        return dmap,umap,wmap
+            typ = term.typ
+            if typ not in rotations:
+                rotations[typ] = {'d':[],'d2':[],'u':[],'w':[]}
+            rotations[typ]['w'].append(w)
+            rotations[typ]['d'].append(term.d)
+            rotations[typ]['d2'].append(term.d2)
+            rotations[typ]['u'].append(self.chol_basis[term.chol_idx][:,term.p])
+        for typ in rotations:
+            for key in ['w','d','d2','u']:
+                rotations[typ][key] = xp.asarray(rotations[typ][key]) 
+        return rotations
 
     def parse_sampled_rotations_slow(self,kixs):
         Us = [None] * len(kixs)
@@ -128,14 +171,16 @@ class SumOfRotationBase:
             nb = self.nbasis
             Daa,Dab,Dba,Dbb = D[:,:nb,:nb],D[:,:nb,nb:],D[:,nb:,:nb],D[:,nb:,nb:]
 
-        E1 = xp.einsum('ij,wij->w',self.h1e,Daa+Dbb)
+        E1 = xp.einsum('ij,wij->w',self.h1e,Daa)
+        if Dbb is not None:
+            E1 += xp.einsum('ij,wij->w',self.h1e,Dbb)
         E2 = self.compute_E2(Daa,Dbb,Dab=Dab,Dba=Dba)
         return E1+E2,E1,E2
 
     def _get_MB_gf(self,basis):
         H = 0
         print('called')
-        for ai,term in zip(self.bare_gf,self.terms): 
+        for ai,term in zip(self.coeffs,self.terms): 
             kappa = term.get_MB_kappa(self.chol_basis[term.chol_idx],basis)
             U = None
             for spin,k in enumerate(kappa):
@@ -164,13 +209,9 @@ class HubbardSOR(SumOfRotationBase):
         ai = self.U/(np.cosh(gu)-1)/4
         if iprint>0:
             print(f'eta={gu},ai={ai}')
-        self.bare_gf += [ai] * (2*self.nbasis)
-        self.Lambda += 2*ai*self.nbasis
-        if nelec is not None:
-            self.Lambda += self.U*sum(nelec)/2 
         for i in range(self.nbasis): 
-            self.terms.append(Rotation(chol_idx,pa=[i],ga=[gu],pb=[i],gb=[-gu]))
-            self.terms.append(Rotation(chol_idx,pa=[i],ga=[-gu],pb=[i],gb=[gu]))
+            self.add_term(ai,chol_idx,'h2ab',[i,i],[gu,-gu])
+            self.add_term(ai,chol_idx,'h2ab',[i,i],[-gu,gu])
 
     def compute_E2(self,Daa,Dbb,Dab=None,Dba=None):
         E2 = xp.einsum('wii,wii->w',Daa,Dbb)
@@ -191,40 +232,42 @@ class QCSOR(SumOfRotationBase):
         aisq = ai**2/2
         if iprint>0:
             print('ai=',ai)
-        for i,L in enumerate(self.chol):
+        for L in self.chol:
             ek,vk = xp.linalg.eigh(L) 
             self.chol_basis.append(vk)
             chol_idx = len(self.chol_basis)-1
 
             if iprint>0:
-                print(f'chol={i},bands={ek}')
+                print(f'chol_idx={chol_idx},bands={ek}')
             assert ai>xp.amax(xp.fabs(ek))
-            nonzero_bands = xp.nonzero(xp.fabs(ek)>thresh)[0]
-            self.Lambda += (ai*2*nonzero_bands.size)**2/2.
             eta_plus = xp.log(1.+ek/ai) 
             eta_minus = xp.log(1.-ek/ai) 
 
-            for p,q in itertools.product(nonzero_bands,repeat=2):
-                self.bare_gf += [aisq] * 4
+            for p,q in itertools.product(np.arange(self.nbasis),repeat=2):
                 eta_p = eta_minus[p]
                 eta_q = eta_plus[q]
                 if p==q:
-                    self.terms.append(Rotation(chol_idx,pa=[p],ga=[eta_p+eta_q]))
-                    self.terms.append(Rotation(chol_idx,pb=[p],gb=[eta_p+eta_q]))
+                    self.add_term(aisq,chol_idx,'h1a',[p],[eta_p+eta_q])
+                    self.add_term(aisq,chol_idx,'h1b',[p],[eta_p+eta_q])
                 else:
-                    self.terms.append(Rotation(chol_idx,pa=[p,q],ga=[eta_p,eta_q]))
-                    self.terms.append(Rotation(chol_idx,pb=[p,q],gb=[eta_p,eta_q]))
-                self.terms.append(Rotation(chol_idx,pa=[p],ga=[eta_p],pb=[q],gb=[eta_q]))
-                self.terms.append(Rotation(chol_idx,pa=[q],ga=[eta_q],pb=[p],gb=[eta_p]))
+                    self.add_term(aisq,chol_idx,'h2a',[p,q],[eta_p,eta_q])
+                    self.add_term(aisq,chol_idx,'h2b',[p,q],[eta_p,eta_q])
+                self.add_term(aisq,chol_idx,'h2ab',[p,q],[eta_p,eta_q])
+                self.add_term(aisq,chol_idx,'h2ab',[q,p],[eta_q,eta_p])
 
     def compute_E2(self,Daa,Dbb,Dab=None,Dba=None):
         E2 = 0
         for i,L in enumerate(self.chol):
             DaaL = xp.einsum('wpq,qr->wpr',Daa,L)
-            DbbL = xp.einsum('wpq,qr->wpr',Dbb,L)
-            E2 += xp.einsum('wpp->w',DaaL+DbbL)**2
+            E2_1 = xp.einsum('wpp->w',DaaL)
+            if Dbb is not None:
+                DbbL = xp.einsum('wpq,qr->wpr',Dbb,L)
+                E2_1 += xp.einsum('wpp->w',DbbL)
+            E2 += E2_1**2
+
             E2 -= xp.einsum('wpq,wqp->w',DaaL,DaaL)
-            E2 -= xp.einsum('wpq,wqp->w',DbbL,DbbL)
+            if Dbb is not None:
+                E2 -= xp.einsum('wpq,wqp->w',DbbL,DbbL)
             if Dab is not None:
                 DabL = xp.einsum('wpq,qr->wpr',Dab,L)
                 DbaL = xp.einsum('wpq,qr->wpr',Dba,L)

@@ -22,8 +22,6 @@ import os
 from typing import Tuple, Union
 
 import numpy
-from ipie.utils.backend import arraylib as xp
-from ipie.utils.backend import to_host
 
 from ipie.config import config, MPI
 from ipie.estimators.energy_custom import EnergyEstimator
@@ -92,18 +90,21 @@ class EstimatorHandler(EstimatorHandler_):
             print("# Finished settting up estimator object.")
 
         self.log_average_weights = []
+
     def load(self,dirname,rank):
         if rank>0:
             return
         self.log_average_weights = list(numpy.load(f'{dirname}/log_average_weights.npy'))
         for k,e in self.items():
             e.load_sr_data(dirname,rank)
+
     def save(self,dirname='.'):
         if dirname is None:
             return
-        numpy.save(f'{dirname}/log_average_weights.npy',to_host(xp.asarray(self.log_average_weights)))
+        numpy.save(f'{dirname}/log_average_weights.npy',numpy.asarray(self.log_average_weights))
         for k,e in self.items():
             e.save_sr_data(dirname=dirname)
+
     def post_sr(self,comm,walker_factors,log_average_weight,dirname='.'):
         self.local_estimates[: walker_factors.size] = walker_factors.buffer
         comm.Reduce(self.local_estimates, self.global_estimates, op=MPI.SUM)
@@ -118,31 +119,33 @@ class EstimatorHandler(EstimatorHandler_):
             start = offset + self.get_offset(k)
             end = start + int(self[k].size)
             est_data = self.global_estimates[start:end]
-            e.process_sr_data(est_data,dirname)
+            e.process_sr_data(est_data.real,dirname)
         self.zero()
+
     def compute_weights(self,max_nprod,max_nsum,ntot=None):
         log_average_weights = self.log_average_weights if ntot is None else \
                               self.log_average_weights[:ntot]
-        log_average_weights = xp.asarray(log_average_weights)
+        log_average_weights = numpy.asarray(log_average_weights)
         ntot = log_average_weights.size
         nprod = min(max_nprod,ntot)
         nsum = min(ntot-nprod+1,max_nsum)
         shift = ntot - nsum 
         #print(f'ntot={ntot},nprod={nprod},nsum={nsum},shift={shift}')
-        weight = xp.zeros(nsum)
+        weight = numpy.zeros(nsum)
         for i in range(nsum):
             stop = i+shift+1
             start = stop-nprod
             weight[i] = log_average_weights[start:stop].sum()
-        max_weight = xp.amax(weight)
-        return xp.exp(weight-max_weight),shift,max_weight
+        max_weight = numpy.amax(weight)
+        return numpy.exp(weight-max_weight),shift,max_weight
+
     def print_block_sr(self,comm,block,walker_factors,max_nprod,max_nsum,ntot=None):
         if comm.rank>0:
             return
         weights,shift,max_weight = self.compute_weights(max_nprod,max_nsum,ntot=ntot)
 
         output_string = " "
-        vals = to_host(xp.mean(weights)),to_host(max_weight),0.
+        vals = numpy.mean(weights),max_weight,0.
         output_string += walker_factors.to_text(numpy.array(vals))
         output_string += " "
 

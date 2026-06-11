@@ -7,8 +7,10 @@ from ipie.trial_wavefunction.single_det_ghf import SingleDetGHF
 from ipie.utils.backend import to_host
 from ipie.utils.backend import arraylib as xp
 
-def _preprocess_walkers(walkers):
-    walkers.buff_names += ['weight','phase','ovlp']
+def _preprocess_walkers(walkers,scalar_ovlp=True):
+    walkers.buff_names += ['weight','phase']
+    if scalar_ovlp:
+        walkers.buff_names += ['ovlp']
     walkers.phase = xp.ones(walkers.nwalkers) 
     walkers.ovlp = xp.ones(walkers.nwalkers) 
     walkers.R = None 
@@ -18,7 +20,7 @@ def _preprocess_walkers(walkers):
     walkers.walker_buffer = xp.zeros(walkers.buff_size)
 
 @plum.dispatch
-def preprocess_walkers(walkers:UHFWalkers):
+def preprocess_walkers(walkers:UHFWalkers,scalar_ovlp=True):
     walkers.buff_names = ['phia','phib']
     walkers.phia = walkers.phia.real
     if walkers.phib is not None:
@@ -28,14 +30,14 @@ def preprocess_walkers(walkers:UHFWalkers):
     walkers.Gb = None
     walkers.Ghalfa = None
     walkers.Ghalfb = None
-    _preprocess_walkers(walkers)
+    _preprocess_walkers(walkers,scalar_ovlp=scalar_ovlp)
 
 @plum.dispatch
-def preprocess_walkers(walkers:GHFWalkers):
+def preprocess_walkers(walkers:GHFWalkers,scalar_ovlp=True):
     walkers.buff_names = ['phi']
     walkers.phi = walkers.phi.real
     walkers.G = None
-    _preprocess_walkers(walkers)
+    _preprocess_walkers(walkers,scalar_ovlp=scalar_ovlp)
 
 def _preprocess_trial(trial):
     trial.psi0 = None
@@ -136,42 +138,72 @@ def _inv(ovlp):
 #    return [_inv(oi) for oi in CdC]
 
 @plum.dispatch
-def compute_ovlp(walkers:UHFWalkers,trial:SingleDet,inv=True,scalar_ovlp=False):
-    C = walkers.phia.real,walkers.phib.real
+def compute_ovlp(walkers:UHFWalkers,trial:SingleDet,inv=True,scalar_ovlp=False,iws=None):
+    if iws is None:
+        C = [walkers.phia,walkers.phib]
+    else:
+        C = [walkers.phia[iws],None]
+        if walkers.phib is not None:
+            C[1] = walkers.phib[iws]
+
     CdB = [_ovlp(Ci,B=Bi) for Ci,Bi in zip(C,trial.psi)] 
     if scalar_ovlp:
-        walkers.ovlp = xp.linalg.det(CdB[0])
+        det = xp.linalg.det(CdB[0])
         if CdB[1] is not None:
-            walkers.ovlp *= xp.linalg.det(CdB[1])
+            det *= xp.linalg.det(CdB[1])
+        if iws is None:
+            walkers.ovlp = det
+        else:
+            walkers.ovlp[iws] = det
     if inv:
         CdB = [_inv(oi) for oi in CdB]
-    return CdB
+    return CdB,C
 
 @plum.dispatch
-def compute_ovlp(walkers:UHFWalkers,trial:SingleDetGHF,inv=True,scalar_ovlp=False):
-    C = walkers.phia,walkers.phib
+def compute_ovlp(walkers:UHFWalkers,trial:SingleDetGHF,inv=True,scalar_ovlp=False,iws=None):
+    if iws is None:
+        C = [walkers.phia,walkers.phib]
+    else:
+        C = [walkers.phia[iws],None]
+        if walkers.phib is not None:
+            C[1] = walkers.phib[iws]
+
     nb = trial.nbasis
     B = trial.psi[:nb],trial.psi[nb:]
     CdB = [_ovlp(Ci,B=Bi) for Ci,Bi in zip(C,B)] 
     CdB = xp.concatenate(CdB,axis=1)
     if scalar_ovlp:
-        walkers.ovlp = xp.linalg.det(CdB)
+        det = xp.linalg.det(CdB)
+        if iws is None:
+            walkers.ovlp = det
+        else:
+            walkers.ovlp[iws] = det
     if inv:
         CdB = xp.linalg.inv(CdB)
-    return CdB
+    return CdB,C
 
 @plum.dispatch
-def compute_ovlp(walkers:GHFWalkers,trial:SingleDetGHF,inv=True,scalar_ovlp=False):
-    CdB = _ovlp(walkers.phi,B=trial.psi)
+def compute_ovlp(walkers:GHFWalkers,trial:SingleDetGHF,inv=True,scalar_ovlp=False,iws=None):
+    C = walkers.phi if iws is None else walkers.phi[iws]
+    CdB = _ovlp(C,B=trial.psi)
     if scalar_ovlp:
-        walkers.ovlp = xp.linalg.det(CdB)
+        det = xp.linalg.det(CdB)
+        if iws is None:
+            walkers.ovlp = det
+        else:
+            walkers.ovlp[iws] = det
     if inv:
         CdB = xp.linalg.inv(CdB)
-    return CdB
+    return CdB,C
 
 def _rdm1(ovlp,C,B=None):
     if C is None:
         return None
+    if xp.count_nonzero(xp.isnan(ovlp))>0:
+        print('ovlp inv')
+        print(ovlp)
+        exit()
+
     if B is None:
         D = xp.einsum('wxi,wij->wxj',C,ovlp) 
     else:
@@ -185,89 +217,173 @@ def _rdm1(ovlp,C,B=None):
 #    walkers.D = [_rdm1(oi,Ci) for oi,Ci in zip(CdCinv,C)] 
 
 @plum.dispatch
-def compute_rdm1(walkers:UHFWalkers,trial:SingleDet,scalar_ovlp=False,eps_sq=None):
-    CdBinv = compute_ovlp(walkers,trial,scalar_ovlp=scalar_ovlp)
-    C = walkers.phia,walkers.phib
-    walkers.D = [_rdm1(oi,Ci,B=Bi) for oi,Ci,Bi in zip(CdBinv,C,trial.psi)] 
-    compute_regularization(walkers,eps_sq=eps_sq)
+def compute_rdm1(walkers:UHFWalkers,trial:SingleDet,scalar_ovlp=False,eps_sq=None,iws=None):
+    CdBinv,C = compute_ovlp(walkers,trial,scalar_ovlp=scalar_ovlp,iws=iws)
+    D = [_rdm1(oi,Ci,B=Bi) for oi,Ci,Bi in zip(CdBinv,C,trial.psi)] 
+    if iws is None:
+        walkers.D = D
+    else:
+        walkers.D[0][iws] = D[0]
+        if D[1] is not None:
+            walkers.D[1][iws] = D[1]
+    compute_regularization(walkers,eps_sq=eps_sq,iws=iws)
 
 @plum.dispatch
-def compute_rdm1(walkers:UHFWalkers,trial:SingleDetGHF,scalar_ovlp=False,eps_sq=None):
-    CdBinv = compute_ovlp(walkers,trial,scalar_ovlp=scalar_ovlp)
+def compute_rdm1(walkers:UHFWalkers,trial:SingleDetGHF,scalar_ovlp=False,eps_sq=None,iws=None):
+    CdBinv,C = compute_ovlp(walkers,trial,scalar_ovlp=scalar_ovlp,iws=iws)
     tmp = xp.einsum('xi,wij->wxj',trial.psi,CdBinv) 
 
-    nw = walkers.nwalkers
+    nw = walkers.nwalkers if iws is None else iws.size
     nu,nd = trial.nelec
     nb = trial.nbasis
     D = xp.zeros((nw,nb*2,nb*2))
-    D[:,:,:nb] = xp.einsum('wxj,wyj->wxy',tmp[:,:,:nu],walkers.phia)
-    D[:,:,nb:] = xp.einsum('wxj,wyj->wxy',tmp[:,:,nu:],walkers.phib)
-    walkers.D = D
-    compute_regularization(walkers,eps_sq=eps_sq)
+    D[:,:,:nb] = xp.einsum('wxj,wyj->wxy',tmp[:,:,:nu],C[0])
+    if C[1] is not None:
+        D[:,:,nb:] = xp.einsum('wxj,wyj->wxy',tmp[:,:,nu:],C[1])
+    if iws is None:
+        walkers.D = D
+    else:
+        walkers.D[iws] = D
+    compute_regularization(walkers,eps_sq=eps_sq,iws=iws)
 
 @plum.dispatch
-def compute_rdm1(walkers:GHFWalkers,trial:SingleDetGHF,scalar_ovlp=False,eps_sq=None):
-    CdBinv = compute_ovlp(walkers,trial,scalar_ovlp=scalar_ovlp)
-    walkers.D = _rdm1(CdBinv,walkers.phi.real,B=trial.psi)
-    compute_regularization(walkers,eps_sq=eps_sq)
+def compute_rdm1(walkers:GHFWalkers,trial:SingleDetGHF,scalar_ovlp=False,eps_sq=None,iws=None):
+    CdBinv,C = compute_ovlp(walkers,trial,scalar_ovlp=scalar_ovlp,iws=iws)
+    D = _rdm1(CdBinv,C,B=trial.psi)
+    if iws is None:
+        walkers.D = D
+    else:
+        walkers.D[iws] = D
+    compute_regularization(walkers,eps_sq=eps_sq,iws=iws)
 
-def _trace(D):
+def _trace(D,iws=None):
     if D is None:
         return 0
-    return xp.einsum('wxy->w',D**2)
+    Dw = D if iws is None else D[iws]
+    return xp.einsum('wxy->w',Dw**2)
 
-def compute_trace(D):
+def compute_trace(D,iws=None):
     if isinstance(D,list):
-        return  _trace(D[0])+_trace(D[1]) 
-    return _trace(D)
+        return  _trace(D[0],iws=iws)+_trace(D[1],iws=iws) 
+    return _trace(D,iws=iws)
 
-def compute_regularization(walkers,eps_sq=None):
+def compute_regularization(walkers,eps_sq=None,iws=None):
     if eps_sq is None:
-        return 
-    tr = compute_trace(walkers.D)
-    walkers.R = 1./xp.sqrt(1.+eps_sq*tr)
+        return None 
+    tr = compute_trace(walkers.D,iws=iws)
+    R = 1./xp.sqrt(1.+eps_sq*tr)
+    if iws is None:
+        walkers.R = R
+    else:
+        walkers.R[iws] = R
 
 def _update_walkers(C,d,u,w):
     if C is None:
+        return C,None
+    uC = xp.einsum('wxr,wxi->wri',u,C[w])
+    C[w] += xp.einsum('wxr,wr,wri->wxi',u,d,uC)
+    return C,uC
+
+def _lowdin(C,uC,d,d2,w): 
+    if C is None:
         return C
-    if d is None:
-        return C
-    right = xp.einsum('wr,wxr,wxi->wri',d,u,C[w])
-    C[w] += xp.einsum('wxr,wri->wxi',u,right)
+    r = d.shape[1]
+    p = uC.transpose(0,2,1)
+    if r==1:
+        norm_sq = (p**2).sum(axis=1)
+        p /= xp.sqrt(norm_sq)[:,None,:]
+        lambda_ = d2*norm_sq 
+    else:
+        p,s = xp.linalg.qr(p,mode='reduced')
+        lambda_ = xp.einsum('wrs,ws,wts->wrt',s,d2,s)
+        lambda_,v = xp.linalg.eigh(lambda_)
+        p = xp.einsum('wir,wrs->wis',p,v)
+    delta = 1./xp.sqrt(lambda_+1.)-1.
+    left = xp.einsum('wxi,wir->wxr',C[w],p)
+    C[w] += xp.einsum('wxr,wr,wir->wxi',left,delta,p)
     return C
 
 @plum.dispatch
-def update_walkers(walkers:UHFWalkers,dmap,umap,wmap):
-    phi = [walkers.phia,walkers.phib]
-    for (s,r),d in dmap.items():
-        phi[s] = _update_walkers(phi[s],d,umap[s,r],wmap[s,r])
-    walkers.phia = phi[0]
-    walkers.phib = phi[1]
+def update_walkers(walkers:UHFWalkers,rotations,lowdin=False):
+    for typ,rotations_ in rotations.items():
+        w = rotations_['w']
+        d = rotations_['d']
+        d2 = rotations_['d2']
+        u = rotations_['u']
+        if typ=='h2ab':
+            walkers.phia,uC = _update_walkers(walkers.phia,d[:,:1],u[:,:,:1],w)
+            if lowdin:
+                walkers.phia = _lowdin(walkers.phia,uC,d[:,:1],d2[:,:1],w)
+            walkers.phib,uC = _update_walkers(walkers.phib,d[:,1:],u[:,:,1:],w)
+            if lowdin:
+                walkers.phib = _lowdin(walkers.phib,uC,d[:,1:],d2[:,1:],w)
+        else:
+            if typ[-1]=='a':
+                walkers.phia,uC = _update_walkers(walkers.phia,d,u,w)
+                if lowdin:
+                    walkers.phia = _lowdin(walkers.phia,uC,d,d2,w)
+            else:
+                walkers.phib,uC = _update_walkers(walkers.phib,d,u,w)
+                if lowdin:
+                    walkers.phib = _lowdin(walkers.phib,uC,d,d2,w)
 
 @plum.dispatch
-def update_walkers(walkers:GHFWalkers,dmap,umap,wmap):
+def update_walkers(walkers:GHFWalkers,rotations,lowdin=False):
     nb = walkers.nbasis
-    phi = [walkers.phi[:,:nb],walkers.phi[:,nb:]]
-    for (s,r),d in dmap.items():
-        phi[s] = _update_walkers(phi[s],d,umap[s,r],wmap[s,r])
-    walkers.phi = xp.concatenate(phi,axis=1)
+    for typ,rotations_ in rotations.items():
+        w = rotations_['w']
+        d = rotations_['d']
+        d2 = rotations_['d2']
+        u = rotations_['u']
+        if typ=='h2ab':
+            walkers.phi[:,:nb],uCa = _update_walkers(walkers.phi[:,:nb],d[:,:1],u[:,:,:1],w)
+            walkers.phi[:,nb:],uCb = _update_walkers(walkers.phi[:,nb:],d[:,1:],u[:,:,1:],w)
+            if lowdin:
+                uC = xp.concatenate([uCa,uCb],axis=1)
+                walkers.phi = _lowdin(walkers.phi,uC,d,d2,w)
+        else:
+            if typ[-1]=='a':
+                walkers.phi[:,:nb],uC = _update_walkers(walkers.phi[:,:nb],d,u,w)
+            else:
+                walkers.phi[:,nb:],uC = _update_walkers(walkers.phi[:,nb:],d,u,w)
+            if lowdin:
+                walkers.phi = _lowdin(walkers.phi,uC,d,d2,w)
+
+def _lowdin_slow(C,thresh=1e-10):
+    if C is None:
+        return C,None
+    ovlp = _ovlp(C) 
+    w,v = xp.linalg.eigh(ovlp)
+    w = 1./xp.sqrt(w)
+    ovlp = xp.einsum('wij,wj,wkj->wik',v,w,v)
+    C = xp.einsum('wxi,wij->wxj',C,ovlp)
+    detR = xp.linalg.det(ovlp) 
+    ovlp = _ovlp(C)
+    assert xp.linalg.norm(ovlp-xp.eye(ovlp.shape[2])[None,:,:])<thresh
+    return C,detR
 
 @plum.dispatch
-def update_walkers_slow(walkers:UHFWalkers,Us):
-    phia = walkers.phia.real.copy()
-    phib = None
+def update_walkers_slow(walkers:UHFWalkers,Us,lowdin=False):
+    phi = [walkers.phia.real.copy(),None]
     if walkers.phib is not None:
-        phib = walkers.phib.real.copy()
+        phi[1] = walkers.phib.real.copy()
     for w,U in enumerate(Us):
-        if U[0] is not None:
-            phia[w] = xp.dot(U[0],phia[w])
-        if phib is not None:
-            if U[1] is not None:
-                phib[w] = xp.dot(U[1],phib[w])
-    return phia,phib
+        for s,Ui in enumerate(U):
+            if phi[s] is None:
+                continue
+            if Ui is None:
+                continue
+            phi[s][w] = xp.dot(U[s],phi[s][w])
+    if lowdin:
+        detR = xp.ones(walkers.nwalkers)
+        for s in (0,1):
+            phi[s],detR_ = _lowdin_slow(phi[s])
+            if detR_ is not None:
+                detR *= detR_
+    return phi[0],phi[1],detR
 
 @plum.dispatch
-def update_walkers_slow(walkers:GHFWalkers,Us):
+def update_walkers_slow(walkers:GHFWalkers,Us,lowdin=False):
     phi = walkers.phi.real.copy()
     nb = walkers.nbasis
     for w,U in enumerate(Us):
@@ -275,7 +391,9 @@ def update_walkers_slow(walkers:GHFWalkers,Us):
             phi[w,:nb] = xp.dot(U[0],phi[w,:nb])
         if U[1] is not None:
             phi[w,nb:] = xp.dot(U[1],phi[w,nb:])
-    return phi
+    if lowdin:
+        phi,detR = _lowdin_slow(phi)
+    return phi,detR
 
 def _get_Dr(D,nb,s):
     if isinstance(D,list):
@@ -293,7 +411,7 @@ def _get_Dl(D,nb,s):
     else:
         return D[:,:,nb:]
 
-def _update_rdm1_ovlp_sd(D,b,d,u,w,s):
+def _update_rdm1_ovlp_sd(D,b,d,u,w,s,thresh=1e4):
     if d is None:
         return D,b
     _,nb,r = u.shape
@@ -315,11 +433,27 @@ def _update_rdm1_ovlp_sd(D,b,d,u,w,s):
             Du = xp.einsum('wxy,wyr->wxr',Dw[:,:,nb:],u)
             uD = xp.einsum('wxr,wxy->wry',u,Dw[:,nb:])
             uDu = xp.einsum('wxr,wxs->wrs',u,Du[:,nb:])
-    M = uDu.copy()
-    M[:,idx,idx] += 1./d
-    b[w] *= d.prod(axis=1)*xp.linalg.det(M)
+    M = xp.eye(r)[None,:,:] + d[:,:,None] * uDu
+    detM = xp.linalg.det(M)
+    if (detM[xp.fabs(detM)<1e-6]).size>0:
+        print('detM=',detM)
+        exit()
+    b[w] *= detM 
+    if xp.linalg.norm(b[w])>thresh or xp.count_nonzero(xp.isnan(b[w]))>0:
+        print('before inverse')
+        print('b=',to_host(b[w]))
+        print('d=',to_host(d))
+        print('M=',to_host(M))
+        print('udu=',to_host(uDu))
+        print('Dw nan=',xp.count_nonzero(xp.isnan(Dw)))
+        exit()
 
-    M = xp.linalg.inv(M)
+    M = xp.linalg.inv(M)*d[:,None,:]
+    if xp.linalg.norm(M)>thresh or xp.count_nonzero(xp.isnan(M))>0:
+        print('after inverse')
+        print('M=',to_host(M))
+        exit()
+
     tmp = xp.einsum('wxr,wrs->wxs',Du,M)
     tmp = xp.einsum('wxr,wry->wxy',tmp,uD)
     if isinstance(D,list):
@@ -340,13 +474,23 @@ def _update_rdm1_ovlp_sd(D,b,d,u,w,s):
             D[w,:,nb:] += tmp
     return D,b
 
-def update_rdm1_and_ovlp(walkers,b,dmap,umap,wmap,eps_sq=None):
-    for (s,r),d in dmap.items():
-        walkers.D,b = _update_rdm1_ovlp_sd(walkers.D,b,d,umap[s,r],wmap[s,r],s)
+def update_rdm1_and_ovlp(walkers,b,rotations,eps_sq=None):
+    for typ,rotations_ in rotations.items():
+        w = rotations_['w']
+        d = rotations_['d']
+        u = rotations_['u']
+        if typ=='h2ab':
+            walkers.D,b = _update_rdm1_ovlp_sd(walkers.D,b,d[:,:1],u[:,:,:1],w,0)
+            walkers.D,b = _update_rdm1_ovlp_sd(walkers.D,b,d[:,1:],u[:,:,1:],w,1)
+        else:
+            if typ[-1]=='a':
+                walkers.D,b = _update_rdm1_ovlp_sd(walkers.D,b,d,u,w,0)
+            else:
+                walkers.D,b = _update_rdm1_ovlp_sd(walkers.D,b,d,u,w,1)
     if eps_sq is None:
         return b
-    Rold = walkers.R.copy()
-    walkers.R = compute_regularization(walkers.D,eps_sq=eps_sq)
-    b *= Rold/walkers.R
+    b *= walkers.R
+    compute_regularization(walkers,eps_sq=eps_sq)
+    b /= walkers.R
     return b
 

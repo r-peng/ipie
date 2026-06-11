@@ -26,6 +26,7 @@ import uuid
 import math
 from typing import Dict, Optional, Tuple
 from functools import partial
+import numpy
 
 from ipie.config import config
 from ipie.estimators.estimator_base import EstimatorBase
@@ -246,6 +247,7 @@ class LAFQMC(AFQMCBase):
         constraint_path=True,
         eps_sq=None,
         num_updates_per_step=1,
+        low_rank_lowdin=True,
         max_nprod=20,
         max_nsum=500,
         dirname='.',
@@ -266,10 +268,12 @@ class LAFQMC(AFQMCBase):
         total_steps = self.params.num_steps_per_block * self.params.num_blocks + num_eqlb_steps
         self.eps_sq = eps_sq
         self.num_updates_per_step = num_updates_per_step
+        self.low_rank_lowdin = low_rank_lowdin 
         if self.num_updates_per_step==1:
             self.scalar_ovlp = False
         else:
             self.scalar_ovlp = True 
+            self.low_rank_lowdin = False 
         if self.mpi_handler.comm.rank==0:
             print('num_eqlb_steps=',num_eqlb_steps)
             print('num_eq_stblz=',self.params.num_eq_stblz)
@@ -284,7 +288,7 @@ class LAFQMC(AFQMCBase):
         self.setup_timers()
         eshift = 0.0
         self.walkers.orthogonalise()
-        preprocess_walkers(self.walkers)
+        preprocess_walkers(self.walkers,scalar_ovlp=self.scalar_ovlp)
         preprocess_trial(self.trial)
         compute_rdm1(self.walkers,self.trial,scalar_ovlp=self.scalar_ovlp,eps_sq=self.eps_sq)
 
@@ -316,42 +320,26 @@ class LAFQMC(AFQMCBase):
         comm = self.mpi_handler.comm
         self.tsetup += time.time() - tzero_setup
 
-        t0 = time.time()
         for step in range(1, total_steps + 1):
             synchronize()
-            start_step = time.time()
-            if step <= num_eqlb_steps:
-                if step % self.params.num_eq_stblz == 0:
-                    start = time.time()
-                    self.walkers.orthogonalise()
-                    synchronize()
-                    self.tortho += time.time() - start
-            else:
-                if step % self.params.num_stblz == 0:
-                    start = time.time()
-                    self.walkers.orthogonalise()
-                    synchronize()
-                    self.tortho += time.time() - start
+            if not self.low_rank_lowdin:
+                start_step = time.time()
+                if step <= num_eqlb_steps:
+                    if step % self.params.num_eq_stblz == 0:
+                        start = time.time()
+                        self.walkers.orthogonalise()
+                        synchronize()
+                        self.tortho += time.time() - start
+                else:
+                    if step % self.params.num_stblz == 0:
+                        start = time.time()
+                        self.walkers.orthogonalise()
+                        synchronize()
+                        self.tortho += time.time() - start
+
             start = time.time()
-            if step <= num_eqlb_steps:
-                self.propagate_walkers(constraint_path=constraint_path)
-                #self.tprop_fbias = self.eq_propagator.timer.tfbias
-                #self.tprop_ovlp = self.eq_propagator.timer.tovlp
-                #self.tprop_update = self.eq_propagator.timer.tupdate
-                #self.tprop_gf = self.eq_propagator.timer.tgf
-                #self.tprop_vhs = self.eq_propagator.timer.tvhs
-                #self.tprop_gemm = self.eq_propagator.timer.tgemm
-            else:
-                #if discard_weights_aftereq:
-                #    if step == num_eqlb_steps + 1:
-                #        self.walkers.weight.fill(1.0)
-                self.propagate_walkers(constraint_path=constraint_path)
-                #self.tprop_fbias = self.propagator.timer.tfbias
-                #self.tprop_ovlp = self.propagator.timer.tovlp
-                #self.tprop_update = self.propagator.timer.tupdate
-                #self.tprop_gf = self.propagator.timer.tgf
-                #self.tprop_vhs = self.propagator.timer.tvhs
-                #self.tprop_gemm = self.propagator.timer.tgemm
+            self.propagate_walkers(constraint_path=constraint_path)
+            self.tprop_update += time.time() - start 
 
             #start_clip = time.time()
             #if step > 1 and step <= num_eqlb_steps:
@@ -379,8 +367,7 @@ class LAFQMC(AFQMCBase):
             if step <= num_eqlb_steps:
                 if step % self.params.eq_pop_control_freq == 0:
                     start = time.time()
-                    log_average_weight = self.pcontrol_eq.pop_control(self.walkers, comm)
-                    self.post_pop_ctr(comm,log_average_weight)
+                    self.pop_ctr(comm,self.pcontrol_eq)
                     synchronize()
                     self.tpopc += time.time() - start
                     self.tpopc_send = self.pcontrol_eq.timer.send_time
@@ -390,8 +377,7 @@ class LAFQMC(AFQMCBase):
             else:
                 if step % self.params.pop_control_freq == 0:
                     start = time.time()
-                    log_average_weight = self.pcontrol.pop_control(self.walkers, comm)
-                    self.post_pop_ctr(comm,log_average_weight)
+                    self.pop_ctr(comm,self.pcontrol)
                     synchronize()
                     self.tpopc += time.time() - start
                     self.tpopc_send = self.pcontrol.timer.send_time
@@ -413,16 +399,14 @@ class LAFQMC(AFQMCBase):
                     self.estimate_energy(comm,block,max_nprod,max_nsum)
                     self.accumulators.zero()
                     self.save(comm,dirname)
-                    if comm.rank==0:
-                        print('time=',time.time()-t0)
+                    self.print_stats(comm,self.pcontrol)
             else:
                 if step % self.params.eq_num_steps_per_block == 0:
                     block = step // self.params.eq_num_steps_per_block
                     self.estimate_energy(comm,block,max_nprod,max_nsum)
                     self.accumulators.zero()
                     self.save(comm,dirname)
-                    if comm.rank==0:
-                        print('time=',time.time()-t0)
+                    self.print_stats(comm,self.pcontrol_eq)
             synchronize()
             self.testim += time.time() - start
 
@@ -444,23 +428,21 @@ class LAFQMC(AFQMCBase):
             #self.tstep += time.time() - start_step
 
     def propagate_walkers(self, constraint_path=True):
-        b = xp.ones(self.walkers.nwalkers)
-        # 1.compute gf
-        gf = self.hamiltonian.bare_gf
         nw = self.walkers.nwalkers
-        # 2.sample from gf
-        sign = xp.sign(gf)
-        p = xp.fabs(gf)
-        p /= p.sum()
+        b = xp.ones(nw)
+        # 1.compute probability 
+        p,sign = self.hamiltonian.compute_prob(self.walkers.D)
+
         for _ in range(self.num_updates_per_step): 
+            # 2.sample from gf
             kixs = xp.random.choice(p.size,size=nw,replace=True,p=p)
             b *= sign[kixs] 
     
             # 3.update walker
-            dmap,umap,wmap = self.hamiltonian.parse_sampled_rotations(to_host(kixs))
-            update_walkers(self.walkers,dmap,umap,wmap)
+            rotations = self.hamiltonian.parse_sampled_rotations(to_host(kixs))
+            update_walkers(self.walkers,rotations,lowdin=self.low_rank_lowdin)
             if not self.scalar_ovlp:
-                b = update_rdm1_and_ovlp(self.walkers,b,dmap,umap,wmap,eps_sq=self.eps_sq)
+                b = update_rdm1_and_ovlp(self.walkers,b,rotations,eps_sq=self.eps_sq)
         synchronize()
     
         # 4.update weight
@@ -473,31 +455,41 @@ class LAFQMC(AFQMCBase):
             if self.eps_sq is not None:
                 b /= self.walkers.R
 
-        nminus = len(b[b<0])
+        bminus = xp.nonzero(b<0.)[0] 
+        nminus = bminus.size
         if nminus>0: 
-            print('number of minus=',nminus)
+            if self.scalar_ovlp:
+                print('number of minus=',nminus)
+            else:
+                kixs = kixs[bminus]
+                kixs = to_host(kixs)
+                for kix in kixs:
+                    term = self.hamiltonian.terms[kix]
+                    print(f'term.chol_idx={term.chol_idx},d={term.d}')
+
         if constraint_path:
             xp.clip(b, a_min=0.0, a_max=None, out=b)  
         self.walkers.weight *= b 
         synchronize()
 
-    def post_pop_ctr(self,comm,log_average_weight):
+    def pop_ctr(self,comm,pcontrol,pre_estimate=True):
+        if self.params.pop_control_method=='stochastic_reconfiguration':
+            if pre_estimate: 
+                self.estimators.compute_estimators(self.system, self.hamiltonian, self.trial, self.walkers)
+        log_average_weight,rdm_iws = pcontrol.pop_control(self.walkers, comm)
         if self.params.pop_control_method!='stochastic_reconfiguration':
             return
-        compute_rdm1(self.walkers,self.trial,scalar_ovlp=False,eps_sq=self.eps_sq)
-        self.estimators.compute_estimators(
-            self.system, self.hamiltonian, self.trial, self.walkers
-        )
+        #print('niws=',rdm_iws.size)
+        compute_rdm1(self.walkers,self.trial,scalar_ovlp=False,eps_sq=self.eps_sq,iws=rdm_iws)
+        if not pre_estimate:
+            self.estimators.compute_estimators(self.system, self.hamiltonian, self.trial, self.walkers)
         self.estimators.post_sr(comm,self.accumulators,log_average_weight)
 
     def estimate_energy(self,comm,block,max_nprod,max_nsum):
         if self.params.pop_control_method=='stochastic_reconfiguration':
             self.estimators.print_block_sr(comm,block,self.accumulators,max_nprod,max_nsum)
         else:
-            compute_rdm1(self.walkers,self.trial,scalar_ovlp=False,eps_sq=self.eps_sq)
-            self.estimators.compute_estimators(
-                self.system, self.hamiltonian, self.trial, self.walkers
-            )
+            self.estimators.compute_estimators(self.system, self.hamiltonian, self.trial, self.walkers)
             self.estimators.print_block(comm, block, self.accumulators)
 
     def save(self,comm,dirname='.'):
@@ -510,3 +502,18 @@ class LAFQMC(AFQMCBase):
             return
         self.estimators.save(dirname)
 
+    def print_stats(self,comm,pcontrol):
+        if comm.rank>0:
+            return
+        ttot = self.tortho + self.tprop_update + self.tprop_barrier + self.tpopc + self.testim
+        print(f'total={ttot}, orth={self.tortho}, prop={self.tprop_update}, barrier={self.tprop_barrier}, pop ctr={self.tpopc}, estimate={self.testim}')
+        if self.params.pop_control_method!='stochastic_reconfiguration':
+            return
+        Neff = pcontrol.Neff
+        Neff = max(Neff),min(Neff)
+        Ndistinct = pcontrol.Ndistinct
+        Ndistinct = max(Ndistinct),min(Ndistinct)
+        w = self.estimators.log_average_weights
+        w = max(w),min(w)
+        w = float(numpy.exp(w[0])),float(numpy.exp(w[1]))
+        print(f'wmean={w},Neff={Neff},Ndistinct={Ndistinct}')
