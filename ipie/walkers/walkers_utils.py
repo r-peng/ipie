@@ -52,7 +52,7 @@ def preprocess_hamiltonian(hamiltonian,trial):
     hamiltonian.LB = [_UB(B,hamiltonian.chol) for Bi in psi]
 
 def _preprocess_walkers(walkers):
-    walkers.buff_names += ['weight','phase']
+    walkers.buff_names += ['phi','weight','phase']
     walkers.phase = xp.ones(walkers.nwalkers) 
     walkers.ovlp = xp.ones(walkers.nwalkers) 
     walkers.G = None
@@ -71,17 +71,17 @@ def preprocess(walkers:UHFWalkers,trial,hamiltonian)
     preprocess_trial(trial)
     preprocess_hamiltonian(hamiltonian)
 
-    walkers.phia = walkers.phia.real
-    if walkers.ndown>0:
-        walkers.phib = walkers.phib.real
+    if walkers.ndown==0:
+        walkers.phi = walkers.phia.real
     else:
-        walkers.phib = None
-    walkers.buff_names = ['phia','phib']
+        walkers.phi = xp.concatenate([walkers.phia.real,walkers.phib.real],axis=2)
+    walkers.phia = None
+    walkers.phib = None
     compute_ovlp(walkers,trial)
     if walkers.S is None:
-        walkers.buff_names += ['Sa','Sb']
+        walkers.buff_names = ['Sa','Sb']
     else:
-        walkers.buff_names += ['S']
+        walkers.buff_names = ['S']
     _preprocess_walkers(walkers)
 
 @plum.dispatch
@@ -91,31 +91,8 @@ def preprocess(walkers:GHFWalkers,trial,hamiltonian):
 
     walkers.phi = walkers.phi.real
     walkers.S = compute_ovlp(walkers,trial)
-    walkers.buff_names = ['phi','S']
+    walkers.buff_names = ['S']
     _preprocess_walkers(walkers)
-
-@plum.dispatch
-def parse_phi(walkers:UHFWalkers):
-    if walkers.phib is None:
-        return walkers.phia
-    return xp.concatenate([walkers.phia,walkers.phib],axis=2)
-
-@plum.dispatch
-def parse_phi(walkers:GHFWalkers):
-    return walkers.phi
-
-@plum.dispatch
-def load_phi(walkers:UHFWalkers,phi):
-    phi = xp.asarray(phi)
-    walkers.phia = phi[:,:,:walkers.nup]
-    if walkers.ndown>0:
-        walkers.phib = phi[:,:,walkers.nup:]
-    return walkers
-
-@plum.dispatch
-def load_phi(walkers:GHFWalkers,phi):
-    walkers.phi = xp.asarray(phi)
-    return walkers 
 
 def save_walkers(walkers,comm,dirname):
     RANK,SIZE = comm.rank,comm.size
@@ -123,7 +100,7 @@ def save_walkers(walkers,comm,dirname):
         obj = to_host(parse_phi(walkers)),to_host(walkers.weight)
         comm.send(obj,0)
         return
-    phi = [to_host(parse_phi(walkers))] + ([None] * (SIZE-1))
+    phi = [to_host(walkers.phi)] + ([None] * (SIZE-1))
     weights = [to_host(walkers.weight)] + ([None] * (SIZE-1))
     for r in range(1,SIZE):
         phi[r],weights[r] = comm.recv(source=r)
@@ -150,7 +127,7 @@ def load_walkers(walkers,comm,dirname):
     start = 0 if RANK==0 else counts[RANK-1]
     stop = counts[RANK]
     print(f'RANK={RANK},start={start},stop={stop}')
-    walkers = load_phi(walkers,phi[start:stop])
+    walkers.phi = phi[start:stop]
     walkers.weight = xp.asarray(weights[start:stop])
     return walkers
 
@@ -168,14 +145,22 @@ def _inv(ovlp):
 
 @plum.dispatch
 def compute_ovlp(walkers:UHFWalkers,trial:SingleDet):
-    phi = [walkers.phia,walkers.phib]
+    nu,nd = walkers.nup,walkers.ndown
+    if nd==0:
+        phi = [walkers.phi,None]
+    else:
+        phi = [walkers.phi[:,:,:nu],walkers.phi[:,:,nu:]]
     CB = [_ovlp(Ci,Bi) for Ci,Bi in zip(phi,trial.psi)] 
     walkers.Sa,walkers.Sb = [_inv(Si) for Si in CB]
     walkers.S = None
 
 @plum.dispatch
 def compute_ovlp(walkers:UHFWalkers,trial:SingleDetGHF):
-    phi = [walkers.phia,walkers.phib]
+    nu,nd = walkers.nup,walkers.ndown
+    if nd==0:
+        phi = [walkers.phi,None]
+    else:
+        phi = [walkers.phi[:,:,:nu],walkers.phi[:,:,nu:]]
     nb = trial.nbasis
     B = [trial.psi[:nb],trial.psi[nb:]]
     CB = [_ovlp(Ci,Bi) for Ci,Bi in zip(phi,B)] 
@@ -197,12 +182,16 @@ def _SC(S,C):
 
 @plum.dispatch
 def compute_SC(walkers:UHFWalkers):
+    nu,nd = walkers.nup,walkers.ndown
+    if nd==0:
+        phi = [walkers.phi,None]
+    else:
+        phi = [walkers.phi[:,:,:nu],walkers.phi[:,:,nu:]]
     if walkers.S is None:
         S = [walkers.Sa,walkers.Sb]
     else:
-        nu = walkers.nup
         S = [walkers.S[:,:,:nu],walkers.S[:,:,nu:]]
-    return [_SC(Si,Ci) for Si,Ci in zip(S,walkers.phi)]
+    return [_SC(Si,Ci) for Si,Ci in zip(S,phi)]
 
 @plum.dispatch
 def compute_SC(walkers:GHFWalkers):
@@ -470,37 +459,39 @@ def _lowdin_ovlp(S,w,p,delta,s):
 @plum.dispatch
 def update_walkers(walkers:UHFWalkers,rotations,b,lowdin=False,eps_sq=None):
     S = [walkers.Sa,walkers.Sb] if walkers.S is None else walkers.S
+    nu,nd = walkers.nup,walkers.ndown
+    if nd==0:
+        phi = [walkers.phi,None]
+    else:
+        phi = [walkers.phi[:,:,:nu],walkers.phi[:,:,nu:]]
     for typ in rotations.typs:
         w,d,d2,u,uB = rotations.get_data(typ)
         if w is None:
             continue
         if typ=='h2ab':
-            walkers.phia,Cua = _update_walkers(walkers.phia,w,d[:,:1],u[:,:,:1])
-            walkers.phib,Cub = _update_walkers(walkers.phib,w,d[:,1:],u[:,:,1:])
+            phi[0],Cua = _update_walkers(phi[0],w,d[:,:1],u[:,:,:1])
+            phi[1],Cub = _update_walkers(phi[1],w,d[:,1:],u[:,:,1:])
             S,b = _update_ovlp_2(S,b,w,[Cua,Cub],uB,d)
             if lowdin:
-                walkers.phia,pa,delta_a = _lowdin(walkers.phia,w,Cua,d[:,:1],d2[:,:1])
-                S = _lowdin_ovlp(S,w,pa,delta_a,0)
-                walkers.phib,pb,delta_b = _lowdin(walkers.phib,w,Cub,d[:,1:],d2[:,1:])
-                S = _lowdin_ovlp(S,w,pb,delta_b,1)
-            continue
-        if typ[-1]=='a':
-            walkers.phia,Cu = _update_walkers(walkers.phia,w,d,u)
-            S,b = _update_ovlp_1(S,b,w,Cu,uB[0],d,0)
-            if lowdin:
-                walkers.phia,p,delta = _lowdin(walkers.phia,w,Cu,d,d2)
+                phi[1],p,delta = _lowdin(phi[0],w,Cua,d[:,:1],d2[:,:1])
                 S = _lowdin_ovlp(S,w,p,delta,0)
-        else:
-            walkers.phib,Cu = _update_walkers(walkers.phib,w,d,u)
-            S,b = _update_ovlp_1(S,b,w,Cu,uB[1],d,1)
-            if lowdin:
-                walkers.phib,p,delta = _lowdin(walkers.phib,w,Cu,d,d2)
+                phi[1],p,delta = _lowdin(phi[1],w,Cub,d[:,1:],d2[:,1:])
                 S = _lowdin_ovlp(S,w,p,delta,1)
+            continue
+        s = {'a':0,'b':1}[typ[-1]]
+        phi[s],Cu = _update_walkers(phi[s],w,d,u)
+        S,b = _update_ovlp_1(S,b,w,Cu,uB[s],d,s)
+        if lowdin:
+            phi[s],p,delta = _lowdin(phi[s],w,Cu,d,d2)
+            S = _lowdin_ovlp(S,w,p,delta,s)
     if isinstance(S,list):
         walkers.Sa = S[0]
         walkers.Sb = S[1]
     else:
         walkers.S = S
+    walkers.phi[:,:,:nu] = phi[0]
+    if nd>0: 
+        walkers.phi[:,:,nu:] = phi[1]
     return b
 
 @plum.dispatch
@@ -545,19 +536,27 @@ def _lowdin_slow(C,thresh=1e-10):
 
 @plum.dispatch
 def update_walkers_slow(walkers:UHFWalkers,Us,lowdin=False):
+    nu,nd = walkers.nup,walkers.ndown
+    if nd==0:
+        phi = [walkers.phi,None]
+    else:
+        phi = [walkers.phi[:,:,:nu],walkers.phi[:,:,nu:]]
     for w,U in enumerate(Us):
         for s,Ui in enumerate(U):
             if walkers.phi[s] is None:
                 continue
             if Ui is None:
                 continue
-            walkers.phi[s][w] = xp.dot(U[s],walkers.phi[s][w])
+            phi[s][w] = xp.dot(U[s],phi[s][w])
     detR = xp.ones(walkers.nwalkers)
     if lowdin:
         for s in (0,1):
-            walkers.phi[s],detR_ = _lowdin_slow(walkers.phi[s])
+            phi[s],detR_ = _lowdin_slow(phi[s])
             if detR_ is not None:
                 detR *= detR_
+    walkers.phi[:,:,:nu] = phi[0]
+    if nd>0: 
+        walkers.phi[:,:,nu:] = phi[1]
     return detR
 
 @plum.dispatch
