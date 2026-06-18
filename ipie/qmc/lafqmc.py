@@ -41,11 +41,10 @@ from ipie.walkers.pop_controller_custom import PopController
 from ipie.qmc.afqmc import AFQMCBase
 from ipie.walkers.walkers_utils import (
         preprocess_walkers,
-        preprocess_trial,
+        preprocess_trial_and_hamiltonian,
         save_walkers,
         update_walkers,
-        update_rdm1_and_ovlp,
-        compute_rdm1,
+        compute_ovlp,
 )
     
 class LAFQMC(AFQMCBase):
@@ -246,7 +245,6 @@ class LAFQMC(AFQMCBase):
         additional_estimators: Optional[Dict[str, EstimatorBase]] = None,
         constraint_path=True,
         eps_sq=None,
-        num_updates_per_step=1,
         low_rank_lowdin=True,
         max_nprod=20,
         max_nsum=500,
@@ -267,13 +265,7 @@ class LAFQMC(AFQMCBase):
         num_eqlb_steps = self.params.num_eq_blocks * self.params.eq_num_steps_per_block
         total_steps = self.params.num_steps_per_block * self.params.num_blocks + num_eqlb_steps
         self.eps_sq = eps_sq
-        self.num_updates_per_step = num_updates_per_step
         self.low_rank_lowdin = low_rank_lowdin 
-        if self.num_updates_per_step==1:
-            self.scalar_ovlp = False
-        else:
-            self.scalar_ovlp = True 
-            self.low_rank_lowdin = False 
         if self.mpi_handler.comm.rank==0:
             print('num_eqlb_steps=',num_eqlb_steps)
             print('num_eq_stblz=',self.params.num_eq_stblz)
@@ -288,9 +280,6 @@ class LAFQMC(AFQMCBase):
         self.setup_timers()
         eshift = 0.0
         self.walkers.orthogonalise()
-        preprocess_walkers(self.walkers,scalar_ovlp=self.scalar_ovlp)
-        preprocess_trial(self.trial)
-        compute_rdm1(self.walkers,self.trial,scalar_ovlp=self.scalar_ovlp,eps_sq=self.eps_sq)
 
         self.pcontrol_eq = PopController(
             self.params.num_walkers,
@@ -314,6 +303,14 @@ class LAFQMC(AFQMCBase):
         self.get_env_info()
         # self.distribute_hamiltonian()
         self.copy_to_gpu()
+
+        start = time.time()
+        preprocess_walkers(self.walkers)
+        preprocess_trial_and_hamiltonian(self.trial,self.hamiltonian)
+        compute_ovlp(self.walkers,self.trial)
+        if self.mpi_handler.comm.rank==0:
+            print('preprocess time=',time.time()-start)
+
         self.setup_estimators(estimator_filename, additional_estimators=additional_estimators)
 
         synchronize()
@@ -428,44 +425,28 @@ class LAFQMC(AFQMCBase):
             #self.tstep += time.time() - start_step
 
     def propagate_walkers(self, constraint_path=True):
-        nw = self.walkers.nwalkers
-        b = xp.ones(nw)
         # 1.compute probability 
-        p,sign = self.hamiltonian.compute_prob(self.walkers.D)
+        p,sign = self.hamiltonian.compute_prob()
 
-        for _ in range(self.num_updates_per_step): 
-            # 2.sample from gf
-            kixs = xp.random.choice(p.size,size=nw,replace=True,p=p)
-            b *= sign[kixs] 
+        # 2.sample from gf
+        nw = self.walkers.nwalkers
+        kixs = xp.random.choice(p.size,size=nw,replace=True,p=p)
+        b = sign[kixs] 
     
-            # 3.update walker
-            rotations = self.hamiltonian.parse_sampled_rotations(to_host(kixs))
-            update_walkers(self.walkers,rotations,lowdin=self.low_rank_lowdin)
-            if not self.scalar_ovlp:
-                b = update_rdm1_and_ovlp(self.walkers,b,rotations,eps_sq=self.eps_sq)
+        # 3.update walker
+        rotations = self.hamiltonian.parse_sampled_rotations(to_host(kixs))
+        b = update_walkers(self.walkers,rotations,b,lowdin=self.low_rank_lowdin)
         synchronize()
     
         # 4.update weight
-        if self.scalar_ovlp:
-            b /= self.walkers.ovlp
-            if self.eps_sq is not None:
-                b *= self.walkers.R
-            compute_rdm1(self.walkers,self.trial,scalar_ovlp=self.scalar_ovlp,eps_sq=self.eps_sq)
-            b *= self.walkers.ovlp
-            if self.eps_sq is not None:
-                b /= self.walkers.R
-
         bminus = xp.nonzero(b<0.)[0] 
         nminus = bminus.size
         if nminus>0: 
-            if self.scalar_ovlp:
-                print('number of minus=',nminus)
-            else:
-                kixs = kixs[bminus]
-                kixs = to_host(kixs)
-                for kix in kixs:
-                    term = self.hamiltonian.terms[kix]
-                    print(f'term.chol_idx={term.chol_idx},d={term.d}')
+            kixs = kixs[bminus]
+            kixs = to_host(kixs)
+            for kix in kixs:
+                term = self.hamiltonian.terms[kix]
+                print(f'term.chol_idx={term.chol_idx},d={term.d}')
 
         if constraint_path:
             xp.clip(b, a_min=0.0, a_max=None, out=b)  
@@ -476,11 +457,9 @@ class LAFQMC(AFQMCBase):
         if self.params.pop_control_method=='stochastic_reconfiguration':
             if pre_estimate: 
                 self.estimators.compute_estimators(self.system, self.hamiltonian, self.trial, self.walkers)
-        log_average_weight,rdm_iws = pcontrol.pop_control(self.walkers, comm)
+        log_average_weight = pcontrol.pop_control(self.walkers, comm)
         if self.params.pop_control_method!='stochastic_reconfiguration':
             return
-        #print('niws=',rdm_iws.size)
-        compute_rdm1(self.walkers,self.trial,scalar_ovlp=False,eps_sq=self.eps_sq,iws=rdm_iws)
         if not pre_estimate:
             self.estimators.compute_estimators(self.system, self.hamiltonian, self.trial, self.walkers)
         self.estimators.post_sr(comm,self.accumulators,log_average_weight)

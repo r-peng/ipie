@@ -24,14 +24,14 @@ class PopController(PopController_):
         walkers.weight = xp.fabs(walkers.weight)
         w = walkers.weight
         walkers.unscaled_weight = walkers.weight
-        invalid_iws,average_weight,Neff,Ndistinct = stochastic_reconfiguration(walkers, comm, self.timer, pop_control_counter=self.pop_control_counter)
+        average_weight,Neff,Ndistinct = stochastic_reconfiguration(walkers, comm, self.timer, pop_control_counter=self.pop_control_counter)
         if self.pop_control_counter == 0:
             self.Neff = []
             self.Ndistinct = []
         self.Neff.append(Neff)
         self.Ndistinct.append(Ndistinct)
         self.pop_control_counter += 1
-        return numpy.log(average_weight),invalid_iws
+        return numpy.log(average_weight)
 
 def stochastic_reconfiguration(
     walkers,
@@ -133,7 +133,6 @@ def stochastic_reconfiguration(
     # Post all nonblocking recvs, saving a Status for each to inspect later
     walker_len = get_buffer(walkers, 0).shape[0]
     recv_reqs = []
-    invalid_iws = []
     for irecv, (src_idx, dest_idx) in enumerate(local_recv):
         iw = dest_idx % nwalkers
         src_rank = src_idx // nwalkers
@@ -143,7 +142,6 @@ def stochastic_reconfiguration(
         status = MPI.Status()
         req = comm.Irecv(recv_buf, source=int(src_rank), tag=int(tag_recv))
         recv_reqs.append((iw, recv_buf, status, req))
-        invalid_iws.append(iw)
 
     # Wait on recvs and inspect their Status
     for iw, buf, status, req in recv_reqs:
@@ -159,4 +157,4 @@ def stochastic_reconfiguration(
     #walkers.weight[:] = new_average_weight
     walkers.weight = walkers.phase
     timer.add_non_communication()
-    return xp.asarray(invalid_iws,dtype=int),new_average_weight,Neff,Ndistinct
+    return new_average_weight,Neff,Ndistinct

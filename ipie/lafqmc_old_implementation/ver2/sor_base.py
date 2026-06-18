@@ -45,57 +45,9 @@ class Rotation:
             U[s] = xp.einsum('xp,yp,p->xy',v,v,diag)
         return U
 
-class Rotations:
-    def __init__(self):
-        self.data = dict()
-        self.typs = 'h1a','h1b','h2a','h2b','h2ab'
-        self.keys = 'w','d','d2','u','uBa','uBb'
-        for typ in self.typs:
-            self.data[typ] = {key:[] for key in self.keys}
-
-    def add_term(self,term,w,U,UBa,UBb):
-        typ = term.typ
-        p = term.p
-        self.data[typ]['w'].append(w)
-        self.data[typ]['d'].append(term.d)
-        self.data[typ]['d2'].append(term.d2)
-        self.data[typ]['u'].append(U[:,p])
-        if typ=='h2ab':
-            self.data[typ]['uBa'].append(UBa[p[:1]])
-            if UBb is None: 
-                return
-            self.data[typ]['uBb'].append(UBb[p[1:]])
-            return
-        if typ[-1]=='a':
-            self.data[typ]['uBa'].append(UBa[p])
-            return
-        if UBb is None:
-            return
-        self.data[typ]['uBb'].append(UBb[p])
-
-    def parse_terms(self):
-        for typ in self.typs:
-            for key in self.keys:
-                dat = self.data[typ][key]
-                if len(dat)==0:
-                    dat = None
-                else:
-                    dat = xp.asarray(dat) 
-                self.data[typ][key] = dat 
-
-    def get_data(self,typ):
-        w = self.data[typ]['w']
-        d = self.data[typ]['d']
-        d2 = self.data[typ]['d2']
-        u = self.data[typ]['u']
-        uB = [self.data[typ]['uBa'],self.data[typ]['uBb']]
-        return w,d,d2,u,uB
-
 class SumOfRotationBase:
 
     def __init__(self,sample_method=0):
-        self.h1e = None
-        self.chol = None
         self.chol_basis = []
         self.terms = [] 
         self.coeffs = []
@@ -187,17 +139,21 @@ class SumOfRotationBase:
         sign = self.coeffs / p
         return p,sign
 
-    def parse_sampled_rotations(self,kixs):
-        rotations = Rotations() 
-        for w,kix in enumerate(kixs):
-            term = self.terms[kix]
-            chol_idx = term.chol_idx
-            U = self.chol_basis[chol_idx]
-            UBa = self.UB[0][chol_idx]
-            UBb = None if self.UB[1] is None else self.UB[1][chol_idx]
-            rotations.add_term(self.terms[kix],w,U,UBa,UBb)
-        rotations.parse_terms()
-        return rotations
+    #def parse_sampled_rotations(self,kixs):
+    #    rotations = dict()
+    #    for w,kix in enumerate(kixs):
+    #        term = self.terms[kix]
+    #        typ = term.typ
+    #        if typ not in rotations:
+    #            rotations[typ] = {'d':[],'d2':[],'u':[],'w':[]}
+    #        rotations[typ]['w'].append(w)
+    #        rotations[typ]['d'].append(term.d)
+    #        rotations[typ]['d2'].append(term.d2)
+    #        rotations[typ]['u'].append(self.chol_basis[term.chol_idx][:,term.p])
+    #    for typ in rotations:
+    #        for key in ['w','d','d2','u']:
+    #            rotations[typ][key] = xp.asarray(rotations[typ][key]) 
+    #    return rotations
 
     def parse_sampled_rotations_slow(self,kixs):
         Us = [None] * len(kixs)
@@ -205,6 +161,21 @@ class SumOfRotationBase:
             term = self.terms[kix]
             Us[w] = term.get_rotation_matrix(self.chol_basis[term.chol_idx])
         return Us
+
+    def local_energy(self,walkers):
+        D = walkers.D 
+        if isinstance(D,list):
+            Daa,Dbb = D
+            Dab = Dba = None
+        else:
+            nb = self.nbasis
+            Daa,Dab,Dba,Dbb = D[:,:nb,:nb],D[:,:nb,nb:],D[:,nb:,:nb],D[:,nb:,nb:]
+
+        E1 = xp.einsum('ij,wij->w',self.h1e,Daa)
+        if Dbb is not None:
+            E1 += xp.einsum('ij,wij->w',self.h1e,Dbb)
+        E2 = self.compute_E2(Daa,Dbb,Dab=Dab,Dba=Dba)
+        return E1+E2,E1,E2
 
     def _get_MB_gf(self,basis):
         H = 0
@@ -228,19 +199,26 @@ class HubbardSOR(SumOfRotationBase):
     def __init__(self,h1e,U):
         super().__init__()
         self.h1e = xp.asarray(h1e)
-        self.hubbard_U = U
+        self.U = U
         self.v0 = -0.5*U*xp.eye(self.h1e.shape[0]) 
 
     def decompose_h2(self,gu,iprint=0,nelec=None):
         self.chol_basis.append(xp.eye(self.nbasis))
         chol_idx = len(self.chol_basis)-1
 
-        ai = self.hubbard_U/(np.cosh(gu)-1)/4
+        ai = self.U/(np.cosh(gu)-1)/4
         if iprint>0:
             print(f'eta={gu},ai={ai}')
         for i in range(self.nbasis): 
             self.add_term(ai,chol_idx,'h2ab',[i,i],[gu,-gu])
             self.add_term(ai,chol_idx,'h2ab',[i,i],[-gu,gu])
+
+    def compute_E2(self,Daa,Dbb,Dab=None,Dba=None):
+        E2 = xp.einsum('wii,wii->w',Daa,Dbb)
+        if Dab is None:
+            return E2*self.U
+        E2 -= xp.einsum('wii,wii->w',Dab,Dba)
+        return E2*self.U
 
 class QCSOR(SumOfRotationBase):
 
@@ -276,6 +254,25 @@ class QCSOR(SumOfRotationBase):
                     self.add_term(aisq,chol_idx,'h2b',[p,q],[eta_p,eta_q])
                 self.add_term(aisq,chol_idx,'h2ab',[p,q],[eta_p,eta_q])
                 self.add_term(aisq,chol_idx,'h2ab',[q,p],[eta_q,eta_p])
+
+    def compute_E2(self,Daa,Dbb,Dab=None,Dba=None):
+        E2 = 0
+        for i,L in enumerate(self.chol):
+            DaaL = xp.einsum('wpq,qr->wpr',Daa,L)
+            E2_1 = xp.einsum('wpp->w',DaaL)
+            if Dbb is not None:
+                DbbL = xp.einsum('wpq,qr->wpr',Dbb,L)
+                E2_1 += xp.einsum('wpp->w',DbbL)
+            E2 += E2_1**2
+
+            E2 -= xp.einsum('wpq,wqp->w',DaaL,DaaL)
+            if Dbb is not None:
+                E2 -= xp.einsum('wpq,wqp->w',DbbL,DbbL)
+            if Dab is not None:
+                DabL = xp.einsum('wpq,qr->wpr',Dab,L)
+                DbaL = xp.einsum('wpq,qr->wpr',Dba,L)
+                E2 -= 2.*xp.einsum('wpq,wqp->w',DabL,DbaL)
+        return 0.5*E2
 
 ##### MB helper fxns #####
 def quadratic2MB(M,basis,spin,thresh=1e-6):
