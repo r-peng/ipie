@@ -16,7 +16,7 @@ def _preprocess_trial(trial):
     trial.Ghalf = None
 
 @plum.dispatch
-def preprocess_trial(trial:SingleDet)
+def preprocess_trial(trial:SingleDet):
     trial.psi = [trial.psi0a.real,None]
     if trial.nelec[1]>0:
         trial.psi[1] = trial.psi0b.real
@@ -49,7 +49,7 @@ def preprocess_hamiltonian(hamiltonian,trial):
 
     if hamiltonian.chol is None:
         return
-    hamiltonian.LB = [_UB(B,hamiltonian.chol) for Bi in psi]
+    hamiltonian.LB = [_UB(Bi,hamiltonian.chol) for Bi in psi]
 
 def _preprocess_walkers(walkers):
     walkers.buff_names += ['phi','weight','phase']
@@ -67,9 +67,9 @@ def _preprocess_walkers(walkers):
     walkers.walker_buffer = xp.zeros(walkers.buff_size)
 
 @plum.dispatch
-def preprocess(walkers:UHFWalkers,trial,hamiltonian)
+def preprocess(walkers:UHFWalkers,trial,hamiltonian):
     preprocess_trial(trial)
-    preprocess_hamiltonian(hamiltonian)
+    preprocess_hamiltonian(hamiltonian,trial)
 
     if walkers.ndown==0:
         walkers.phi = walkers.phia.real
@@ -87,17 +87,17 @@ def preprocess(walkers:UHFWalkers,trial,hamiltonian)
 @plum.dispatch
 def preprocess(walkers:GHFWalkers,trial,hamiltonian):
     preprocess_trial(trial)
-    preprocess_hamiltonian(hamiltonian)
+    preprocess_hamiltonian(hamiltonian,trial)
 
     walkers.phi = walkers.phi.real
-    walkers.S = compute_ovlp(walkers,trial)
+    compute_ovlp(walkers,trial)
     walkers.buff_names = ['S']
     _preprocess_walkers(walkers)
 
 def save_walkers(walkers,comm,dirname):
     RANK,SIZE = comm.rank,comm.size
     if RANK>0:
-        obj = to_host(parse_phi(walkers)),to_host(walkers.weight)
+        obj = to_host(walkers.phi),to_host(walkers.weight)
         comm.send(obj,0)
         return
     phi = [to_host(walkers.phi)] + ([None] * (SIZE-1))
@@ -314,12 +314,13 @@ def local_energy(hamiltonian:QCSOR,walkers,trial:SingleDetGHF):
 #    else:
 #        walkers.R[iws] = R
 
-def _update_walkers(C,w,d,u):
+def _update_walkers(C,w,d,u,update_C=True):
     if C is None:
-        return C,None
-    uC = xp.einsum('wxr,wxi->wri',u,C[w])
-    C[w] += xp.einsum('wxr,wr,wri->wxi',u,d,uC)
-    return C,uC.transpose(0,2,1)
+        return None,None
+    Cu = xp.einsum('wxi,wxr->wir',C[w],u)
+    if update_C:
+        C[w] += xp.einsum('wxr,wir->wxi',u*d[:,None,:],Cu)
+    return C,Cu
 
 def _multiply_Cu(S,Cu,s):
     ne = Cu.shape[1]
@@ -339,7 +340,7 @@ def _multiply_uB(S,uB,s):
     else:
         return xp.einsum('wri,wij->wrj',uB,S[:,-ne:])
 
-def _compute_ovlp_update(uDu,d,SCu,uBS,thresh=1e4):
+def _compute_ovlp_update(uDu,d,SCu,uBS,thresh=1e4,update_S=True):
     r = d.shape[-1]
     M = xp.eye(r)[None,:,:] + d[:,:,None] * uDu
     detM = xp.linalg.det(M)
@@ -351,6 +352,8 @@ def _compute_ovlp_update(uDu,d,SCu,uBS,thresh=1e4):
         print('before inverse')
         print('M=',to_host(M))
         exit()
+    if not update_S:
+        return detM,None
 
     M = xp.linalg.inv(M)*d[:,None,:]
     if xp.linalg.norm(M)>thresh or xp.count_nonzero(xp.isnan(M))>0:
@@ -362,7 +365,7 @@ def _compute_ovlp_update(uDu,d,SCu,uBS,thresh=1e4):
     S1 = xp.einsum('wir,wrj->wij',S1,uBS)
     return detM,S1
 
-def _update_ovlp_1(S,b,w,Cu,uB,d,s):
+def _update_ovlp_1(S,b,w,Cu,uB,d,s,update_S=True):
     if Cu is None:
         return S,b
     if uB is None:
@@ -377,20 +380,21 @@ def _update_ovlp_1(S,b,w,Cu,uB,d,s):
     SCu = _multiply_Cu(Sw,Cu,s)
     uBS = _multiply_uB(Sw,uB,s)
     uDu = _multiply_uB(SCu,uB,s)
-    detM,S1 = _compute_ovlp_update(uDu,d,SCu,uBS) 
+    detM,S1 = _compute_ovlp_update(uDu,d,SCu,uBS,update_S=update_S) 
     b[w] *= detM 
-    if isinstance(S,list):
-        S[s][w] -= S1
-    else:
-        S[w] -= S1
+    if update_S:
+        if isinstance(S,list):
+            S[s][w] -= S1
+        else:
+            S[w] -= S1
     return S,b
 
-def _update_ovlp_2(S,b,w,Cu,uB,d):
+def _update_ovlp_2(S,b,w,Cu,uB,d,update_S=True):
     if isinstance(S,list):
         assert isinstance(Cu,list)
         assert isinstance(uB,list)
-        S,b = _update_ovlp_1(S,b,w,Cu[0],uB[0],d[:,:1],0)
-        S,b = _update_ovlp_1(S,b,w,Cu[1],uB[1],d[:,1:],1)
+        S,b = _update_ovlp_1(S,b,w,Cu[0],uB[0],d[:,:1],0,update_S=update_S)
+        S,b = _update_ovlp_1(S,b,w,Cu[1],uB[1],d[:,1:],1,update_S=update_S)
         return S,b
     Sw = S[w]
     nw,ne,_ = Sw.shape
@@ -410,9 +414,10 @@ def _update_ovlp_2(S,b,w,Cu,uB,d):
     if uB[1] is not None:
         uDu[:,1:] = _multiply_uB(SCu,uB[1],1)
 
-    detM,S1 = _compute_ovlp_update(uDu,d,SCu,uBS) 
+    detM,S1 = _compute_ovlp_update(uDu,d,SCu,uBS,update_S=update_S) 
     b[w] *= detM 
-    S[w] -= S1
+    if update_S:
+        S[w] -= S1
     return S,b
 
 def _lowdin(C,w,Cu,d,d2): 
@@ -457,13 +462,24 @@ def _lowdin_ovlp(S,w,p,delta,s):
     return S
 
 @plum.dispatch
-def update_walkers(walkers:UHFWalkers,rotations,b,lowdin=False,eps_sq=None):
+def _parse_update(walkers:UHFWalkers):
     S = [walkers.Sa,walkers.Sb] if walkers.S is None else walkers.S
     nu,nd = walkers.nup,walkers.ndown
     if nd==0:
         phi = [walkers.phi,None]
     else:
         phi = [walkers.phi[:,:,:nu],walkers.phi[:,:,nu:]]
+    return phi,S
+
+@plum.dispatch
+def _parse_update(walkers:GHFWalkers):
+    nb = walkers.nbasis
+    phi = [walkers.phi[:,:nb],walkers.phi[:,nb:]]
+    return phi,walkers.S
+
+@plum.dispatch
+def update_walkers(walkers:UHFWalkers,rotations,b,lowdin=False,eps_sq=None):
+    phi,S = _parse_update(walkers)
     for typ in rotations.typs:
         w,d,d2,u,uB = rotations.get_data(typ)
         if w is None:
@@ -473,7 +489,7 @@ def update_walkers(walkers:UHFWalkers,rotations,b,lowdin=False,eps_sq=None):
             phi[1],Cub = _update_walkers(phi[1],w,d[:,1:],u[:,:,1:])
             S,b = _update_ovlp_2(S,b,w,[Cua,Cub],uB,d)
             if lowdin:
-                phi[1],p,delta = _lowdin(phi[0],w,Cua,d[:,:1],d2[:,:1])
+                phi[0],p,delta = _lowdin(phi[0],w,Cua,d[:,:1],d2[:,:1])
                 S = _lowdin_ovlp(S,w,p,delta,0)
                 phi[1],p,delta = _lowdin(phi[1],w,Cub,d[:,1:],d2[:,1:])
                 S = _lowdin_ovlp(S,w,p,delta,1)
@@ -489,6 +505,7 @@ def update_walkers(walkers:UHFWalkers,rotations,b,lowdin=False,eps_sq=None):
         walkers.Sb = S[1]
     else:
         walkers.S = S
+    nu,nd = walkers.nup,walkers.ndown
     walkers.phi[:,:,:nu] = phi[0]
     if nd>0: 
         walkers.phi[:,:,nu:] = phi[1]
@@ -521,6 +538,22 @@ def update_walkers(walkers:GHFWalkers,rotations,b,lowdin=False,eps_sq=None):
             walkers.S = _lowdin_ovlp(walkers.S,w,p,delta,None)
     return b
 
+def compute_ovlp_ratio(walkers,rotations,b):
+    phi,S = _parse_update(walkers)
+    for typ in rotations.typs:
+        w,d,d2,u,uB = rotations.get_data(typ)
+        if w is None:
+            continue
+        if typ=='h2ab':
+            _,Cua = _update_walkers(phi[0],w,d[:,:1],u[:,:,:1],update_C=False)
+            _,Cub = _update_walkers(phi[1],w,d[:,1:],u[:,:,1:],update_C=False)
+            _,b = _update_ovlp_2(S,b,w,[Cua,Cub],uB,d,update_S=False)
+            continue
+        s = {'a':0,'b':1}[typ[-1]]
+        _,Cu = _update_walkers(phi[s],w,d,u,update_C=False)
+        _,b = _update_ovlp_1(S,b,w,Cu,uB[s],d,s,update_S=False)
+    return b
+
 def _lowdin_slow(C,thresh=1e-10):
     if C is None:
         return C,None
@@ -543,7 +576,7 @@ def update_walkers_slow(walkers:UHFWalkers,Us,lowdin=False):
         phi = [walkers.phi[:,:,:nu],walkers.phi[:,:,nu:]]
     for w,U in enumerate(Us):
         for s,Ui in enumerate(U):
-            if walkers.phi[s] is None:
+            if phi[s] is None:
                 continue
             if Ui is None:
                 continue
