@@ -62,15 +62,19 @@ def sample_minibatch(hamiltonian,walkers,K):
     nw = walkers.nwalkers
     nterms = hamiltonian.nterms
 
-    kixs = [None] * nw
+    minibatch_kixs = [None] * nw
     for i in range(nw):
-        kixs[i] = xp.random.choice(nterms,size=K,replace=False)
-    kixs = xp.asarray(kixs).T
+        minibatch_kixs[i] = xp.random.choice(nterms,size=K,replace=False)
+    minibatch_kixs = xp.asarray(minibatch_kixs).T
+    minibatch_kixs_host = to_host(minibatch_kixs)
 
     b = xp.ones((K,nw))
-    for i,kix in enumerate(kixs):
+    for i in range(K):
+        kix = minibatch_kixs[i]
         b[i] = hamiltonian.coeffs[kix]
-        rotations = hamiltonian.parse_sampled_rotations(to_host(kix))
+
+        kix = minibatch_kixs_host[i]
+        rotations = hamiltonian.parse_sampled_rotations(kix)
         b[i] = compute_ovlp_ratio(walkers,rotations,b[i])
     
     p = xp.fabs(b)
@@ -78,9 +82,10 @@ def sample_minibatch(hamiltonian,walkers,K):
     p /= B[None,:] 
     kixs = [None] * nw
     for i in range(nw):
-        kix = xp.random.choice(K,p=p[:,i])
-        B[i] *= xp.sign(b[kix,i])
-        kixs[i] = kix
+        k = xp.random.choice(K,p=p[:,i])
+        B[i] *= xp.sign(b[k,i])
+
+        kixs[i] = minibatch_kixs[k,i]
     kixs = xp.asarray(kixs)
     B *= nterms/K
     return kixs,B
@@ -526,8 +531,10 @@ class LAFQMC(AFQMCBase):
             return
         Neff = pcontrol.Neff
         Neff = max(Neff),min(Neff)
+        pcontrol.Neff = []
         Ndistinct = pcontrol.Ndistinct
         Ndistinct = max(Ndistinct),min(Ndistinct)
+        pcontrol.Ndistinct = []
         w = self.estimators.log_average_weights
         w = max(w),min(w)
         w = float(numpy.exp(w[0])),float(numpy.exp(w[1]))

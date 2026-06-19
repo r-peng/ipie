@@ -348,19 +348,10 @@ def _compute_ovlp_update(uDu,d,SCu,uBS,thresh=1e4,update_S=True):
         print('detM=',detM)
         exit()
 
-    if xp.linalg.norm(detM)>thresh or xp.count_nonzero(xp.isnan(detM))>0:
-        print('before inverse')
-        print('M=',to_host(M))
-        exit()
     if not update_S:
         return detM,None
 
     M = xp.linalg.inv(M)*d[:,None,:]
-    if xp.linalg.norm(M)>thresh or xp.count_nonzero(xp.isnan(M))>0:
-        print('after inverse')
-        print('M=',to_host(M))
-        exit()
-
     S1 = xp.einsum('wir,wrs->wis',SCu,M)
     S1 = xp.einsum('wir,wrj->wij',S1,uBS)
     return detM,S1
@@ -377,6 +368,7 @@ def _update_ovlp_1(S,b,w,Cu,uB,d,s,update_S=True):
         Sw = S[s][w]
     else:
         Sw = S[w]
+
     SCu = _multiply_Cu(Sw,Cu,s)
     uBS = _multiply_uB(Sw,uB,s)
     uDu = _multiply_uB(SCu,uB,s)
@@ -477,8 +469,24 @@ def _parse_update(walkers:GHFWalkers):
     phi = [walkers.phi[:,:nb],walkers.phi[:,nb:]]
     return phi,walkers.S
 
+def _check_nan(T,typ,txt):
+    if xp.count_nonzero(xp.isnan(T))>0:
+        print(f'{txt} {typ} contains Nan')
+        exit()
+
+def check_nan(walkers,txt):
+    _check_nan(walkers.phi,'phi',txt)
+    if walkers.S is None:
+        _check_nan(walkers.Sa,'Sa',txt)
+        if walkers.Sb is None:
+            return
+        _check_nan(walkers.Sb,'Sb',txt)
+    else:
+        _check_nan(walkers.S,'S',txt)
+
 @plum.dispatch
 def update_walkers(walkers:UHFWalkers,rotations,b,lowdin=False,eps_sq=None):
+    check_nan(walkers,'pre update')
     phi,S = _parse_update(walkers)
     for typ in rotations.typs:
         w,d,d2,u,uB = rotations.get_data(typ)
@@ -509,10 +517,12 @@ def update_walkers(walkers:UHFWalkers,rotations,b,lowdin=False,eps_sq=None):
     walkers.phi[:,:,:nu] = phi[0]
     if nd>0: 
         walkers.phi[:,:,nu:] = phi[1]
+    check_nan(walkers,'post update')
     return b
 
 @plum.dispatch
 def update_walkers(walkers:GHFWalkers,rotations,b,lowdin=False,eps_sq=None):
+    check_nan(walkers,'pre update')
     nb = walkers.nbasis
     for typ in rotations.typs:
         w,d,d2,u,uB = rotations.get_data(typ)
@@ -536,9 +546,11 @@ def update_walkers(walkers:GHFWalkers,rotations,b,lowdin=False,eps_sq=None):
         if lowdin:
             walkers.phi,p,delta = _lowdin(walkers.phi,w,Cu,d,d2)
             walkers.S = _lowdin_ovlp(walkers.S,w,p,delta,None)
+    check_nan(walkers,'post update')
     return b
 
 def compute_ovlp_ratio(walkers,rotations,b):
+    check_nan(walkers,'compute ovlp ratio')
     phi,S = _parse_update(walkers)
     for typ in rotations.typs:
         w,d,d2,u,uB = rotations.get_data(typ)
