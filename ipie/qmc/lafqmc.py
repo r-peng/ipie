@@ -46,7 +46,7 @@ from ipie.walkers.walkers_utils import (
         compute_ovlp_ratio,
 )
    
-def sample_simple(hamiltonian,walkers):
+def propagate_walkers_simple(hamiltonian,walkers,lowdin=True):
     nw = walkers.nwalkers
     nterms = hamiltonian.nterms
 
@@ -56,9 +56,13 @@ def sample_simple(hamiltonian,walkers):
     # 2.sample from gf
     kixs = xp.random.choice(nterms,size=nw,replace=True,p=p)
     b = sign[kixs] 
+
+    # 3.update walker
+    rotations = hamiltonian.parse_sampled_rotations(to_host(kixs))
+    b = update_walkers(walkers,rotations,b=b,lowdin=lowdin)
     return kixs,b
 
-def sample_minibatch(hamiltonian,walkers,K):
+def propagate_walkers_minibatch(hamiltonian,walkers,K,lowdin=True):
     nw = walkers.nwalkers
     nterms = hamiltonian.nterms
 
@@ -88,6 +92,9 @@ def sample_minibatch(hamiltonian,walkers,K):
         kixs[i] = minibatch_kixs[k,i]
     kixs = xp.asarray(kixs)
     B *= nterms/K
+
+    rotations = hamiltonian.parse_sampled_rotations(to_host(kixs))
+    update_walkers(walkers,rotations,lowdin=lowdin)
     return kixs,B
 
 class LAFQMC(AFQMCBase):
@@ -289,7 +296,7 @@ class LAFQMC(AFQMCBase):
         constraint_path=True,
         minibatch_size=1,
         eps_sq=None,
-        low_rank_lowdin=True,
+        lowdin=True,
         max_nprod=20,
         max_nsum=500,
         dirname='.',
@@ -309,7 +316,6 @@ class LAFQMC(AFQMCBase):
         num_eqlb_steps = self.params.num_eq_blocks * self.params.eq_num_steps_per_block
         total_steps = self.params.num_steps_per_block * self.params.num_blocks + num_eqlb_steps
         self.eps_sq = eps_sq
-        self.low_rank_lowdin = low_rank_lowdin 
         if self.mpi_handler.comm.rank==0:
             print('num_eqlb_steps=',num_eqlb_steps)
             print('num_eq_stblz=',self.params.num_eq_stblz)
@@ -361,7 +367,7 @@ class LAFQMC(AFQMCBase):
 
         for step in range(1, total_steps + 1):
             synchronize()
-            if not self.low_rank_lowdin:
+            if not lowdin:
                 start_step = time.time()
                 if step <= num_eqlb_steps:
                     if step % self.params.num_eq_stblz == 0:
@@ -377,7 +383,7 @@ class LAFQMC(AFQMCBase):
                         self.tortho += time.time() - start
 
             start = time.time()
-            self.propagate_walkers(constraint_path=constraint_path,minibatch_size=minibatch_size)
+            self.propagate_walkers(lowdin=lowdin,constraint_path=constraint_path,minibatch_size=minibatch_size)
             self.tprop_update += time.time() - start 
 
             #start_clip = time.time()
@@ -466,17 +472,13 @@ class LAFQMC(AFQMCBase):
             #synchronize()
             #self.tstep += time.time() - start_step
 
-    def propagate_walkers(self, constraint_path=True, minibatch_size=1):
+    def propagate_walkers(self, lowdin=True, constraint_path=True, minibatch_size=1):
         if minibatch_size==1:
-            kixs,b = sample_simple(self.hamiltonian,self.walkers)
+            kixs,b = propagate_walkers_simple(self.hamiltonian,self.walkers,lowdin=lowdin)
         elif minibatch_size<self.hamiltonian.nterms:
-            kixs,b = sample_minibatch(self.hamiltonian,self.walkers,minibatch_size)
+            kixs,b = propagate_walkers_minibatch(self.hamiltonian,self.walkers,minibatch_size)
         else:
             raise NotImplementedError
-
-        # 3.update walker
-        rotations = self.hamiltonian.parse_sampled_rotations(to_host(kixs))
-        b = update_walkers(self.walkers,rotations,b,lowdin=self.low_rank_lowdin)
         synchronize()
     
         # 4.update weight
