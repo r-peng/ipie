@@ -93,13 +93,14 @@ class Rotations:
 
 class SumOfRotationBase:
 
-    def __init__(self,sample_method=0):
+    def __init__(self,sample_method=0,apply_spin_down=True):
         self.h1e = None
         self.chol = None
         self.chol_basis = []
         self.terms = [] 
         self.coeffs = []
         self.sample_method = sample_method
+        self.apply_spin_down = apply_spin_down
 
         # additional saved quantites 
         if self.sample_method==0:
@@ -155,7 +156,8 @@ class SumOfRotationBase:
 
         for k,eta_k in enumerate(eta):
             self.add_term(at,chol_idx,'h1a',[k],[eta_k])
-            self.add_term(at,chol_idx,'h1b',[k],[eta_k])
+            if self.apply_spin_down:
+                self.add_term(at,chol_idx,'h1b',[k],[eta_k])
         return ek
 
     def parse_decomposition(self,iprint=0):
@@ -225,8 +227,8 @@ class SumOfRotationBase:
 
 class HubbardSOR(SumOfRotationBase):
 
-    def __init__(self,h1e,U):
-        super().__init__()
+    def __init__(self,h1e,U,**kwargs):
+        super().__init__(**kwargs)
         self.h1e = xp.asarray(h1e)
         self.hubbard_U = U
         self.v0 = -0.5*U*xp.eye(self.h1e.shape[0]) 
@@ -238,14 +240,15 @@ class HubbardSOR(SumOfRotationBase):
         ai = self.hubbard_U/(np.cosh(gu)-1)/4
         if iprint>0:
             print(f'eta={gu},ai={ai}')
+        assert self.apply_spin_down
         for i in range(self.nbasis): 
             self.add_term(ai,chol_idx,'h2ab',[i,i],[gu,-gu])
             self.add_term(ai,chol_idx,'h2ab',[i,i],[-gu,gu])
 
 class QCSOR(SumOfRotationBase):
 
-    def __init__(self,h1e,chol):
-        super().__init__()
+    def __init__(self,h1e,chol,**kwargs):
+        super().__init__(**kwargs)
         self.h1e = xp.asarray(h1e)
         self.chol = xp.asarray(chol)
         self.v0 = .5*xp.einsum('npr,nrs->ps',self.chol,self.chol) 
@@ -270,12 +273,18 @@ class QCSOR(SumOfRotationBase):
                 eta_q = eta_plus[q]
                 if p==q:
                     self.add_term(aisq,chol_idx,'h1a',[p],[eta_p+eta_q])
-                    self.add_term(aisq,chol_idx,'h1b',[p],[eta_p+eta_q])
+                    if self.apply_spin_down: 
+                        self.add_term(aisq,chol_idx,'h1b',[p],[eta_p+eta_q])
                 else:
                     self.add_term(aisq,chol_idx,'h2a',[p,q],[eta_p,eta_q])
-                    self.add_term(aisq,chol_idx,'h2b',[p,q],[eta_p,eta_q])
-                self.add_term(aisq,chol_idx,'h2ab',[p,q],[eta_p,eta_q])
-                self.add_term(aisq,chol_idx,'h2ab',[q,p],[eta_q,eta_p])
+                    if self.apply_spin_down: 
+                        self.add_term(aisq,chol_idx,'h2b',[p,q],[eta_p,eta_q])
+                if self.apply_spin_down:
+                    self.add_term(aisq,chol_idx,'h2ab',[p,q],[eta_p,eta_q])
+                    self.add_term(aisq,chol_idx,'h2ab',[q,p],[eta_q,eta_p])
+                else:
+                    self.add_term(aisq,chol_idx,'h1a',[p],[eta_p])
+                    self.add_term(aisq,chol_idx,'h1a',[q],[eta_q])
 
 ##### MB helper fxns #####
 def quadratic2MB(M,basis,spin,thresh=1e-6):

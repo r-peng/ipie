@@ -428,6 +428,8 @@ def _lowdin(C,w,Cu,d,d2):
         delta = xp.einsum('wrs,ws,wts->wrt',s,d2,s)
         delta,v = xp.linalg.eigh(delta)
         p = xp.einsum('wir,wrs->wis',p,v)
+    if (delta[delta<-1.]).size>0:
+        print('lowdin delta=',delta)
     delta = xp.sqrt(delta+1.)
     left = xp.einsum('wxi,wir->wxr',C[w],p) * (1./delta-1.)[:,None,:] 
     C[w] += xp.einsum('wxr,wir->wxi',left,p)
@@ -474,17 +476,20 @@ def _parse_update(walkers:GHFWalkers):
 def _check_nan(T,typ,txt):
     if xp.count_nonzero(xp.isnan(T))>0:
         print(f'{txt} {typ} contains Nan')
-        exit()
+        return 1 
+    return 0
 
 def check_nan(walkers,txt):
-    _check_nan(walkers.phi,'phi',txt)
+    hasNan = 0 
+    hasNan += _check_nan(walkers.phi,'phi',txt)
     if walkers.S is None:
-        _check_nan(walkers.Sa,'Sa',txt)
-        if walkers.Sb is None:
-            return
-        _check_nan(walkers.Sb,'Sb',txt)
+        hasNan += _check_nan(walkers.Sa,'Sa',txt)
+        if walkers.Sb is not None:
+            hasNan += _check_nan(walkers.Sb,'Sb',txt)
     else:
-        _check_nan(walkers.S,'S',txt)
+        hasNan += _check_nan(walkers.S,'S',txt)
+    if hasNan > 0:
+        exit()
 
 @plum.dispatch
 def update_walkers(walkers:UHFWalkers,rotations,b=None,lowdin=False,eps_sq=None):

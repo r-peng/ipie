@@ -86,7 +86,7 @@ def propagate_walkers_minibatch(hamiltonian,walkers,K,lowdin=True):
     p /= B[None,:] 
     kixs = [None] * nw
     for i in range(nw):
-        k = xp.random.choice(K,p=p[:,i])
+        k = xp.random.choice(K,size=1,p=p[:,i])[0]
         B[i] *= xp.sign(b[k,i])
 
         kixs[i] = minibatch_kixs[k,i]
@@ -476,7 +476,7 @@ class LAFQMC(AFQMCBase):
         if minibatch_size==1:
             kixs,b = propagate_walkers_simple(self.hamiltonian,self.walkers,lowdin=lowdin)
         elif minibatch_size<self.hamiltonian.nterms:
-            kixs,b = propagate_walkers_minibatch(self.hamiltonian,self.walkers,minibatch_size)
+            kixs,b = propagate_walkers_minibatch(self.hamiltonian,self.walkers,minibatch_size,lowdin=lowdin)
         else:
             raise NotImplementedError
         synchronize()
