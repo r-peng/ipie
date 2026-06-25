@@ -43,19 +43,12 @@ from ipie.walkers.walkers_utils import (
         preprocess,
         save_walkers,
         update_walkers,
-        compute_ovlp_ratio,
+        orthogonalise,
 )
    
 def propagate_walkers_simple(hamiltonian,walkers,lowdin=True):
-    nw = walkers.nwalkers
-    nterms = hamiltonian.nterms
-
-    # 1.compute probability 
-    p,sign = hamiltonian.compute_prob()
-
-    # 2.sample from gf
-    kixs = xp.random.choice(nterms,size=nw,replace=True,p=p)
-    b = sign[kixs] 
+    kixs = xp.random.choice(hamiltonian.nterms,size=walkers.nwalkers,replace=True,p=hamiltonian.prob)
+    b = hamiltonian.a_over_q[kixs].copy()
 
     # 3.update walker
     rotations = hamiltonian.parse_sampled_rotations(to_host(kixs))
@@ -64,22 +57,18 @@ def propagate_walkers_simple(hamiltonian,walkers,lowdin=True):
 
 def propagate_walkers_minibatch(hamiltonian,walkers,K,lowdin=True):
     nw = walkers.nwalkers
-    nterms = hamiltonian.nterms
 
-    minibatch_kixs = [None] * nw
-    for i in range(nw):
-        minibatch_kixs[i] = xp.random.choice(nterms,size=K,replace=False)
-    minibatch_kixs = xp.asarray(minibatch_kixs).T
+    minibatch_kixs = xp.random.choice(hamiltonian.nterms,size=(K,nw),replace=True,p=hamiltonian.prob)
     minibatch_kixs_host = to_host(minibatch_kixs)
 
     b = xp.ones((K,nw))
     for i in range(K):
-        kix = minibatch_kixs[i]
-        b[i] = hamiltonian.coeffs[kix]
+        kixs = minibatch_kixs[i]
+        b[i] = hamiltonian.a_over_q[kixs].copy()
 
-        kix = minibatch_kixs_host[i]
-        rotations = hamiltonian.parse_sampled_rotations(kix)
-        b[i] = compute_ovlp_ratio(walkers,rotations,b[i])
+        kixs = minibatch_kixs_host[i]
+        rotations = hamiltonian.parse_sampled_rotations(kixs)
+        b[i] = update_walkers(walkers,rotations,walkers_update=False,b=b[i],lowdin=False)
     
     p = xp.fabs(b)
     B = p.sum(axis=0)
@@ -91,7 +80,7 @@ def propagate_walkers_minibatch(hamiltonian,walkers,K,lowdin=True):
 
         kixs[i] = minibatch_kixs[k,i]
     kixs = xp.asarray(kixs)
-    B *= nterms/K
+    B /= K
 
     rotations = hamiltonian.parse_sampled_rotations(to_host(kixs))
     update_walkers(walkers,rotations,lowdin=lowdin)
@@ -296,7 +285,6 @@ class LAFQMC(AFQMCBase):
         constraint_path=True,
         minibatch_size=1,
         eps_sq=None,
-        lowdin=True,
         max_nprod=20,
         max_nsum=500,
         dirname='.',
@@ -367,23 +355,24 @@ class LAFQMC(AFQMCBase):
 
         for step in range(1, total_steps + 1):
             synchronize()
-            if not lowdin:
-                start_step = time.time()
-                if step <= num_eqlb_steps:
-                    if step % self.params.num_eq_stblz == 0:
-                        start = time.time()
-                        self.walkers.orthogonalise()
-                        synchronize()
-                        self.tortho += time.time() - start
-                else:
-                    if step % self.params.num_stblz == 0:
-                        start = time.time()
-                        self.walkers.orthogonalise()
-                        synchronize()
-                        self.tortho += time.time() - start
+            start_step = time.time()
+            if step <= num_eqlb_steps:
+                if step % self.params.num_eq_stblz == 0:
+                    start = time.time()
+                    #self.walkers.orthogonalise()
+                    orthogonalise(self.walkers,self.trial)
+                    synchronize()
+                    self.tortho += time.time() - start
+            else:
+                if step % self.params.num_stblz == 0:
+                    start = time.time()
+                    #self.walkers.orthogonalise()
+                    orthogonalise(self.walkers,self.trial)
+                    synchronize()
+                    self.tortho += time.time() - start
 
             start = time.time()
-            self.propagate_walkers(lowdin=lowdin,constraint_path=constraint_path,minibatch_size=minibatch_size)
+            self.propagate_walkers(constraint_path=constraint_path,minibatch_size=minibatch_size)
             self.tprop_update += time.time() - start 
 
             #start_clip = time.time()

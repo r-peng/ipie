@@ -1,7 +1,8 @@
 import numpy as np
-import scipy,itertools
+import scipy,itertools,plum
 from ipie.hamiltonians.bitstring_utils import (
         get_all_configs_u11,
+        get_all_configs_u1,
         string_act,
         count_double_occupancy, 
 )
@@ -44,6 +45,41 @@ class Rotation:
             s = 0 if self.typ[-1]=='a' else 1
             U[s] = xp.einsum('xp,yp,p->xy',v,v,diag)
         return U
+
+    def get_trial_expectation_1(self,UB):
+        uB = UB[self.chol_idx][self.p[0]]
+        n = xp.dot(uB,uB) 
+        return 1.+self.d[0]*n
+
+    def get_trial_expectation_2(self,UB1,UB2,cross=True):
+        uB1 = UB1[self.chol_idx][self.p[0]]
+        uB2 = UB2[self.chol_idx][self.p[1]]
+        n1 = xp.dot(uB1,uB1) 
+        n2 = xp.dot(uB2,uB2) 
+        cross = xp.dot(uB1,uB2) if cross else 0.
+        d1,d2 = self.d
+        return 1.+d1*n1+d2*n2+d1*d2*(n1*n2-cross**2)
+
+    def get_trial_expectation(self,UBa,UBb,cross):
+        if self.typ=='h1a':
+            return self.get_trial_expectation_1(UBa)
+        if self.typ=='h1b':
+            if UBb is None:
+                return 1.
+            else:
+                return self.get_trial_expectation_1(UBb)
+        if self.typ=='h2a':
+            return self.get_trial_expectation_2(UBa,UBa)
+        if self.typ=='h2b':
+            if UBb is None:
+                return 1.
+            else:
+                return self.get_trial_expectation_2(UBb,UBb)
+        if self.typ=='h2ab':
+            if UBb is None:
+                return self.get_trial_expectation_1(UBa)
+            else:
+                return self.get_trial_expectation_2(UBa,UBb,cross=cross)
 
 class Rotations:
     def __init__(self):
@@ -91,30 +127,24 @@ class Rotations:
         uB = [self.data[typ]['uBa'],self.data[typ]['uBb']]
         return w,d,d2,u,uB
 
+def _UB(B,chol_basis):
+    if B is None:
+        return None
+    return xp.einsum('dxp,xi->dpi',chol_basis,B)
+
+def _h1B(B,h1e):
+    if B is None:
+        return None
+    return xp.dot(h1e,B)
+
 class SumOfRotationBase:
 
-    def __init__(self,sample_method=0,apply_spin_down=True):
-        self.h1e = None
-        self.chol = None
+    def __init__(self,apply_spin_down=True,importance_sample=True):
         self.chol_basis = []
         self.terms = [] 
         self.coeffs = []
-        self.sample_method = sample_method
         self.apply_spin_down = apply_spin_down
-
-        # additional saved quantites 
-        if self.sample_method==0:
-            return
-        elif self.sample_method==1:
-            # sample with a_i*det(I_r+d_i)
-            self.importance_factor = []
-        else:
-            raise NotImplementedError
-        #if self.sample_method==2:
-        #    # sample with a_i*det(I_r+d_i*D0[i])
-        #    self.kix_map = {1:[],2:[]}
-        #    self.dmap = {1:[],2:[]}
-        #    self.pmap = {1:[],2:[]}
+        self.importance_sample = importance_sample
 
     def add_term(self,ai,chol_idx,typ,p,g,thresh=1e-6):
         p = xp.asarray(p,dtype=int)
@@ -133,13 +163,6 @@ class SumOfRotationBase:
 
         self.terms.append(Rotation(chol_idx,typ,p,g,d,d2))
         self.coeffs.append(ai)
-
-        if self.sample_method==1:
-            self.importance_factor.append((d+1.).prod())
-            #print(g,d,self.importance_factor[-1])
-        #if self.sample_method==2:
-        #    r = p.size
-        #    self.kix_map
 
     def decompose_h1(self,at,thresh=1e-6,iprint=0):
         self.nbasis = self.h1e.shape[0]
@@ -172,22 +195,27 @@ class SumOfRotationBase:
             print('normalization=',xp.fabs(self.coeffs).sum())
             print('number of terms=',self.nterms)
 
-        if self.sample_method==1:
-            self.importance_factor = xp.asarray(self.importance_factor)
-            assert self.importance_factor.size==self.nterms
+    def _conjugate(self,psi):
+        self.UB = [_UB(Bi,self.chol_basis) for Bi in psi]
+        self.h1B = [_h1B(Bi,self.h1e) for Bi in psi]
 
-    def compute_prob(self,D=None):
-        if self.sample_method==0:
-            p = self.coeffs
-        elif self.sample_method==1:
-            p = self.coeffs * self.importance_factor 
-        else:
-            raise NotImplementedError
+    def compute_importance_factor(self,cross):
+        if not self.importance_sample:
+            return None
+        UBa,UBb = self.UB 
+        fac = xp.asarray([term.get_trial_expectation(UBa,UBb,cross) for term in self.terms])
+        #print(fac)
+        #exit()
+        return fac
 
-        p = xp.fabs(p)
-        p /= p.sum()
-        sign = self.coeffs / p
-        return p,sign
+    def compute_probability(self,fac):
+        self.prob = self.coeffs
+        if fac is not None:
+            self.prob *= fac
+
+        self.prob = xp.fabs(self.prob)
+        self.prob /= self.prob.sum()
+        self.a_over_q = self.coeffs / self.prob
 
     def parse_sampled_rotations(self,kixs):
         rotations = Rotations() 
@@ -252,6 +280,10 @@ class QCSOR(SumOfRotationBase):
         self.h1e = xp.asarray(h1e)
         self.chol = xp.asarray(chol)
         self.v0 = .5*xp.einsum('npr,nrs->ps',self.chol,self.chol) 
+
+    def _conjugate(self,psi):
+        super()._conjugate(psi)
+        self.LB = [_UB(Bi,self.chol) for Bi in psi]
 
     def decompose_h2(self,ai,thresh=1e-6,iprint=0):
         aisq = ai**2/2
@@ -341,10 +373,15 @@ def det2MB(B,basis=None,basis_map=None,order=1):
         psi = apply_cre(k,psi,B)
     return psi,basis,basis_map
 
-def hubbard2MB(h1e,U,nelecs=None,basis=None,basis_map=None,thresh=1e-6):
+def hubbard2MB(h1e,U,symmetry='u11',nelecs=None,basis=None,basis_map=None,thresh=1e-6):
     nsite = h1e.shape[0]
     if basis is None:
-        basis = get_all_configs_u11((nsite,nsite),nelecs)
+        if symmetry=='u11':
+            basis = get_all_configs_u11((nsite,nsite),nelecs)
+        elif symmetry=='u1':
+            basis = get_all_configs_u1(2*nsite,sum(nelecs))
+        else:
+            raise NotImplementedError
     if basis_map is None:
         basis_map = {cf:i for i,cf in enumerate(basis)}
 
