@@ -336,6 +336,21 @@ def quadratic2MB(M,basis,spin,thresh=1e-6):
             H[ix2,ix1] += M[p,q]*sign
     return H
 
+def eri2MB(eri,basis,spin1,spin2,thresh=1e-6):
+    basis_map = {cf:i for i,cf in enumerate(basis)}
+    H = np.zeros((len(basis),)*2)
+    for (p,r,q,s) in itertools.product(range(eri.shape[0]),repeat=4):
+        if np.absolute(eri[p,r,q,s])<thresh:
+            continue
+        for ix1,cf1 in enumerate(basis):
+            ops = (2*p+spin1,'cre'),(2*q+spin2,'cre'),(2*s+spin2,'des'),(2*r+spin1,'des')
+            cf2,sign = string_act(cf1,ops)
+            if cf2 is None:
+                continue
+            ix2 = basis_map[cf2]
+            H[ix2,ix1] += eri[p,r,q,s]*sign
+    return H
+
 def bcs2MB(A,B,u,v,basis=None,basis_map=None): 
     nsite,npair = A.shape
     if basis is None:
@@ -391,17 +406,28 @@ def hubbard2MB(h1e,U,symmetry='u11',nelecs=None,basis=None,basis_map=None,thresh
         H[ix,ix] += U*count_double_occupancy(cf,nsite)
     return H,basis,basis_map
 
-def chol2MB(h1e,chol,nelecs=None,basis=None,basis_map=None,thresh=1e-6):
+def chol2MB(h1e,chol=None,eri=None,nelecs=None,basis=None,basis_map=None,thresh=1e-6):
     nsite = h1e.shape[0]
     if basis is None:
         basis = get_all_configs_u11((nsite,nsite),nelecs)
     if basis_map is None:
         basis_map = {cf:i for i,cf in enumerate(basis)}
 
-    H = quadratic2MB(h1e,basis,0,thresh=thresh)
-    H += quadratic2MB(h1e,basis,1,thresh=thresh)
-    for i,L in enumerate(chol):
-        L_ = quadratic2MB(L,basis,0,thresh=thresh)
-        L_ += quadratic2MB(L,basis,1,thresh=thresh)
-        H += np.dot(L_,L_)/2.
-    return H,basis,basis_map
+    v0 = 0.
+    if chol is not None:
+        v0 = .5*xp.einsum('npr,nrs->ps',chol,chol) 
+
+    H = quadratic2MB(h1e-v0,basis,0,thresh=thresh)
+    H += quadratic2MB(h1e-v0,basis,1,thresh=thresh)
+    if chol is None:
+        for s1,s2 in itertools.product((0,1),repeat=2):
+            H += .5 * eri2MB(eri,basis,s1,s2,thresh=thresh)
+        return H,basis,basis_map
+
+    if eri is None:
+        for i,L in enumerate(chol):
+            L_ = quadratic2MB(L,basis,0,thresh=thresh)
+            L_ += quadratic2MB(L,basis,1,thresh=thresh)
+            H += .5 * np.dot(L_,L_)
+        return H,basis,basis_map
+    
