@@ -214,13 +214,8 @@ class SumOfRotationBase:
 
     def parse_decomposition(self,iprint=0):
         self.chol_basis = xp.asarray(self.chol_basis)
-        self.nchol = self.chol_basis.shape[0]
-
         self.terms = []
         self.coeffs = []
-        self.p_dict = dict() 
-        self.d_dict = dict() 
-        self.kix_dict = dict()
         for key in self.term_dict:
             _,p,_ = key
             if len(p)==1:
@@ -236,26 +231,7 @@ class SumOfRotationBase:
                 self.coeffs.append(rot.a)
                 kix = len(self.terms)-1
                 print(kix,key,rot.d,rot.d2,rot.a)
-
-                key = chol_idx,rot.typ 
-                if key not in self.p_dict:
-                    self.p_dict[key] = []
-                if key not in self.d_dict:
-                    self.d_dict[key] = []
-                if key not in self.kix_dict:
-                    self.kix_dict[key] = []
-                self.p_dict[key].append(rot.p)
-                self.d_dict[key].append(rot.d)
-                self.kix_dict[key].append(kix)
-
         self.term_dict = None
-        for key in self.p_dict:
-            self.p_dict[key] = xp.asarray(self.p_dict[key])
-        for key in self.d_dict:
-            self.d_dict[key] = xp.asarray(self.d_dict[key])
-        for key in self.kix_dict:
-            self.kix_dict[key] = xp.asarray(self.kix_dict[key])
-
         self.coeffs = xp.asarray(self.coeffs)
         self.Lambda = self.coeffs.sum()
         self.coeffs /= self.Lambda
@@ -266,6 +242,23 @@ class SumOfRotationBase:
             print('normalization=',xp.fabs(self.coeffs).sum())
             print('number of terms=',self.nterms)
 
+    def compute_importance_factor(self,cross):
+        if not self.importance_sample:
+            return None
+        UBa,UBb = self.UB 
+        fac = xp.asarray([term.get_trial_expectation(UBa,UBb,cross) for term in self.terms])
+        return fac
+
+    def compute_probability(self,fac):
+        self.prob = self.coeffs.copy()
+        print('coeffs=',self.coeffs)
+        if fac is not None:
+            self.prob *= fac
+
+        self.prob = xp.fabs(self.prob)
+        self.prob /= self.prob.sum()
+        self.a_over_q = self.coeffs / self.prob
+
     def parse_sampled_rotations(self,kixs):
         rotations = Rotations() 
         for w,kix in enumerate(kixs):
@@ -274,7 +267,7 @@ class SumOfRotationBase:
             U = self.chol_basis[chol_idx]
             UBa = self.UB[0][chol_idx]
             UBb = None if self.UB[1] is None else self.UB[1][chol_idx]
-            rotations.add_hamiltonian_term(term,w,U,UBa,UBb)
+            rotations.add_hamiltonian_term(self.terms[kix],w,U,UBa,UBb)
         rotations.parse_terms()
         return rotations
 
