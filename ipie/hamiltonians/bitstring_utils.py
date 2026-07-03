@@ -117,7 +117,6 @@ def _apply_creation(det: int, p: int) -> Tuple[Optional[int], int]:
     new_det = det | (1 << p)
     return new_det, sign
 
-
 def _apply_annihilation(det: int, p: int) -> Tuple[Optional[int], int]:
     """
     Apply fermionic annihilation operator c_p to |det>.
@@ -161,7 +160,7 @@ def masks_from_ctr_ls(ctr_ls: Sequence[Sequence[int]]) -> List[int]:
             m |= (1 << r)
         masks.append(m)
     return masks
-#def compute_occ_bits_from_masks(det: int, masks: Sequence[int]) -> np.ndarray:
+
 def _compute_occ_bits_from_masks(det: int, masks: Sequence[int]) -> Sequence[int]:
     """
     Returns a NumPy array of 0/1 for each mask:
@@ -186,6 +185,7 @@ def _virtual_indices(det: int, n_orb: int) -> List[int]:
     mask = (1 << n_orb) - 1
     vir_bits = (~det) & mask
     return _occupied_indices(vir_bits)
+
 def _single_dets(det: int, n_orb: int):
     occs = _occupied_indices(det)
     virs = _virtual_indices(det, n_orb)
@@ -369,6 +369,7 @@ def _bitstring_from_occupied(n_orb: int, occ_orbs: Iterable[int]) -> int:
             raise ValueError(f"orbital index {p} out of range [0,{n_orb-1}]")
         det |= 1 << p
     return det
+
 def _excite_single(x: int, i: int, a: int):
     if ((x >> i) & 1) == 0 or ((x >> a) & 1) == 1:
         return None
@@ -381,6 +382,7 @@ def _excite_single(x: int, i: int, a: int):
     sign = -1 if ((x & mask).bit_count() & 1) else 1
     y = x ^ (1 << i) ^ (1 << a)
     return y, sign
+
 def _excite_double(x: int, i: int, j: int, a: int, b: int):
     if (i == j) or (a == b) or (i == a) or (i == b) or (j == a) or (j == b):
         return None
@@ -423,6 +425,7 @@ def get_exc_list_u1(x,nsite,nexs=2):
     if nexs>=2:
         ls += list(_double_dets(x,nsite))
     return ls
+
 def get_exc_list_u11(x,pc,nexs=2):
     if nexs>2:
         raise ValueError
@@ -432,13 +435,17 @@ def get_exc_list_u11(x,pc,nexs=2):
     if nexs>=2:
         ls += _doubles_spin_conserving_fast(x,pc)
     return ls
+
 def get_config_from_occ(occ,nsite):
     occ = [int(p) for p in occ]
     return _bitstring_from_occupied(int(nsite),occ)
+
 def get_all_configs_u1(nsites,nelecs):
     return list(_all_dets_bitwise(int(nsites),int(nelecs)))
+
 def get_all_configs_u11(nsites,nelecs):
     return list(_configs_interleaved_spin_fast(int(nsites[0]),int(nsites[1]),int(nelecs[0]),int(nelecs[1])))
+
 def fermion_act(x,oix,typ):
     if typ=='cre':
         return _apply_creation(x,int(oix))
@@ -446,6 +453,7 @@ def fermion_act(x,oix,typ):
         return _apply_annihilation(x,int(oix))
     else:
         raise ValueError
+
 def string_act(x,ops,order=-1):
     if order==-1:
         ops = ops[::-1]
@@ -457,6 +465,7 @@ def string_act(x,ops,order=-1):
             return None,0
         s *= si
     return y,s
+
 def check_symmetry(x,symmetry,nsite,nelec):
     N,Na,Nb = _count_up_dn(x,int(nsite//2))
     if symmetry=='u1':

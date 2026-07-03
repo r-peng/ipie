@@ -18,13 +18,14 @@ class PopController(PopController_):
             raise NotImplementedError
             super().pop_control(walkers,comm)
             self.pop_control_counter += 1
-            return None,None
+            return None
         #self.timer.start_time()
         walkers.phase = xp.sign(walkers.weight)
         walkers.weight = xp.fabs(walkers.weight)
         w = walkers.weight
         walkers.unscaled_weight = walkers.weight
         average_weight,Neff,Ndistinct = stochastic_reconfiguration(walkers, comm, self.timer, pop_control_counter=self.pop_control_counter)
+        walkers.weight = walkers.phase
         if self.pop_control_counter == 0:
             self.Neff = []
             self.Ndistinct = []
@@ -155,6 +156,5 @@ def stochastic_reconfiguration(
 
     timer.start_time()
     #walkers.weight[:] = new_average_weight
-    walkers.weight = walkers.phase
     timer.add_non_communication()
     return new_average_weight,Neff,Ndistinct
