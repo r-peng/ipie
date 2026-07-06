@@ -215,29 +215,36 @@ class SumOfRotationBase:
     def parse_decomposition(self,iprint=0):
         self.chol_basis = xp.asarray(self.chol_basis)
         self.nchol = self.chol_basis.shape[0]
+        self.chol2 = dict()
+        for i,Ui in enumerate(self.chol_basis):
+            for j in range(i+1,self.nchol):
+                Uj = self.chol_basis[j]
+                self.chol2[i,j] = xp.dot(Ui.T,Uj)
 
         self.terms = []
         self.coeffs = []
+        self.kix2key = []
         self.p_dict = dict() 
         self.d_dict = dict() 
         self.kix_dict = dict()
-        for key in self.term_dict:
-            _,p,_ = key
+        for term_key in self.term_dict:
+            _,p,_ = term_key
             if len(p)==1:
-                rot = self.term_dict[key] 
+                rot = self.term_dict[term_key] 
                 if xp.fabs(rot.d[0])<self.thresh:
                     #print('not included',key,rot.d,rot.d2,rot.a)
                     continue
                 terms = [rot]
             else:
-                terms = self.term_dict[key] 
-            for rot in terms:
-                self.terms.append(rot)
+                terms = self.term_dict[term_key] 
+            for i,rot in enumerate(terms):
+                #self.terms.append(rot)
                 self.coeffs.append(rot.a)
                 kix = len(self.terms)-1
                 print(kix,key,rot.d,rot.d2,rot.a)
 
                 key = chol_idx,rot.typ 
+                self.kix2key.append((key,i))
                 if key not in self.p_dict:
                     self.p_dict[key] = []
                 if key not in self.d_dict:
@@ -266,17 +273,37 @@ class SumOfRotationBase:
             print('normalization=',xp.fabs(self.coeffs).sum())
             print('number of terms=',self.nterms)
 
-    def parse_sampled_rotations(self,kixs):
-        rotations = Rotations() 
-        for w,kix in enumerate(kixs):
-            term = self.terms[kix]
-            chol_idx = term.chol_idx
-            U = self.chol_basis[chol_idx]
-            UBa = self.UB[0][chol_idx]
-            UBb = None if self.UB[1] is None else self.UB[1][chol_idx]
-            rotations.add_hamiltonian_term(term,w,U,UBa,UBb)
-        rotations.parse_terms()
-        return rotations
+    def get_ud(self,key,i):
+        chol_idx,typ = key
+        p = self.p_dict[key][i]
+        d = self.d_dict[key][i]
+        u = self.chol_basis[chol_idx]
+        u = xp.asarray([u[:,pi] for pi in p])
+
+        nw,r = p.shape
+        u2 = xp.zeros((nw,self.nchol,self.nbasis,r))
+        for i in range(self.nchol):
+            if i<chol_idx:
+                U2 = self.chol2[i,chol_idx]
+            elif i>chol_idx:
+                U2 = self.chol2[i,chol_idx].T
+            else:
+                U2 = xp.eye(self.nbasis)
+            u2[i] = [U2[:,pi] for pi in p]
+        u2 = xp.asarray(u2)
+        return u,d,u2
+
+    #def parse_sampled_rotations(self,kixs):
+    #    rotations = Rotations() 
+    #    for w,kix in enumerate(kixs):
+    #        term = self.terms[kix]
+    #        chol_idx = term.chol_idx
+    #        U = self.chol_basis[chol_idx]
+    #        UBa = self.UB[0][chol_idx]
+    #        UBb = None if self.UB[1] is None else self.UB[1][chol_idx]
+    #        rotations.add_hamiltonian_term(term,w,U,UBa,UBb)
+    #    rotations.parse_terms()
+    #    return rotations
 
     def parse_sampled_rotations_slow(self,kixs):
         Us = [None] * len(kixs)
