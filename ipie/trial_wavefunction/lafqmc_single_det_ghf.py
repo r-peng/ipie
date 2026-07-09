@@ -1,14 +1,11 @@
 import numpy
-import plum
 from ipie.utils.backend import arraylib as xp
-from ipie.trial_wavefunction.wavefunction_base import TrialWavefunctionBase
-from ipie.trial_wavefunction.lafqmc_single_det import (
-        compute_UB,
-        compute_h1B,
-)
+from ipie.utils.mpi import MPIHandler
+from ipie.trial_wavefunction.lafqmc_single_det import SingleDet
 
 # class for GHF trial
-class SingleDetGHF(TrialWavefunctionBase):
+class SingleDetGHF(SingleDet):
+
     def __init__(self, wavefunction, num_elec, num_basis, handler=MPIHandler(), verbose=False):
         assert isinstance(wavefunction, numpy.ndarray)
         assert len(wavefunction.shape) == 2
@@ -19,7 +16,13 @@ class SingleDetGHF(TrialWavefunctionBase):
         self.psi = wavefunction
         self.handler = handler
 
-    def build_hamiltonian(self,hamiltonian):
-        psi = [self.psi[:self.nbasis],self.psi[self.nbasis:]]
-        self.UB = [compute_UB(Bi,hamiltonian.chol_basis) for Bi in psi]
-        self.h1B = [compute_h1B(Bi,hamiltonian.h1e) for Bi in psi]
+    def compute_UB(self,hamiltonian):
+        nchol = hamiltonian.nchol 
+        U = hamiltonian.chol_basis
+        nb = self.nbasis
+        nelec = self.nalpha+self.nbeta
+        UB = xp.zeros((nchol,nb*2,nelec))
+        UB[:,:nb] = xp.einsum('dxp,xi->dpi',U,self.psi[:nb])
+        UB[:,nb:] = xp.einsum('dxp,xi->dpi',U,self.psi[nb:])
+        return UB
+

@@ -1,106 +1,8 @@
 import numpy as np
 import plum,h5py
-from ipie.walkers.uhf_walkers import UHFWalkers
-from ipie.walkers.ghf_walkers import GHFWalkers
-from ipie.trial_wavefunction.single_det import SingleDet 
-from ipie.trial_wavefunction.single_det_ghf import SingleDetGHF
 from ipie.hamiltonians.sor_base import HubbardSOR,QCSOR
 from ipie.utils.backend import to_host#,qr,qr_mode
 from ipie.utils.backend import arraylib as xp
-
-def multiply_h1(h1B,SC):
-    if h1B is None:
-        return None
-    if SC is None:
-        return None
-    return xp.einsum('wix,xj->wij',SC,h1B)
-
-def trace_h1(h1B,SC):
-    if h1B is None:
-        return 0 
-    if SC is None:
-        return 0
-    return xp.einsum('wix,xi->w',SC,h1B)
-
-def _1rdm_diag(B,SC,s):
-    if B is None:
-        return None
-    if SC is None:
-        return None
-    ne = B.shape[1]
-    if ne==SC.shape[1]:
-        return xp.einsum('xi,wix->wx',B,SC)
-    if s==0:
-        return xp.einsum('xi,wix->wx',B,SC[:,:ne])
-    else:
-        return xp.einsum('xi,wix->wx',B,SC[:,-ne:])
-
-@plum.dispatch
-def compute_1rdm_diag(trial:SingleDet,SC):
-    D = [_1rdm_diag(trial.psi[s],SC[s],s) for s in (0,1)] 
-    return D[0],D[1],None,None
-
-@plum.dispatch
-def compute_1rdm_diag(trial:SingleDetGHF,SC):
-    nb = trial.nbasis
-    Daa = _1rdm_diag(trial.psi[:nb],SC[0],None) 
-    Dab = _1rdm_diag(trial.psi[:nb],SC[1],None) 
-    Dba = _1rdm_diag(trial.psi[nb:],SC[0],None) 
-    Dbb = _1rdm_diag(trial.psi[nb:],SC[1],None) 
-    return Daa,Dbb,Dab,Dba
-
-def compute_E1(walkers,h1B):
-    SC = compute_SC(walkers)
-    E1 = [trace_h1(h1Bi,SCi) for h1Bi,SCi in zip(h1B,SC)]
-    E1 = E1[0]+E1[1]
-    return E1,SC
-
-@plum.dispatch
-def local_energy(hamiltonian:HubbardSOR,walkers,trial):
-    E1,SC = compute_E1(walkers,hamiltonian.h1B)
-
-    Daa,Dbb,Dab,Dba = compute_1rdm_diag(trial,SC)
-    if Dbb is None:
-        E2 = xp.zeros(Daa.shape[0])
-        return E1+E2,E1,E2 
-    E2 = (Daa*Dbb).sum(axis=1)
-    if Dab is None:
-        E2 *= hamiltonian.hubbard_U
-        return E1+E2,E1,E2
-    E2 -= (Dab*Dba).sum(axis=1)
-    E2 *= hamiltonian.hubbard_U
-    return E1+E2,E1,E2
-
-def compute_chol_E2(SC,hamiltonian,cross_spin):
-    LBa,LBb = hamiltonian.LB
-    E2 = 0
-    for i in range(LBa.shape[0]):
-        LBai = LBa[i]
-        LBbi = None if LBb is None else LBb[i] 
-
-        E2 += (trace_h1(LBai,SC[0]) + trace_h1(LBbi,SC[1]))**2
-
-        ta = multiply_h1(LBai,SC[0])
-        tb = multiply_h1(LBbi,SC[1])
-        E2 -= xp.einsum('wij,wji->w',ta,ta)
-        if tb is None:
-            continue
-        E2 -= xp.einsum('wij,wji->w',tb,tb)
-        if cross_spin:
-            E2 -= 2*xp.einsum('wij,wji->w',ta,tb)
-    return 0.5*E2
-
-@plum.dispatch
-def local_energy(hamiltonian:QCSOR,walkers:UHFWalkers,trial:SingleDet):
-    E1,SC = compute_E1(walkers,hamiltonian.h1B)
-    E2 = compute_chol_E2(SC,hamiltonian,False)
-    return E1+E2,E1,E2
-
-@plum.dispatch
-def local_energy(hamiltonian:QCSOR,walkers,trial:SingleDetGHF):
-    E1,SC = compute_E1(walkers,hamiltonian.h1B)
-    E2 = compute_chol_E2(SC,hamiltonian,True)
-    return E1+E2,E1,E2
 
 #def _trace(D,iws=None):
 #    if D is None:
@@ -496,43 +398,6 @@ def _lowdin_slow(C,thresh=1e-10):
     assert xp.linalg.norm(ovlp-xp.eye(ovlp.shape[2])[None,:,:])<thresh
     return C,detR
 
-@plum.dispatch
-def update_walkers_slow(walkers:UHFWalkers,Us,lowdin=True):
-    nu,nd = walkers.nup,walkers.ndown
-    if nd==0:
-        phi = [walkers.phi,None]
-    else:
-        phi = [walkers.phi[:,:,:nu],walkers.phi[:,:,nu:]]
-    for w,U in enumerate(Us):
-        for s,Ui in enumerate(U):
-            if phi[s] is None:
-                continue
-            if Ui is None:
-                continue
-            phi[s][w] = xp.dot(U[s],phi[s][w])
-    detR = xp.ones(walkers.nwalkers)
-    if lowdin:
-        for s in (0,1):
-            phi[s],detR_ = _lowdin_slow(phi[s])
-            if detR_ is not None:
-                detR *= detR_
-    walkers.phi[:,:,:nu] = phi[0]
-    if nd>0: 
-        walkers.phi[:,:,nu:] = phi[1]
-    return detR
-
-@plum.dispatch
-def update_walkers_slow(walkers:GHFWalkers,Us,lowdin=True):
-    nb = walkers.nbasis
-    for w,U in enumerate(Us):
-        if U[0] is not None:
-            walkers.phi[w,:nb] = xp.dot(U[0],walkers.phi[w,:nb])
-        if U[1] is not None:
-            walkers.phi[w,nb:] = xp.dot(U[1],walkers.phi[w,nb:])
-    detR = xp.ones(walkers.nwalkers)
-    if lowdin:
-        walkers.phi,detR = _lowdin_slow(walkers.phi)
-    return detR
 
 
     #p = Cu.copy()

@@ -1,11 +1,10 @@
 import numpy as np
-import scipy,itertools,plum
-from ipie.hamiltonians.bitstring_utils import (
-        get_all_configs_u11,
-        get_all_configs_u1,
-        string_act,
-)
+import plum
 from ipie.utils.backend import arraylib as xp
+from ipie.walkers.lafqmc_uhf_walkers import UHFWalkers
+from ipie.walkers.lafqmc_ghf_walkers import GHFWalkers
+from ipie.trial_wavefunction.lafqmc_single_det import SingleDet 
+from ipie.trial_wavefunction.lafqmc_single_det_ghf import SingleDetGHF
 
 class Rotation:
 
@@ -26,20 +25,6 @@ class Rotation:
         self.d /= self.a
         self.d2 = self.d*2.+self.d**2
         
-    def get_MB_kappa(self,chol_basis,basis,basis_map):
-        v = chol_basis[self.chol_idx]
-        g = xp.log(1.+self.d)
-        kappa = [None] * 2
-        if self.typ=='h2ab':
-            for s,p in enumerate(self.p):
-                ks = np.outer(v[:,p],v[:,p]*g[s])
-                kappa[s] = quadratic2MB(ks,basis,basis_map,s) 
-        else:
-            s = 0 if self.typ[-1]=='a' else 1
-            ks = np.einsum('xr,yr,r->xy',v[:,self.p],v[:,self.p],g)
-            kappa[s] = quadratic2MB(ks,basis,basis_map,s) 
-        return kappa
-
     def get_rotation_matrix(self,chol_basis):
         v = chol_basis[self.chol_idx]
         U = [None] * 2
@@ -55,98 +40,99 @@ class Rotation:
             U[s] = xp.einsum('xp,yp,p->xy',v,v,diag)
         return U
 
-    def get_trial_expectation_1(self,UB):
-        uB = UB[self.chol_idx][self.p[0]]
-        n = xp.dot(uB,uB) 
-        return 1.+self.d[0]*n
+#    def get_trial_expectation_1(self,UB):
+#        uB = UB[self.chol_idx][self.p[0]]
+#        n = xp.dot(uB,uB) 
+#        return 1.+self.d[0]*n
+#
+#    def get_trial_expectation_2(self,UB1,UB2,cross=True):
+#        uB1 = UB1[self.chol_idx][self.p[0]]
+#        uB2 = UB2[self.chol_idx][self.p[1]]
+#        n1 = xp.dot(uB1,uB1) 
+#        n2 = xp.dot(uB2,uB2) 
+#        cross = xp.dot(uB1,uB2) if cross else 0.
+#        d1,d2 = self.d
+#        return 1.+d1*n1+d2*n2+d1*d2*(n1*n2-cross**2)
+#
+#    def get_trial_expectation(self,UBa,UBb,cross):
+#        if self.typ=='h1a':
+#            return self.get_trial_expectation_1(UBa)
+#        if self.typ=='h1b':
+#            if UBb is None:
+#                return 1.
+#            else:
+#                return self.get_trial_expectation_1(UBb)
+#        if self.typ=='h2a':
+#            return self.get_trial_expectation_2(UBa,UBa)
+#        if self.typ=='h2b':
+#            if UBb is None:
+#                return 1.
+#            else:
+#                return self.get_trial_expectation_2(UBb,UBb)
+#        if self.typ=='h2ab':
+#            if UBb is None:
+#                return self.get_trial_expectation_1(UBa)
+#            else:
+#                return self.get_trial_expectation_2(UBa,UBb,cross=cross)
 
-    def get_trial_expectation_2(self,UB1,UB2,cross=True):
-        uB1 = UB1[self.chol_idx][self.p[0]]
-        uB2 = UB2[self.chol_idx][self.p[1]]
-        n1 = xp.dot(uB1,uB1) 
-        n2 = xp.dot(uB2,uB2) 
-        cross = xp.dot(uB1,uB2) if cross else 0.
-        d1,d2 = self.d
-        return 1.+d1*n1+d2*n2+d1*d2*(n1*n2-cross**2)
-
-    def get_trial_expectation(self,UBa,UBb,cross):
-        if self.typ=='h1a':
-            return self.get_trial_expectation_1(UBa)
-        if self.typ=='h1b':
-            if UBb is None:
-                return 1.
-            else:
-                return self.get_trial_expectation_1(UBb)
-        if self.typ=='h2a':
-            return self.get_trial_expectation_2(UBa,UBa)
-        if self.typ=='h2b':
-            if UBb is None:
-                return 1.
-            else:
-                return self.get_trial_expectation_2(UBb,UBb)
-        if self.typ=='h2ab':
-            if UBb is None:
-                return self.get_trial_expectation_1(UBa)
-            else:
-                return self.get_trial_expectation_2(UBa,UBb,cross=cross)
-
-class Rotations:
-    def __init__(self):
-        self.data = dict()
-        self.typs = 'h1a','h1b','h2a','h2b','h2ab'
-        self.keys = 'w','d','d2','u','uBa','uBb'
-        for typ in self.typs:
-            self.data[typ] = {key:[] for key in self.keys}
-
-    def add_hamiltonian_term(self,term,w,U,UBa,UBb):
-        typ = term.typ
-        p = term.p
-        self.data[typ]['w'].append(w)
-        self.data[typ]['d'].append(term.d)
-        self.data[typ]['d2'].append(term.d2)
-        self.data[typ]['u'].append(U[:,p])
-        if typ=='h2ab':
-            self.data[typ]['uBa'].append(UBa[p[:1]])
-            if UBb is None: 
-                return
-            self.data[typ]['uBb'].append(UBb[p[1:]])
-            return
-        if typ[-1]=='a':
-            self.data[typ]['uBa'].append(UBa[p])
-            return
-        if UBb is None:
-            return
-        self.data[typ]['uBb'].append(UBb[p])
-
-    def parse_terms(self):
-        for typ in self.typs:
-            for key in self.keys:
-                dat = self.data[typ][key]
-                if len(dat)==0:
-                    dat = None
-                else:
-                    dat = xp.asarray(dat) 
-                self.data[typ][key] = dat 
-
-    def get_data(self,typ):
-        w = self.data[typ]['w']
-        d = self.data[typ]['d']
-        return w,d,d2,u,uB
-
-    def add_itm(self,typ,key,itm):
-        self.data[typ][key] = itm 
-
-    def get_itm(self,typ,key):
-        if key=='uB':
-            return [self.data[typ]['uBa'],self.data[typ]['uBb']]
-        itm = self.data[typ][key]
-        if typ=='h2ab' and key=='u':
-            return [itm[:,:,:1],itm[:,:,1:]]
-        return itm
+#class Rotations:
+#    def __init__(self):
+#        self.data = dict()
+#        self.typs = 'h1a','h1b','h2a','h2b','h2ab'
+#        self.keys = 'w','d','d2','u','uBa','uBb'
+#        for typ in self.typs:
+#            self.data[typ] = {key:[] for key in self.keys}
+#
+#    def add_hamiltonian_term(self,term,w,U,UBa,UBb):
+#        typ = term.typ
+#        p = term.p
+#        self.data[typ]['w'].append(w)
+#        self.data[typ]['d'].append(term.d)
+#        self.data[typ]['d2'].append(term.d2)
+#        self.data[typ]['u'].append(U[:,p])
+#        if typ=='h2ab':
+#            self.data[typ]['uBa'].append(UBa[p[:1]])
+#            if UBb is None: 
+#                return
+#            self.data[typ]['uBb'].append(UBb[p[1:]])
+#            return
+#        if typ[-1]=='a':
+#            self.data[typ]['uBa'].append(UBa[p])
+#            return
+#        if UBb is None:
+#            return
+#        self.data[typ]['uBb'].append(UBb[p])
+#
+#    def parse_terms(self):
+#        for typ in self.typs:
+#            for key in self.keys:
+#                dat = self.data[typ][key]
+#                if len(dat)==0:
+#                    dat = None
+#                else:
+#                    dat = xp.asarray(dat) 
+#                self.data[typ][key] = dat 
+#
+#    def get_data(self,typ):
+#        w = self.data[typ]['w']
+#        d = self.data[typ]['d']
+#        return w,d,d2,u,uB
+#
+#    def add_itm(self,typ,key,itm):
+#        self.data[typ][key] = itm 
+#
+#    def get_itm(self,typ,key):
+#        if key=='uB':
+#            return [self.data[typ]['uBa'],self.data[typ]['uBb']]
+#        itm = self.data[typ][key]
+#        if typ=='h2ab' and key=='u':
+#            return [itm[:,:,:1],itm[:,:,1:]]
+#        return itm
 
 class SumOfRotationBase:
 
     def __init__(self,apply_spin_down=True,importance_sample=False,thresh=1e-6):
+        self.chol = None
         self.chol_basis = []
         self.term_dict = dict() 
         self.apply_spin_down = apply_spin_down
@@ -214,24 +200,55 @@ class SumOfRotationBase:
 
     def parse_decomposition(self,iprint=0):
         self.chol_basis = xp.asarray(self.chol_basis)
+        self.nchol = self.chol_basis.shape[0]
+        self.chol_basis2 = dict()
+        for i,Ui in enumerate(self.chol_basis):
+            for j in range(i+1,self.nchol):
+                Uj = self.chol_basis[j]
+                self.chol_basis2[i,j] = xp.dot(Ui.T,Uj)
+
         self.terms = []
         self.coeffs = []
-        for key in self.term_dict:
-            _,p,_ = key
+        self.kix2key = []
+        self.p_dict = dict() 
+        self.d_dict = dict() 
+        self.kix_dict = dict()
+        for term_key in self.term_dict:
+            chol_idx,p,_ = term_key
             if len(p)==1:
-                rot = self.term_dict[key] 
+                rot = self.term_dict[term_key] 
                 if xp.fabs(rot.d[0])<self.thresh:
                     #print('not included',key,rot.d,rot.d2,rot.a)
                     continue
                 terms = [rot]
             else:
-                terms = self.term_dict[key] 
-            for rot in terms:
+                terms = self.term_dict[term_key] 
+            for i,rot in enumerate(terms):
                 self.terms.append(rot)
                 self.coeffs.append(rot.a)
                 kix = len(self.terms)-1
+
+                key = chol_idx,rot.typ 
                 print(kix,key,rot.d,rot.d2,rot.a)
+                self.kix2key.append((key,i))
+                if key not in self.p_dict:
+                    self.p_dict[key] = []
+                if key not in self.d_dict:
+                    self.d_dict[key] = []
+                if key not in self.kix_dict:
+                    self.kix_dict[key] = []
+                self.p_dict[key].append(rot.p)
+                self.d_dict[key].append(rot.d)
+                self.kix_dict[key].append(kix)
+
         self.term_dict = None
+        for key in self.p_dict:
+            self.p_dict[key] = xp.asarray(self.p_dict[key])
+        for key in self.d_dict:
+            self.d_dict[key] = xp.asarray(self.d_dict[key])
+        for key in self.kix_dict:
+            self.kix_dict[key] = xp.asarray(self.kix_dict[key])
+
         self.coeffs = xp.asarray(self.coeffs)
         self.Lambda = self.coeffs.sum()
         self.coeffs /= self.Lambda
@@ -242,58 +259,44 @@ class SumOfRotationBase:
             print('normalization=',xp.fabs(self.coeffs).sum())
             print('number of terms=',self.nterms)
 
-    def compute_importance_factor(self,cross):
-        if not self.importance_sample:
-            return None
-        UBa,UBb = self.UB 
-        fac = xp.asarray([term.get_trial_expectation(UBa,UBb,cross) for term in self.terms])
-        return fac
+    def get_ud(self,key,i):
+        chol_idx,typ = key
+        p = self.p_dict[key][i]
+        d = self.d_dict[key][i]
+        u = self.chol_basis[chol_idx]
+        u = xp.asarray([u[:,pi] for pi in p])
 
-    def compute_probability(self,fac):
-        self.prob = self.coeffs.copy()
-        print('coeffs=',self.coeffs)
-        if fac is not None:
-            self.prob *= fac
+        nw,r = p.shape
+        u2 = xp.zeros((nw,self.nchol,self.nbasis,r))
+        for i in range(self.nchol):
+            if i<chol_idx:
+                U2 = self.chol_basis2[i,chol_idx]
+            elif i>chol_idx:
+                U2 = self.chol_basis2[i,chol_idx].T
+            else:
+                U2 = xp.eye(self.nbasis)
+            u2[i] = [U2[:,pi] for pi in p]
+        u2 = xp.asarray(u2)
+        return u,d,u2
 
-        self.prob = xp.fabs(self.prob)
-        self.prob /= self.prob.sum()
-        self.a_over_q = self.coeffs / self.prob
+    #def parse_sampled_rotations(self,kixs):
+    #    rotations = Rotations() 
+    #    for w,kix in enumerate(kixs):
+    #        term = self.terms[kix]
+    #        chol_idx = term.chol_idx
+    #        U = self.chol_basis[chol_idx]
+    #        UBa = self.UB[0][chol_idx]
+    #        UBb = None if self.UB[1] is None else self.UB[1][chol_idx]
+    #        rotations.add_hamiltonian_term(term,w,U,UBa,UBb)
+    #    rotations.parse_terms()
+    #    return rotations
 
-    def parse_sampled_rotations(self,kixs):
-        rotations = Rotations() 
-        for w,kix in enumerate(kixs):
-            term = self.terms[kix]
-            chol_idx = term.chol_idx
-            U = self.chol_basis[chol_idx]
-            UBa = self.UB[0][chol_idx]
-            UBb = None if self.UB[1] is None else self.UB[1][chol_idx]
-            rotations.add_hamiltonian_term(self.terms[kix],w,U,UBa,UBb)
-        rotations.parse_terms()
-        return rotations
-
-    def parse_sampled_rotations_slow(self,kixs):
-        Us = [None] * len(kixs)
-        for w,kix in enumerate(kixs):
-            term = self.terms[kix]
-            Us[w] = term.get_rotation_matrix(self.chol_basis[term.chol_idx])
-        return Us
-
-    def _get_MB_gf(self,basis,basis_map):
-        H = 0
-        print('called')
-        for ai,term in zip(self.coeffs,self.terms): 
-            kappa = term.get_MB_kappa(self.chol_basis,basis,basis_map)
-            U = None
-            for spin,k in enumerate(kappa):
-                if k is None:
-                    continue
-                Us = scipy.linalg.expm(k)
-                if U is None:
-                    U = Us
-                else:
-                    U = np.dot(U,Us)
-            H += ai*U
-        return H
+    #def parse_sampled_rotations_slow(self,kixs):
+    #    Us = [None] * len(kixs)
+    #    for w,kix in enumerate(kixs):
+    #        term = self.terms[kix]
+    #        Us[w] = term.get_rotation_matrix(self.chol_basis[term.chol_idx])
+    #    return Us
 
 class HubbardSOR(SumOfRotationBase):
 
@@ -316,6 +319,21 @@ class HubbardSOR(SumOfRotationBase):
         for i in range(self.nbasis): 
             self.add_term(ai,chol_idx,[i,i],[dp,dm],[0,1])
             self.add_term(ai,chol_idx,[i,i],[dm,dp],[0,1])
+
+    def local_energy(self,walkers,trial):
+        E1,SC = trial.compute_E1(walkers)
+    
+        Daa,Dbb,Dab,Dba = trial.compute_1rdm_diag(SC)
+        if Dbb is None:
+            E2 = xp.zeros(Daa.shape[0])
+            return E1+E2,E1,E2 
+        E2 = (Daa*Dbb).sum(axis=1)
+        if Dab is None:
+            E2 *= self.hubbard_U
+            return E1+E2,E1,E2
+        E2 -= (Dab*Dba).sum(axis=1)
+        E2 *= self.hubbard_U
+        return E1+E2,E1,E2
 
 class QCSOR(SumOfRotationBase):
 
@@ -373,121 +391,15 @@ class QCSOR(SumOfRotationBase):
                         self.add_term(aisq,chol_idx,[q,p],[dq,-dp],[0,1])
                         self.add_term(aisq,chol_idx,[q,p],[-dq,dp],[0,1])
 
-##### MB helper fxns #####
-def quadratic2MB(M,basis,basis_map,spin,thresh=1e-6):
-    if len(M.shape)==1:
-        M = np.diag(M)
-    H = np.zeros((len(basis),)*2)
-    for (p,q) in itertools.product(range(M.shape[0]),repeat=2):
-        if np.absolute(M[p,q])<thresh:
-            continue
-        for ix1,cf1 in enumerate(basis):
-            ops = (2*p+spin,'cre'),(2*q+spin,'des')
-            cf2,sign = string_act(cf1,ops)
-            if cf2 is None:
-                continue
-            ix2 = basis_map[cf2]
-            H[ix2,ix1] += M[p,q]*sign
-    return H
-
-def eri2MB(eri,basis,basis_map,spin1,spin2,thresh=1e-6):
-    H = np.zeros((len(basis),)*2)
-    for (p,r,q,s) in itertools.product(range(eri.shape[0]),repeat=4):
-        if np.absolute(eri[p,r,q,s])<thresh:
-            continue
-        for ix1,cf1 in enumerate(basis):
-            ops = (2*p+spin1,'cre'),(2*q+spin2,'cre'),(2*s+spin2,'des'),(2*r+spin1,'des')
-            cf2,sign = string_act(cf1,ops)
-            if cf2 is None:
-                continue
-            ix2 = basis_map[cf2]
-            H[ix2,ix1] += eri[p,r,q,s]*sign
-    return H
-
-def bcs2MB(A,B,u,v,basis=None,basis_map=None): 
-    nsite,npair = A.shape
-    if basis is None:
-        basis = all_bitstrings_list(nsite) 
-    if basis_map is None:
-        basis_map = {det:ix for ix,det in enumerate(basis)}
-    nbasis = len(basis)
-    def apply_cre(i,psi,A):
-        return apply_a_dag_dense_sign(psi,basis,A[:,i],nsite,det_to_index=basis_map)
+    @plum.dispatch
+    def local_energy(self,walkers:UHFWalkers,trial:SingleDet):
+        E1,SC = trial.compute_E1(walkers)
+        E2 = trial.compute_chol_E2(SC,False)
+        return E1+E2,E1,E2
     
-    psi = np.zeros(nbasis)
-    psi[basis_map[0]] = 1.
-    for k in range(npair//2-1,-1,-1):
-        psi_v = apply_cre(2*k+1,psi,A)
-        psi_v = apply_cre(2*k,psi_v,A)
-        psi = u[2*k]*psi + v[2*k]*psi_v
-    nocc = B.shape[1]
-    for k in range(nocc-1,-1,-1):
-        psi = apply_cre(k,psi,B)
-    return psi,basis,basis_map
+    @plum.dispatch
+    def local_energy(self,walkers,trial:SingleDetGHF):
+        E1,SC = trial.compute_E1(walkers)
+        E2 = trial.compute_chol_E2(SC,True)
+        return E1+E2,E1,E2
 
-def det2MB(B,basis=None,basis_map=None,det=0,order=1):
-    from ipie.hamiltonians.bitstring_utils import apply_a_dag_dense_sign
-    nsite,nocc = B.shape
-    if basis is None:
-        basis = all_bitstrings_list(nsite) 
-    if basis_map is None:
-        basis_map = {det:ix for ix,det in enumerate(basis)}
-    nbasis = len(basis)
-    def apply_cre(i,psi,A):
-        return apply_a_dag_dense_sign(psi,basis,A[:,i],nsite,det_to_index=basis_map)
-    psi = np.zeros(nbasis)
-    psi[basis_map[det]] = 1.
-    ks = range(nocc) if order==1 else range(nocc-1,-1,-1)
-    for k in ks:
-        psi = apply_cre(k,psi,B)
-    return psi,basis,basis_map
-
-def hubbard2MB(h1e,U,symmetry='u11',nelecs=None,basis=None,basis_map=None,thresh=1e-6):
-    from ipie.hamiltonians.bitstring_utils import count_double_occupancy
-    nsite = h1e.shape[0]
-    if basis is None:
-        if symmetry=='u11':
-            basis = get_all_configs_u11((nsite,nsite),nelecs)
-        elif symmetry=='u1':
-            basis = get_all_configs_u1(2*nsite,sum(nelecs))
-        else:
-            raise NotImplementedError
-    if basis_map is None:
-        basis_map = {cf:i for i,cf in enumerate(basis)}
-
-    H = quadratic2MB(h1e,basis,0,thresh=thresh)
-    H += quadratic2MB(h1e,basis,1,thresh=thresh)
-    for ix,cf in enumerate(basis):
-        H[ix,ix] += U*count_double_occupancy(cf,nsite)
-    return H,basis,basis_map
-
-def chol2MB(h1e,chol=None,eri=None,symmetry='u11',nelecs=None,basis=None,basis_map=None,thresh=1e-6):
-    nsite = h1e.shape[0]
-    if basis is None:
-        if symmetry=='u11':
-            basis = get_all_configs_u11((nsite,nsite),nelecs)
-        elif symmetry=='u1':
-            basis = get_all_configs_u1(2*nsite,sum(nelecs))
-        else:
-            raise NotImplementedError
-    if basis_map is None:
-        basis_map = {cf:i for i,cf in enumerate(basis)}
-
-    v0 = 0.
-    if chol is not None:
-        v0 = .5*xp.einsum('npr,nrs->ps',chol,chol) 
-
-    H = quadratic2MB(h1e-v0,basis,basis_map,0,thresh=thresh)
-    H += quadratic2MB(h1e-v0,basis,basis_map,1,thresh=thresh)
-    if chol is None:
-        for s1,s2 in itertools.product((0,1),repeat=2):
-            H += .5 * eri2MB(eri,basis,basis_map,s1,s2,thresh=thresh)
-        return H,basis,basis_map
-
-    if eri is None:
-        for i,L in enumerate(chol):
-            L_ = quadratic2MB(L,basis,basis_map,0,thresh=thresh)
-            L_ += quadratic2MB(L,basis,basis_map,1,thresh=thresh)
-            H += .5 * np.dot(L_,L_)
-        return H,basis,basis_map
-    
