@@ -212,8 +212,7 @@ class HubbardSOR(SumOfRotationBase):
         ek,vk = xp.linalg.eigh(h1e) 
         self.chol_basis.append(vk)
         self.chol_bands.append(ek)
-
-        self._decompose_h1(ek+0.5*self.hubbard_U,at,iprint=iprint)
+        return self._decompose_h1(ek+0.5*self.hubbard_U,at,iprint=iprint)
 
     def decompose_h2(self,gu,iprint=0,nelec=None):
         self.chol_basis.append(xp.eye(self.nbasis))

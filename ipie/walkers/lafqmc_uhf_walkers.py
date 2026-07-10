@@ -3,7 +3,7 @@ import plum,h5py
 from ipie.trial_wavefunction.lafqmc_single_det import SingleDet
 from ipie.trial_wavefunction.lafqmc_single_det_ghf import SingleDetGHF
 from ipie.walkers.base_walkers import BaseWalkers 
-from ipie.utils.backend import to_host
+from ipie.utils.backend import to_host,cast_to_device
 from ipie.utils.backend import arraylib as xp
 
 def qr(phi,thresh=1e-3):
@@ -29,7 +29,7 @@ def compute_right2(uB,SCU,M1,d):
     return xp.einsum('wrs,wdsp->wdrp',M2,right2),M2
 
 def compute_M3(uDu,M2,d):
-    M3 = np.eye(d.shape[1])[None,:,:]-xp.einsum('wrs,wst->wrt',M2,uDu)
+    M3 = xp.eye(d.shape[1])[None,:,:]-xp.einsum('wrs,wst->wrt',M2,uDu)
     return M3 * d[:,None,:]
 
 def compute_right3(uDu,M2,d,u2):
@@ -80,6 +80,9 @@ class UHFWalkers(BaseWalkers):
         self.phi = xp.array([initial_walker.copy() for iw in range(self.nwalkers)])
 
         self.phase = xp.ones(self.nwalkers) 
+
+    def cast_to_cupy(self, verbose=False):
+        cast_to_device(self, verbose)
 
     def get_phi(self):
         nu = self.nup

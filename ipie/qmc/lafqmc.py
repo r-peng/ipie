@@ -33,7 +33,7 @@ from ipie.estimators.estimator_base import EstimatorBase
 from ipie.estimators.handler_custom import EstimatorHandler
 from ipie.qmc.options import QMCParams
 from ipie.utils.backend import arraylib as xp
-#from ipie.utils.backend import to_host
+from ipie.utils.backend import to_host
 from ipie.utils.backend import synchronize
 from ipie.utils.mpi import MPIHandler
 from ipie.walkers.base_walkers import WalkerAccumulator
@@ -434,13 +434,14 @@ class LAFQMC(AFQMCBase):
         p = p/b[None,:] 
 
         nw = self.walkers.nwalkers
-        ixs = [xp.random.choice(self.hamiltonian.nterms,p=p[:,i]) for i in range(nw)]
-        self.hamiltonian.parse_samples(ixs)
+        ixs = xp.asarray([xp.random.choice(self.hamiltonian.nterms,size=1,p=p[:,i])[0] for i in range(nw)])
+        #print(ixs)
+        self.hamiltonian.parse_samples(to_host(ixs))
         self.walkers.update_walkers(self.hamiltonian,self.trial)
         synchronize()
     
         # 4.update weight
-        b *= sign[xp.asarray(ixs),xp.arange(nw)]
+        b *= sign[ixs,xp.arange(nw)]
         bminus = xp.nonzero(b<0.)[0] 
         nminus = bminus.size
         if nminus>0: 
