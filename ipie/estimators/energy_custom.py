@@ -20,7 +20,6 @@ import h5py,numpy
 from ipie.utils.backend import arraylib as xp
 from ipie.utils.backend import to_host
 from ipie.estimators.energy import EnergyEstimator as EnergyEstimator_
-from ipie.walkers.walkers_utils import local_energy
 
 class EnergyEstimator(EnergyEstimator_):
     def __init__(self,**kwargs):
@@ -34,11 +33,8 @@ class EnergyEstimator(EnergyEstimator_):
 
     def compute_estimator(self, system=None, walkers=None, hamiltonian=None, trial=None):
         # Need to be able to dispatch here
-        Etot,E1,E2 = local_energy(hamiltonian,walkers,trial)
-        if walkers.R is None:
-            weight = walkers.weight.copy()
-        else:
-            weight = walkers.weight * walkers.R 
+        Etot,E1,E2 = hamiltonian.local_energy(walkers)
+        weight = walkers.weight.copy()
         weight /= walkers.nwalkers
 
         self._data["ENumer"] = xp.sum(weight * Etot)

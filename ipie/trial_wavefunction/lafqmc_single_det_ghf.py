@@ -1,7 +1,7 @@
 import numpy
+from ipie.trial_wavefunction.lafqmc_single_det import SingleDet
 from ipie.utils.backend import arraylib as xp
 from ipie.utils.mpi import MPIHandler
-from ipie.trial_wavefunction.lafqmc_single_det import SingleDet
 
 # class for GHF trial
 class SingleDetGHF(SingleDet):
@@ -16,13 +16,8 @@ class SingleDetGHF(SingleDet):
         self.psi = wavefunction
         self.handler = handler
 
-    def compute_UB(self,hamiltonian):
-        nchol = hamiltonian.nchol 
-        U = hamiltonian.chol_basis
+    def build(self,hamiltonian):
         nb = self.nbasis
-        nelec = self.nalpha+self.nbeta
-        UB = xp.zeros((nchol,nb*2,nelec))
-        UB[:,:nb] = xp.einsum('dxp,xi->dpi',U,self.psi[:nb])
-        UB[:,nb:] = xp.einsum('dxp,xi->dpi',U,self.psi[nb:])
-        return UB
+        psi = [self.psi[:nb],self.psi[nb:]]
+        super().build(hamiltonian,psi=psi)
 

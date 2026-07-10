@@ -6,7 +6,7 @@ from ipie.walkers.base_walkers import BaseWalkers
 from ipie.utils.backend import to_host
 from ipie.utils.backend import arraylib as xp
 
-def qr(phi,UC=None,thresh=1e-3):
+def qr(phi,thresh=1e-3):
     Q,R = xp.linalg.qr(phi,mode='reduced')
     Rdiag = xp.einsum('wii->wi',R)
 
@@ -15,95 +15,35 @@ def qr(phi,UC=None,thresh=1e-3):
 
     sign = xp.sign(Rdiag)
     Q *= sign[:,None,:]
+    return Q
 
-    if UC is not None:
-        Rinv = xp.linalg.inv(R)
-        UC = xp.einsum('wdpi,wij->wdpj',UC,Rinv)
-        UC *= sign[:,None,None,:]
-    return Q,UC
-
-def get_uBS_left(uBS,ne,s):
-    if uBS.shape[-1]==ne:
-        return uBS
-    if s==0:
-        return uBS[:,:,:,:ne]
-    assert s==1
-    if ne==0:
-        return None 
-    return uBS[:,:,:,-ne:]
-
-def uBS_dot_Cu(uBS,uC,s,scalar=False):
-    uBS = get_uBS_left(uBS,uC.shape[-1],s)
-    if uBS is None:
-        return 0
-    uDu = xp.einsum('kwrj,kwsj->kwrs',uBS,uC)
-    if scalar:
-        uDu = uDu[:,:,0,0]
-    return uDu
-
-def UBS_dot_Cu(UBS,uC,s,scalar=False):
-    UBS = get_uBS_left(UBS,uC.shape[-1],s)
-    if UBS is None:
-        return 0
-    left = xp.einsum('wdpi,wri->wdpr',UBS,uC)
-    if scalar:
-        left = left[:,:,:,0]
-    return left
-
-def CU_dot_UBS(UBS,UC,s,tr=True,ixs=None):
-    UBS = get_uBS_left(UBS,UC.shape[-1],s)
-    if UBS is None:
-        return 0
-    if ixs is not None:
-        UC = UC[:,ixs]
-        UBS = UBS[:,ixs]
-    if tr:
-        return xp.einsum('wdpi,wdpi->wd',UC,UBS)
-    else:
-        return xp.einsum('wdpi,wdpj->wdij',UC,UBS)
-
-def update_phi(C,u,d,uC):
+def update_phi(C,u,d):
+    uC = xp.einsum('xwr,wxi->wri',u,C)
     duC = d[:,:,None]*uC
-    C += xp.einsum('wxr,wri->wxi',u,duC)
-    return C,duC
-
-def update_UC(UC,u2,duC):
-    UC += xp.einsum('dwpr,wri->wdpi',u2,duC)
-    return UC
-
-def update_UBS(UBS,left,uBS):
-    UBS -= xp.einsum('wdpr,wri->wdpi',left,uBS)
-    return UBS
-
-def compute_1rdm_diag(BS,C):
-    return xp.einsum('wpi,wpi->wp',BS,C)
-
-def compute_lowdin(d,uC,thresh=1e-3):
-    Cu = uC.transpose(0,2,1)
-    q,s = xp.linalg.qr(Cu,mode='reduced')
-    delta = np.einsum('wrs,ws,wts->wrt',s,d**2+2*d,s)
-    delta,v = xp.linalg.eigh(delta)
-    q = xp.einsum('wir,wrs->wis',q,v)
-    delta += 1.
-    if delta[delta<thresh.size]>0:
-        print('delta=',delta.T)
-        print('s=',s.T)
-        raise ValueError
-
-    delta = xp.sqrt(delta)
-    return q,delta
-
-def lowdin_phi(C,q,delta):
-    left = xp.einsum('wxi,wir->wxr',C,q)
-    right = (1./delta-1.)[:,None,:]*q
-    C += xp.einsum('wxr,wir->wxi',left,right)
+    C += xp.einsum('xwr,wri->wxi',u,duC)
     return C
 
-def lowdin_UC(C,q,delta):
-    left = xp.einsum('wdxi,wir->wdxr',C,q)
-    right = (1./delta-1.)[:,None,:]*q
-    C += xp.einsum('wdxr,wir->wdxi',left,right)
-    return C
+def compute_right2(uB,SCU,M1,d):
+    right2 = xp.einsum('wri,wdip->wdrp',uB,SCU)
+    M2 = xp.linalg.inv(M1) * d[:,None,:]
+    return xp.einsum('wrs,wdsp->wdrp',M2,right2),M2
+
+def compute_M3(uDu,M2,d):
+    M3 = np.eye(d.shape[1])[None,:,:]-xp.einsum('wrs,wst->wrt',M2,uDu)
+    return M3 * d[:,None,:]
+
+def compute_right3(uDu,M2,d,u2):
+    M3 = compute_M3(uDu,M2,d)
+    return xp.einsum('wrs,dpws->wdrp',M3,u2)
+
+def update_SCU(SCU,SCu,right):
+    SCU += xp.einsum('wri,wdrp->wdip',SCu,right)
+    return SCU
+
+def update_UDU(D,UB,SCu,right):
+    left = xp.einsum('dpi,wri->wdpr',UB,SCu)
+    D += xp.einsum('wdpr,wdrq->wdpq',left,right)
+    return D
 
 class UHFWalkers(BaseWalkers):
 
@@ -124,6 +64,7 @@ class UHFWalkers(BaseWalkers):
         assert len(initial_walker.shape) == 2
         self.nup = nup
         self.ndown = ndown
+        self.nelec = nup+ndown
         self.nbasis = nbasis
         self.mpi_handler = mpi_handler
 
@@ -163,261 +104,263 @@ class UHFWalkers(BaseWalkers):
         CB = xp.concatenate(CB,axis=1)
         return xp.linalg.inv(CB)
 
-    def compute_UC(self,hamiltonian):
-        U = hamiltonian.chol_basis
-        self.UC = xp.einsum('dxp,wxi->wdpi',U,self.phi)
-
     def build(self,hamiltonian,trial):
-        self.compute_UC(hamiltonian)
-        UB = trial.compute_UB(hamiltonian)
         S = self.compute_S(trial)
-        if isinstance(S,list):
-            UBS = [xp.einsum('dpi,wij->wdpj',UBi,Si) for UBi,Si in zip(UB,S)]
-            self.UBS = xp.concatenate(UBS,axis=3)
-        else:
-            self.UBS = xp.einsum('dpi,wij->wdpj',UB,S)
+        U = hamiltonian.chol_basis
+        UC = xp.einsum('dxp,wxi->wdpi',U,self.phi)
+        nu = self.nup
+        UC = [UC[:,:,:,:nu],UC[:,:,:,nu:]]
 
-        self.buff_names = ['phi','weight','phase','UC','UBS']
+        if isinstance(S,list):
+            SCU = [xp.einsum('wij,wdpj->wdip',Si,UCi) for Si,UCi in zip(S,UC)]
+            self.SCU = xp.concatenate(SCU,axis=2)
+            UDU = [xp.einsum('dpi,wdiq->wdpq',UBi,SCUi) for UBi,SCUi in zip(trial.UB,SCU)]
+            self.UDU = xp.concatenate(UDU,axis=2)
+        else:
+            nb = self.nbasis
+            self.SCU = xp.zeros((self.nwalkers,hamiltonian.nchol,self.nelec,nb*2))
+            self.SCU[:,:,:,:nb] = xp.einsum('wij,wdpj->wdip',S[:,:,:nu],UC[0])
+            self.SCU[:,:,:,nb:] = xp.einsum('wij,wdpj->wdip',S[:,:,nu:],UC[1])
+            self.UDU = xp.zeros((self.nwalkers,hamiltonian.nchol,nb*2,nb*2))
+            self.UDU[:,:,:nb] = xp.einsum('dpi,wdiq->wdpq',trial.UB[0],self.SCU)
+            self.UDU[:,:,nb:] = xp.einsum('dpi,wdiq->wdpq',trial.UB[1],self.SCU)
+
+        self.buff_names = ['phi','weight','phase','SCU','UDU']
         self.buff_size = round(self.set_buff_size_single_walker() / float(self.nwalkers))
         self.walker_buffer = xp.zeros(self.buff_size)
 
-    def get_UC(self):
-        nu = self.nup
-        return [self.UC[:,:,:,:nu],self.UC[:,:,:,nu:]]
-
-    def set_UC(self,UC):
-        nu = self.nup
-        self.UC[:,:,:,:nu] = UC[0]
-        self.UC[:,:,:,nu:] = UC[1]
-
-    def get_UBS(self):
+    def get_SCU(self,chol_ix=None):
         nb = self.nbasis
-        if self.UBS.shape[2]==nb:
+        _,_,sh1,sh2 = self.SCU.shape
+        assert sh1==self.nelec
+        if sh2==nb:
             nu = self.nup
-            return [self.UBS[:,:,:,:nu],self.UBS[:,:,:,nu:]]
-        else:
-            return [self.UBS[:,:,:nb],self.UBS[:,:,nb:]]
-
-    def set_UBS(self,UBS):
-        nb = self.nbasis
-        if self.UBS.shape[2]==nb:
-            nu = self.nup
-            self.UBS[:,:,:,:nu] = UBS[0]
-            self.UBS[:,:,:,nu:] = UBS[1]
-        else:
-            self.UBS[:,:,:nb] = UBS[0]
-            self.UBS[:,:,nb:] = UBS[1]
-
-    def get_walkers_component(self,key,p,typ):
-        chol_idx,spin = key
-        if typ=='UC':
-            UX = self.get_UC()
-        elif typ=='UBS':
-            UX = self.get_UBS()
+            SCU = [self.SCU[:,:,:nu],self.SCU[:,:,nu:]]
+        elif sh2==nb*2:
+            SCU = [self.SCU[:,:,:,:nb],self.SCU[:,:,:,nb:]]
         else:
             raise ValueError
-        uX = [UXi[:,chol_idx] for UXi in UX]
+        if chol_ix is not None:
+            SCU = [SCUi[:,chol_ix] for SCUi in SCU]
+        return SCU
 
-        if spin==(0,1):
-            p = [p[:,:1],p[:,1:]]
-            uX = [xp.asarray([uX[s][:,pi] for pi in p[s]]) for s in (0,1)]
+    def set_SCU(self,SCU):
+        nb = self.nbasis
+        _,_,sh1,sh2 = self.SCU.shape
+        assert sh1==self.nelec
+        if sh2==nb:
+            nu = self.nup
+            if SCU[0] is not None:
+                self.SCU[:,:,:nu] = SCU[0]
+            if SCU[1] is not None:
+                self.SCU[:,:,nu:] = SCU[1]
+        elif sh2==nb*2:
+            if SCU[0] is not None:
+                self.SCU[:,:,:,:nb] = SCU[0]
+            if SCU[1] is not None:
+                self.SCU[:,:,:,nb:] = SCU[1]
         else:
-            s = spin[0]
-            uX = xp.asarray([uX[s][:,pi] for pi in p])
-        return uX
+            raise ValueError
 
-    def compute_M(self,key,d):
+    def get_UDU(self,chol_ix=None):
+        nb = self.nbasis
+        _,_,sh1,sh2 = self.UDU.shape
+        assert sh1==self.nbasis*2
+        D = dict()
+        if sh2==nb:
+            D[0,0] = self.UDU[:,:,:nb]
+            D[1,1] = self.UDU[:,:,nb:]
+        elif sh2==nb*2:
+            D[0,0] = self.UDU[:,:,:nb,:nb]
+            D[1,1] = self.UDU[:,:,nb:,nb:]
+            D[0,1] = self.UDU[:,:,:nb,nb:]
+            D[1,0] = self.UDU[:,:,nb:,:nb]
+        else:
+            raise ValueError
+        if chol_ix is not None:
+            D = {key:Di[:,chol_ix] for key,Di in D.items()}
+        return D
+
+    def set_UDU(self,D):
+        nb = self.nbasis
+        _,_,sh1,sh2 = self.UDU.shape
+        assert sh1==self.nbasis*2
+        if sh2==nb:
+            if (0,0) in D:
+                self.UDU[:,:,:nb] = D[0,0]
+            if (1,1) in D:
+                self.UDU[:,:,nb:] = D[1,1]
+        elif sh2==nb*2:
+            if (0,0) in D:
+                self.UDU[:,:,:nb,:nb] = D[0,0] 
+            if (1,1) in D:
+                self.UDU[:,:,nb:,nb:] = D[1,1] 
+            if (0,1) in D:
+                self.UDU[:,:,:nb,nb:] = D[0,1] 
+            if (1,0) in D:
+                self.UDU[:,:,nb:,:nb] = D[1,0] 
+
+    def get_uDu(self,key,p):
+        chol_ix,spin = key
+        D = self.get_UDU(chol_ix)
+        if p.shape[1]==1:
+            s = spin[0]
+            uDu = D[s,s][:,p[:,0],p[:,0]]
+            return uDu.reshape(self.nwalkers,p.shape[0],1,1)
+
+        if spin!=(0,1):
+            s = spin[0]
+            D = {(s1,s2):D[s,s] for s1 in (0,1) for s2 in (0,1)}
+
+        uDu = xp.zeros((self.nwalkers,p.shape[0],2,2))
+        for s1 in (0,1):
+            for s2 in (0,1):
+                if (s1,s2) not in D:
+                    continue
+                uDu[:,:,s1,s2] = D[s1,s2][:,p[:,s1],p[:,s2]] 
+        return uDu 
+
+    def compute_M1(self,key,p,d):
         _,spin = key
-        uBS = self.uBS[key]
-        uC = self.uC[key]
-        if spin==(0,1):
-            nk,nw,_,_ = uC[0].shape
-            M = xp.zeros((nk,nw,2,2))
-            for s in (0,1):
-                M[:,:,s,s] = uBS_dot_Cu(uBS[s],uC[s],s,scalar=True)
-            if uBS[0].shape[-1]>self.nup:
-                M[:,:,0,1] = uBS_dot_Cu(uBS[0],uC[1],1,scalar=True)
-            if uBS[1].shape[-1]>self.nup:
-                M[:,:,1,0] = uBS_dot_Cu(uBS[1],uC[0],0,scalar=True)
-        else:
-            s = spin[0]
-            M = uBS_dot_Cu(uBS,uC,s)
-        M = d[:,None,:,None]*M + xp.eye(d.shape[1])[None,None,:,:]
+        uDu = self.get_uDu(key,p) 
+
+        M = d[None,:,:,None]*uDu + xp.eye(d.shape[1])[None,None,:,:]
         ovlp = xp.linalg.det(M)
+        self.M[key] = uDu,M
+        return ovlp.T
 
-        M = xp.linalg.inv(M) * d[:,None,None,:]
-        self.M2[key] = M
-        return ovlp
-
-    def compute_ovlp_ratio(self,hamiltonian,trial):
+    def compute_ovlp_ratio(self,hamiltonian):
         ovlp = xp.zeros((hamiltonian.nterms,self.nwalkers))
-        self.uC = dict()
-        self.uBS = dict()
-        self.M2 = dict()
+        self.M = dict()
         keys = 'p','d','ix'
         for key,dat in hamiltonian.term_dict.items():
             p,d,ix = [dat[k] for k in keys]
-
-            self.uC[key] = self.get_walkers_component(key,p,'UC')
-            self.uBS[key] = self.get_walkers_component(key,p,'UBS')
-            ovlp[ix] = self.compute_M(key,d)
+            ovlp[ix] = self.compute_M1(key,p,d)
         return ovlp
 
-    def update_walkers(self,samples):
-        keys = 'w','i','u','d','u2'
-        for key in samples:
-            dat = samples[key]
-            w,i,u,d,u2 = [dat[k] for k in keys]
+    def update_walkers(self,hamiltonian,trial):
+        self.itm = dict()
+        for key,ixs in hamiltonian.samples.items():
+            w,i = ixs['w'],ixs['i']
+            p,d,u,u2 = hamiltonian.get_batch_ud(key,i)
 
-            uC,duC = self.update_phi(key,w,i,u,d)
-            self.update_UC(key,w,u2,duC)
-            self.update_UBS(key,w,i,uC) 
+            self.update_phi(key,w,u,d)
+            chol_ix,spin = key
+            if spin==(0,1):
+                self.update_density_2(key,w,i,p,d,u,u2,trial)
+            else:
+                self.update_density_1(key,w,i,p,d,u,u2,trial)
 
-            samples[key] = {'w':w,'d':d,'uC':uC}
-        return samples
-
-    def update_phi(self,key,w,i,u,d):
+    def update_phi(self,key,w,u,d):
         _,spin = key
-        uC = self.uC[key]
         phi = self.get_phi()
         if spin==(0,1):
             d = [d[:,:1],d[:,1:]]
             u = [u[:,:,:1],u[:,:,1:]]
-            uC = [uCi[i,w] for uCi in uC]
-            duC = [None] * 2
             for s in (0,1):
-                phi[s][w],duC[s] = update_phi(phi[s][w],u[s],d[s],uC[s])
+                phi[s][w] = update_phi(phi[s][w],u[s],d[s])
         else:
             s = spin[0]
-            uC = uC[i,w]
-            phi[s][w],duC = update_phi(phi[s][w],u,d,uC)
+            phi[s][w] = update_phi(phi[s][w],u,d)
         self.set_phi(phi)
-        return uC,duC
 
-    def update_UC(self,key,w,u2,duC):
-        _,spin = key
-        UC = self.get_UC()
-        if spin==(0,1):
-            u2 = [u2[:,:,:,:1],u2[:,:,:,1:]]
-            for s in (0,1):
-                UC[s][w] = update_UC(UC[s][w],u2[s],duC[s])
-        else:
-            s = spin[0]
-            UC[s][w] = update_UC(UC[s][w],u2,duC)
-        self.set_UC(UC)
-
-    def update_UBS_1(self,key,w,i,uC):
-        _,spin = key
+    @plum.dispatch
+    def update_density_1(self,key,w,i,p,d,u,u2,trial:SingleDet):
+        chol_ix,spin = key
         s = spin[0]
 
-        M = self.M2[key][i,w]
-        MuC = xp.einsum('wri,wrs->wsi',uC,M)
-        uBS = self.uBS[key]
-        if self.UBS.shape[2]==self.nbasis:
-            UBS = self.get_UBS()
-            left = UBS_dot_Cu(UBS[s][w],MuC,s)
-            UBS[s][w] = update_UBS(UBS[s][w],left,uBS[i,w])
-            self.set_UBS(UBS)
-        else:
-            left = UBS_dot_Cu(self.UBS[w],MuC,s)
-            self.UBS[w] = update_UBS(self.UBS[w],left,uBS[i,w])
+        SCU = self.get_SCU()[s]
+        uDu,M1 = self.M[key]
 
-    def update_UBS_2(self,key,w,i,uC):
-        M = self.M2[key][i,w]
-        M = M[:,:1],M[:,1:]
-        MuC = [xp.einsum('wri,wrs->wsi',uC[s],M[s]) for s in (0,1)]
+        right2,M2 = compute_right2(trial.UB[s][chol_ix,p],SCU[w],M1[w,i],d)
+        right3 = compute_right3(uDu[w,i],M2,d,u2)
+        right = right3 - right2
 
-        uBS = self.uBS[key]
-        uBS = [uBSi[i,w] for uBSi in uBS]
-        if self.UBS.shape[2]==self.nbasis:
-            UBS = self.get_UBS()
-            for s in (0,1):
-                left = UBS_dot_Cu(UBS[s][w],MuC[s],s)
-                UBS[s][w] = update_UBS(UBS[s][w],left,uBS[s])
-            self.set_UBS(UBS)
-        else:
-            MuC = np.concatenate(MuC,axis=2)
-            left = UBS_dot_Cu(self.UBS[w],MuC,None)
-            uBS = xp.concatenate(uBS,axis=1)
-            self.UBS[w] = update_UBS(self.UBS[w],left,uBS)
+        SCu = SCU[w[:,None],chol_ix,:,p]
+        SCU[w] = update_SCU(SCU[w],SCu,right)
 
-    def update_UBS(self,key,w,i,uC):
-        _,spin = key
-        if spin==(0,1):
-            self.update_UBS_2(key,w,i,uC)
-        else:
-            self.update_UBS_1(key,w,i,uC)
+        D = self.get_UDU()[s,s]
+        D[w] = update_UDU(D[w],trial.UB[s],SCu,right)
+        self.set_SCU({s:SCU,1-s:None})
+        self.set_UDU({(s,s):D})
 
-    def compute_lowdin(self,samples):
-        keys = 'w','d','uC'
-        for key in samples.items():
-            dat = samples[key]
-            w,d,uC = [dat[k] for k in keys]
-            q,delta = self._compute_lowdin(key,d,uC)
-            samples[key] = {'w':w,'q':q,'delta':delta}
-        return samples
+    @plum.dispatch
+    def update_density_2(self,key,w,i,p,d,u,u2,trial:SingleDet):
+        chol_ix,_ = key
+        p = [p[:,:1],p[:,1:]]
+        d = [d[:,:1],d[:,1:]]
+        u2 = [u2[:,:,:,:1],u2[:,:,:,1:]]
 
-    def _compute_lowdin(self,key,d,uC):
-        _,spin = key
-        if spin==(0,1):
-            q = [None] * 2
-            delta = [None] * 2
-            d = [d[:,:1],d[:,1:]]
-            for s in (0,1):
-                q[s],delta[s] = compute_lowdin(d[s],uC[s])
-        else:
-            q,delta = compute_lowdin(d,uC) 
-        return q,delta
+        SCU = self.get_SCU()
+        D = self.get_UDU()
 
-    def lowdin(self,samples):
-        keys = 'w','q','delta'
-        for key,dat in samples.items():
-            w,q,delta = [dat[k] for k in keys]
-            self.lowdin_phi(key,w,q,delta)
+        uDu,M1 = self.M[key]
+        uDu,M1 = uDu[w,i],M1[w,i]
+        uDu = [uDu[:,:1,:1],uDu[:,1:,1:]]
+        M1 = [M1[:,:1,:1],M1[:,1:,1:]]
+        for s in (0,1):
+            right2,M2 = compute_right2(trial.UB[s][chol_ix,p[s]],SCU[s][w],M1[s],d[s])
+            right3 = compute_right3(uDu[s],M2,d[s],u2[s])
+            right = right3 - right2
 
-    def lowdin_phi(self,key,w,q,delta):
-        _,spin = key
-        phi = self.get_phi()
-        if spin==(0,1):
-            for s in (0,1):
-                phi[s][w] = lowdin_phi(phi[s][w],q[s],delta[s])
-        else:
-            s = spin[0]
-            phi[s][w] = lowdin_phi(phi[s][w],q,delta)
-        self.set_phi(phi)
+            SCu = SCU[s][w[:,None],chol_ix,:,p[s]]
+            SCU[s][w] = update_SCU(SCU[s][w],SCu,right)
+            D[s,s][w] = update_UDU(D[s,s][w],trial.UB[s],SCu,right)
 
-    def compute_1rdm_diag(self,chol_ix):
-        phi = self.get_phi()
-        BS = [UBSi[:,chol_ix] for UBSi in self.get_UBS()]
-        D = dict()
-        if BS[0].shape[-1]==phi[0].shape[-1]:
-            D[0,0] = compute_1rdm_diag(BS[0],phi[0])
-            D[1,1] = compute_1rdm_diag(BS[1],phi[1])
-            return D
+        self.set_SCU(SCU)
+        self.set_UDU(D)
+
+    @plum.dispatch
+    def update_density_1(self,key,w,i,p,d,u,u2,trial:SingleDetGHF):
+        chol_ix,spin = key
+        s = spin[0]
         nu = self.nup
-        D[0,0] = compute_1rdm_diag(BS[0][:,:,:,:nu],phi[0])
-        D[1,1] = compute_1rdm_diag(BS[1][:,:,:,nu:],phi[1])
-        D[0,1] = compute_1rdm_diag(BS[0][:,:,:,nu:],phi[1])
-        D[1,0] = compute_1rdm_diag(BS[1][:,:,:,:nu],phi[0])
-        return D
 
-    def compute_local_energy_intermediates(self,bands,tr_ixs=None,mat_ixs=None):
-        UBS = [bands[None,:,:,None]*UBSi for UBSi in self.get_UBS()]
-        UC = self.get_UC()
+        uB = trial.UB[s][chol_ix,p]
+        uDu,M1 = self.M[key]
 
-        tr = [CU_dot_UBS(UBS[s],UC[s],s,tr=True,ixs=tr_ixs) for s in (0,1)] 
-        if mat_ixs is None:
-            return tr
-        mat = [CU_dot_UBS(UBS[s],UC[s],s,tr=False,ixs=mat_ixs) for s in (0,1)] 
-        return tr,mat 
+        right2,M2 = compute_right2(uB,self.SCU[w],M1[w,i],d) 
+        right3 = compute_right3(uDu[w,i],M2,d,u2)
+        nb = self.nbasis
+        right = -right2
+        if s==0:
+            right[:,:,:,:nb] += right3
+        else:
+            right[:,:,:,nb:] += right3
+
+        SCu = self.get_SCU(chol_ix)[s][w[:,None],:,p]
+        self.SCU[w] = update_SCU(self.SCU[w],SCu,right)
+
+        self.UDU[w,:,:nb] = update_UDU(self.UDU[w,:,:nb],trial.UB[0],SCu,right)
+        self.UDU[w,:,nb:] = update_UDU(self.UDU[w,:,nb:],trial.UB[1],SCu,right)
+
+    @plum.dispatch
+    def update_density_2(self,key,w,i,p,d,u,u2,trial:SingleDetGHF):
+        chol_ix,_ = key
+        p = [p[:,:1],p[:,1:]]
+        uB = xp.concatenate([trial.UB[s][chol_ix,p[s]] for s in (0,1)],axis=1)
+        uDu,M1 = self.M[key]
+        right2,M2 = compute_right2(uB,self.SCU[w],M1[w,i],d) 
+        right = -right2
+
+        M3 = compute_M3(uDu[w,i],M2,d)
+        nb = self.nbasis
+        right[:,:,:,:nb] += xp.einsum('wr,dpw->wdrp',M3[:,:,0],u2[:,:,:,0])
+        right[:,:,:,nb:] += xp.einsum('wr,dpw->wdrp',M3[:,:,1],u2[:,:,:,1])
+
+        SCU = self.get_SCU(chol_ix)
+        SCu = [SCU[s][w[:,None],:,p[s]] for s in (0,1)]
+        SCu = xp.concatenate(SCu,axis=1)
+        self.SCU[w] = update_SCU(self.SCU[w],SCu,right)
+
+        self.UDU[w,:,:nb] = update_UDU(self.UDU[w,:,:nb],trial.UB[0],SCu,right)
+        self.UDU[w,:,nb:] = update_UDU(self.UDU[w,:,nb:],trial.UB[1],SCu,right)
 
     def reortho(self):
         phi = self.get_phi()
-        UC = self.get_UC()
         for s in (0,1):
-            phi[s],UC[s] = qr(phi[s],UC[s])
+            phi[s] = qr(phi[s])
         self.set_phi(phi)
-        self.set_UC(UC)
 
     def save(self,comm,dirname):
         RANK,SIZE = comm.rank,comm.size

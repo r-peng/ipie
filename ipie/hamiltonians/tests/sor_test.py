@@ -10,7 +10,8 @@ from ipie.hamiltonians.bitstring_utils import (
 )
 
 def get_MB_kappa(ham,ix,basis,basis_map):
-    v,ds,ps,spin = ham.get_single_ud(ix)
+    chol_ix,spin,ps,ds = ham.get_term(ix)
+    v = ham.chol_basis[chol_ix]
     g = np.log(1.+ds)
     kappa = [None] * 2
     if spin==(0,1):

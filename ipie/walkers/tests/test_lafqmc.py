@@ -4,16 +4,16 @@ from ipie.walkers.lafqmc_uhf_walkers import UHFWalkers
 from ipie.walkers.lafqmc_ghf_walkers import GHFWalkers 
 
 def get_data(walkers):
-    phi = walkers.phi.copy()
-    UC = walkers.UC.copy()
-    UBS = walkers.UBS.copy()
-    return [phi,UC,UBS]
+    data = [None] * 3
+    data[0] = walkers.phi.copy()
+    data[1] = walkers.SCU.copy()
+    data[2] = walkers.UDU.copy()
+    return data
 
 def set_data(walkers,data):
-    phi,UC,UBS = data
-    walkers.phi = phi.copy()
-    walkers.UC = UC.copy()
-    walkers.UBS = UBS.copy()
+    walkers.phi = data[0].copy()
+    walkers.SCU = data[1].copy()
+    walkers.UDU = data[2].copy()
 
 def compute_scalar_ovlp(walkers,trial):
     S = walkers.compute_S(trial) 
@@ -140,7 +140,6 @@ if __name__=='__main__':
             eri[i, i, i, i] = U
         verbose = True 
         chol = modified_cholesky(eri.reshape((nsite**2,)*2),verbose=verbose,cmax=nsite) 
-        print(chol.shape)
         generic_real_chols[0] = GenericRealChol(np.array([h1e,h1e]),chol.T,0)
 
     nchol = 3
@@ -235,6 +234,7 @@ if __name__=='__main__':
                 afqmc = AFQMC.build(nelecs,generic_real_chol,trial_,walkers=walkers_,num_walkers=nwalker,num_steps_per_block=1,num_blocks=1,timestep=0.001)
                 afqmc.setup_estimators(None,None)
         
+            trial.build(ham)
             walkers.build(ham,trial)
             if walkers_type==trial_type:
                 eloc,e1,e2 = ham.local_energy(walkers)
@@ -242,17 +242,15 @@ if __name__=='__main__':
                 e1 = np.dot(e1,walkers.weight)/sum(walkers.weight)
                 e2 = np.dot(e2,walkers.weight)/sum(walkers.weight)
                 print('E,E1,E2=',E,e1,e2)
-            #continue
 
             ovlp_ratio1 = np.zeros((ham.nterms,walkers.nwalkers))
             for ix in range(ham.nterms):
                 ovlp_ratio1[ix] = compute_ovlp_ratio_single(ham,ix,walkers,trial)
-            ovlp_ratio2 = walkers.compute_ovlp_ratio(ham,trial)
+            ovlp_ratio2 = walkers.compute_ovlp_ratio(ham)
             #print('ovlp ratio')
             #print(ovlp_ratio1.T)
             #print(ovlp_ratio2.T)
             test_norm(ovlp_ratio1,ovlp_ratio2)
-            #continue
 
             niter = ham.nterms // walkers.nwalkers + 1
             start = 0
@@ -265,13 +263,11 @@ if __name__=='__main__':
                 data1 = update_walkers_slow(ham,ixs,walkers,trial)
 
                 data_old = get_data(walkers)
-                samples = ham.parse_samples(ixs)
-                walkers.update_walkers(samples)
+                ham.parse_samples(ixs)
+                walkers.update_walkers(ham,trial)
                 data2 = get_data(walkers)
                 set_data(walkers,data_old)
-                types = 'phi','UC','UBS'
-                for item1,item2,typ in zip(data1,data2,types):
-                    #print(typ)
+                for item1,item2 in zip(data1,data2):
                     test_norm(item1,item2)
                 start = stop
 

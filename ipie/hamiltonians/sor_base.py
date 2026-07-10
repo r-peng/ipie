@@ -1,13 +1,9 @@
 import numpy as np
 from ipie.utils.backend import arraylib as xp
-#from ipie.walkers.lafqmc_uhf_walkers import UHFWalkers
-#from ipie.walkers.lafqmc_ghf_walkers import GHFWalkers
-#from ipie.trial_wavefunction.lafqmc_single_det import SingleDet 
-#from ipie.trial_wavefunction.lafqmc_single_det_ghf import SingleDetGHF
 
 class SumOfRotationBase:
 
-    def __init__(self,apply_spin_down=True,importance_sample=False,thresh=1e-6):
+    def __init__(self,apply_spin_down=True,thresh=1e-6):
         self.chol_basis = []
         self.chol_bands = []
         self.chol_ix = dict()
@@ -157,20 +153,17 @@ class SumOfRotationBase:
                 i_dict[key] = []
             i_dict[key].append(i)
 
-        samples = dict()
+        self.samples = dict()
         for key in w_dict:
             w = xp.asarray(w_dict[key])
             i = xp.asarray(i_dict[key])
-            u,d,u2 = self.get_batch_ud(key,i)
-            samples[key] = {'w':w,'i':i,'u':u,'d':d,'u2':u2}
-        return samples
+            self.samples[key] = {'w':w,'i':i}
 
     def get_batch_ud(self,key,i):
         chol_ix,spin = key
         dat = self.term_dict[key]
         p,d = dat['p'][i],dat['d'][i]
-        u = self.chol_basis[chol_ix]
-        u = xp.asarray([u[:,pi] for pi in p])
+        u = self.chol_basis[chol_ix][:,p]
         
         nw,r = p.shape
         u2 = [None] * self.nchol 
@@ -181,20 +174,20 @@ class SumOfRotationBase:
                 U2 = self.chol_basis2[chol_ix,i].T
             else:
                 U2 = self.chol_basis2['eye'] 
-            u2[i] = [U2[:,pi] for pi in p]
+            u2[i] = U2[:,p]
         u2 = xp.asarray(u2)
-        return u,d,u2
+        return p,d,u,u2
 
-    def get_single_ud(self,ix):
+    def get_term(self,ix):
         key,i = self.ix2key[ix]
         chol_ix,spin = key
         dat = self.term_dict[key]
         p,d = dat['p'][i],dat['d'][i]
-        u = self.chol_basis[chol_ix]
-        return u,d,p,spin 
+        return chol_ix,spin,p,d
 
     def get_rotation_matrix(self,ix):
-        v,ds,ps,spin = self.get_single_ud(ix)
+        chol_ix,spin,ps,ds = self.get_term(ix)
+        v = self.chol_basis[chol_ix]
         U = [None] * 2
         if spin==(0,1):
             for s,p in enumerate(ps):
@@ -239,15 +232,16 @@ class HubbardSOR(SumOfRotationBase):
             self.add_term(ai,chol_ix,[i,i],[dm,dp],[0,1])
 
     def local_energy(self,walkers):
-        tr = walkers.compute_local_energy_intermediates(self.chol_bands,tr_ixs=self.chol_ix['h1'])
-        E1 = tr[0][:,0]+tr[1][:,0]
+        D = walkers.get_UDU()
+
+        ix = self.chol_ix['h1'][0]
+        E1 = xp.einsum('p,wpp->w',self.chol_bands[ix],D[0,0][:,ix])
+        E1 += xp.einsum('p,wpp->w',self.chol_bands[ix],D[1,1][:,ix])
     
-        D = walkers.compute_1rdm_diag(self.chol_ix['U'][0])
-        E2 = (D[0,0]*D[1,1]).sum(axis=1)
-        if (0,1) not in D:
-            E2 *= self.hubbard_U
-            return E1+E2,E1,E2
-        E2 -= (D[0,1]*D[1,0]).sum(axis=1)
+        ix = self.chol_ix['U'][0]
+        E2 = xp.einsum('wpp,wpp->w',D[0,0][:,ix],D[1,1][:,ix])
+        if (0,1) in D:
+            E2 -= xp.einsum('wpp,wpp->w',D[0,1][:,ix],D[1,0][:,ix])
         E2 *= self.hubbard_U
         return E1+E2,E1,E2
 
@@ -297,17 +291,28 @@ class QCSOR(SumOfRotationBase):
                         self.add_term(aisq,chol_ix,[q,p],[-dq,dp],[0,1])
 
     def local_energy(self,walkers):
-        h1_ix = self.chol_ix['h1'][0]
-        chol_ix = self.chol_ix['chol']
-        tr,mat = walkers.compute_local_energy_intermediates(self.chol_bands,mat_ixs=chol_ix)
-        E1 = tr[0][:,h1_ix]+tr[1][:,h1_ix]
+        D = walkers.get_UDU()
 
-        tr = [tri[:,chol_ix] for tri in tr] 
-        E2 = ((tr[0]+tr[1])**2).sum(axis=1) 
-        E2 -= xp.einsum('wdij,wdji->w',mat[0],mat[0])
-        E2 -= xp.einsum('wdij,wdji->w',mat[1],mat[1])
-        if walkers.UBS.shape[2]==walkers.nbasis*2:
-            E2 -= 2.*xp.einsum('wdij,wdji->w',mat[0],mat[1])
+        ix = self.chol_ix['h1'][0]
+        E1 = xp.einsum('p,wpp->w',self.chol_bands[ix],D[0,0][:,ix])
+        E1 += xp.einsum('p,wpp->w',self.chol_bands[ix],D[1,1][:,ix])
+
+        ix = self.chol_ix['chol']
+        Sigma = self.chol_bands[ix]
+        Daa,Dbb = D[0,0][:,ix],D[1,1][:,ix]
+        Daa = Sigma[None,:,:,None]*Daa
+        Dbb = Sigma[None,:,:,None]*Dbb
+        tr = xp.einsum('wdpp->wd',Daa)
+        tr += xp.einsum('wdpp->wd',Dbb)
+        E2 = (tr**2).sum(axis=1) 
+
+        E2 -= xp.einsum('wdpq,wdqp->w',Daa,Daa)
+        E2 -= xp.einsum('wdpq,wdqp->w',Dbb,Dbb)
+        if (0,1) in D: 
+            Dab,Dba = D[0,1][:,ix],D[1,0][:,ix]
+            Dab = Sigma[None,:,:,None]*Dab
+            Dba = Sigma[None,:,:,None]*Dba
+            E2 -= 2.*xp.einsum('wdpq,wdqp->w',Dab,Dba)
         E2 *= .5
         return E1+E2,E1,E2
     

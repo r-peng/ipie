@@ -33,20 +33,12 @@ from ipie.estimators.estimator_base import EstimatorBase
 from ipie.estimators.handler_custom import EstimatorHandler
 from ipie.qmc.options import QMCParams
 from ipie.utils.backend import arraylib as xp
-from ipie.utils.backend import to_host
+#from ipie.utils.backend import to_host
 from ipie.utils.backend import synchronize
 from ipie.utils.mpi import MPIHandler
 from ipie.walkers.base_walkers import WalkerAccumulator
 from ipie.walkers.pop_controller_custom import PopController
 from ipie.qmc.afqmc import AFQMCBase
-from ipie.walkers.walkers_utils import (
-        preprocess,
-        save_walkers,
-        load_walkers,
-        compute_intermediates,
-        update_walkers,
-        orthogonalise,
-)
    
 class LAFQMC(AFQMCBase):
     """AFQMC driver for zero temperature open ended random walk.
@@ -249,8 +241,6 @@ class LAFQMC(AFQMCBase):
         discard_weights_aftereq=False,
         additional_estimators: Optional[Dict[str, EstimatorBase]] = None,
         constraint_path=True,
-        minibatch_size=1,
-        lowdin=False,
         eps_sq=None,
         max_nprod=20,
         max_nsum=500,
@@ -318,7 +308,8 @@ class LAFQMC(AFQMCBase):
 
         start = time.time()
         iprint = 1 if comm.rank==0 else 0
-        preprocess(self.walkers,self.trial,self.hamiltonian,iprint=iprint)
+        self.trial.build(self.hamiltonian)
+        self.walkers.build(self.hamiltonian,self.trial)
         if comm.rank==0:
             print('preprocess time=',time.time()-start)
 
@@ -333,20 +324,18 @@ class LAFQMC(AFQMCBase):
             if step <= num_eqlb_steps:
                 if step % self.params.num_eq_stblz == 0:
                     start = time.time()
-                    #self.walkers.orthogonalise()
-                    orthogonalise(self.walkers,self.trial)
+                    self.walkers.orthogonalise()
                     synchronize()
                     self.tortho += time.time() - start
             else:
                 if step % self.params.num_stblz == 0:
                     start = time.time()
-                    #self.walkers.orthogonalise()
-                    orthogonalise(self.walkers,self.trial)
+                    self.walkers.orthogonalise()
                     synchronize()
                     self.tortho += time.time() - start
 
             start = time.time()
-            self.propagate_walkers(lowdin=lowdin,constraint_path=constraint_path,minibatch_size=minibatch_size)
+            self.propagate_walkers(constraint_path=constraint_path)
             self.tprop_update += time.time() - start 
 
             #start_clip = time.time()
@@ -387,7 +376,6 @@ class LAFQMC(AFQMCBase):
                     start = time.time()
                     self.pop_ctr(comm,self.pcontrol)
                     synchronize()
-                    orthogonalise(self.walkers,self.trial)
                     self.tpopc += time.time() - start
                     self.tpopc_send = self.pcontrol.timer.send_time
                     self.tpopc_recv = self.pcontrol.timer.recv_time
@@ -397,7 +385,6 @@ class LAFQMC(AFQMCBase):
             # accumulate weight, hybrid energy etc. across block
             start = time.time()
             self.accumulators.update(self.walkers)
-            orthogonalise(self.walkers,self.trial)
             synchronize()
             self.testim += time.time() - start  # we dump this time into estimator
 
@@ -439,119 +426,34 @@ class LAFQMC(AFQMCBase):
 
     def propagate_walkers(self, constraint_path=True):
         # sample rotations 
-        ovlp = self.walkers.compute_ovlp_ratio(self.hamiltonian,self.trial)
-        g = b * self.hamiltonian.coeffs[:,None]
+        ovlp = self.walkers.compute_ovlp_ratio(self.hamiltonian)
+        g = ovlp * self.hamiltonian.a[:,None]
         p = xp.fabs(g)
         sign = g/p
-        b = g.sum(axis=0)
-        p = p/g[None,:] 
+        b = p.sum(axis=0)
+        p = p/b[None,:] 
 
-        kixs = xp.random.choice(self.hamiltonian.nterms,size=self.walkers.nwalkers,replace=True,p=p)
-        self.walkers.update_walkers(to_host(kixs),self.hamiltonian)
+        nw = self.walkers.nwalkers
+        ixs = [xp.random.choice(self.hamiltonian.nterms,p=p[:,i]) for i in range(nw)]
+        self.hamiltonian.parse_samples(ixs)
+        self.walkers.update_walkers(self.hamiltonian,self.trial)
         synchronize()
     
         # 4.update weight
+        b *= sign[xp.asarray(ixs),xp.arange(nw)]
         bminus = xp.nonzero(b<0.)[0] 
         nminus = bminus.size
         if nminus>0: 
-            kixs = kixs[bminus]
-            kixs = to_host(kixs)
-            for kix in kixs:
-                term = self.hamiltonian.terms[kix]
-                print(f'term.chol_idx={term.chol_idx},d={term.d}')
+            ixs = [ixs[i] for i in bminus]
+            for ix in ixs:
+                chol_ix,spin,p,d = self.hamiltonian.get_term(ix)
+                print(f'chol_ix={chol_ix},spin={spin},p={p},d={d}')
 
         if constraint_path:
             xp.clip(b, a_min=0.0, a_max=None, out=b)  
         self.walkers.weight *= b 
         #print(f'term_label={kixs[0]},weight multiplier={b[0]},accumulated weight={self.walkers.weight[0]},ovlp={1./self.walkers.Sa[0,0,0]}')
         synchronize()
-
-        return kixs,b
-    
-
-    #def propagate_walkers_simple(self,lowdin=True):
-    #    # sample rotations 
-    #    kixs = xp.random.choice(self.hamiltonian.nterms,size=self.walkers.nwalkers,replace=True,p=self.hamiltonian.prob)
-    #    rotations = self.hamiltonian.parse_sampled_rotations(to_host(kixs))
-
-    #    # update walkers 
-    #    b = self.hamiltonian.a_over_q[kixs].copy()
-    #    try:
-    #        compute_intermediates(self.walkers,rotations,lowdin=lowdin)
-    #    except ValueError:
-    #        orthogonalise(self.walkers,self.trial)
-    #        compute_intermediates(self.walkers,rotations,lowdin=lowdin)
-    #    b = update_walkers(self.walkers,rotations,b=b,lowdin=lowdin)
-    #    return kixs,b
-    #
-    #def propagate_walkers_minibatch(self,K,lowdin=True):
-    #    nw = self.walkers.nwalkers
-    #    # compute probability 
-    #    minibatch_kixs = xp.random.choice(self.hamiltonian.nterms,size=(K,nw),replace=True,p=self.hamiltonian.prob)
-    #    minibatch_kixs_host = to_host(minibatch_kixs)
-    #
-    #    b = xp.ones((K,nw))
-    #    rotations = [None] * K
-    #    for i in range(K):
-    #        kixs = minibatch_kixs[i]
-    #        b[i] = self.hamiltonian.a_over_q[kixs].copy()
-    #        kixs = minibatch_kixs_host[i]
-    #        rotations[i] = self.hamiltonian.parse_sampled_rotations(kixs)
-    #
-    #    try:
-    #        for i in range(K):
-    #            compute_intermediates(self.walkers,rotations[i],lowdin=lowdin)
-    #    except ValueError:
-    #        orthogonalise(self.walkers,self.trial)
-    #        for i in range(K):
-    #            compute_intermediates(self.walkers,rotations[i],lowdin=lowdin)
-
-    #    for i in range(K):
-    #        b[i] = update_walkers(self.walkers,rotations[i],walkers_update=False,b=b[i])
-    #    
-    #    # sample rotations 
-    #    p = xp.fabs(b)
-    #    B = p.sum(axis=0)
-    #    p /= B[None,:] 
-    #    kixs = [None] * nw
-    #    for i in range(nw):
-    #        k = xp.random.choice(K,size=1,p=p[:,i])[0]
-    #        B[i] *= xp.sign(b[k,i])
-    #
-    #        kixs[i] = minibatch_kixs[k,i]
-    #    kixs = xp.asarray(kixs)
-    #    rotations = self.hamiltonian.parse_sampled_rotations(to_host(kixs))
-
-    #    # update walkers
-    #    B /= K
-    #    compute_intermediates(self.walkers,rotations,lowdin=lowdin)
-    #    update_walkers(self.walkers,rotations,lowdin=lowdin)
-    #    return kixs,B
-
-    #def propagate_walkers(self, lowdin=True, constraint_path=True, minibatch_size=1):
-    #    if minibatch_size==1:
-    #        kixs,b = self.propagate_walkers_simple(lowdin=lowdin)
-    #    elif minibatch_size<self.hamiltonian.nterms:
-    #        kixs,b = self.propagate_walkers_minibatch(minibatch_size,lowdin=lowdin)
-    #    else:
-    #        raise NotImplementedError
-    #    synchronize()
-    #
-    #    # 4.update weight
-    #    bminus = xp.nonzero(b<0.)[0] 
-    #    nminus = bminus.size
-    #    if nminus>0: 
-    #        kixs = kixs[bminus]
-    #        kixs = to_host(kixs)
-    #        for kix in kixs:
-    #            term = self.hamiltonian.terms[kix]
-    #            print(f'term.chol_idx={term.chol_idx},d={term.d}')
-
-    #    if constraint_path:
-    #        xp.clip(b, a_min=0.0, a_max=None, out=b)  
-    #    self.walkers.weight *= b 
-    #    #print(f'term_label={kixs[0]},weight multiplier={b[0]},accumulated weight={self.walkers.weight[0]},ovlp={1./self.walkers.Sa[0,0,0]}')
-    #    synchronize()
 
     def pop_ctr(self,comm,pcontrol,pre_estimate=True):
         if self.params.pop_control_method=='stochastic_reconfiguration':
@@ -574,7 +476,7 @@ class LAFQMC(AFQMCBase):
     def save(self,comm,dirname='.'):
         if dirname is None:
             return
-        save_walkers(self.walkers,comm,dirname)
+        self.walkers.save(comm,dirname)
         if self.params.pop_control_method!='stochastic_reconfiguration':
             return
         if comm.rank>0:
