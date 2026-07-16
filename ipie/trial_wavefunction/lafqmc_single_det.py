@@ -16,11 +16,18 @@ class SingleDet(TrialWavefunctionBase):
         self.psi = [wavefunction[:, : self.nalpha],wavefunction[:, self.nalpha :]]
         self.handler = handler
 
-    def build(self,hamiltonian,psi=None):
-        if psi is None:
-            psi = self.psi
+    def get_psi(self):
+        return self.psi 
+
+    def build(self,hamiltonian,conjugate=False):
+        psi = self.get_psi()
         U = hamiltonian.chol_basis
         self.UB = [xp.einsum('dxp,xi->dpi',U,Bi) for Bi in psi]
+        if not conjugate:
+            return
+        self.hB = [xp.einsum('xy,yi->xi',hamiltonian.h1e,Bi) for Bi in psi]
+        if hamiltonian.chol is not None:
+            self.LB = [xp.einsum('dxy,yi->dxi',hamiltonian.chol,Bi) for Bi in psi]
 
     def calc_force_bias(self, hamiltonian, walkers, mpi_handler):
         pass
@@ -33,3 +40,5 @@ class SingleDet(TrialWavefunctionBase):
 
     def half_rotate(self, hamiltonian, comm):
         pass
+
+    

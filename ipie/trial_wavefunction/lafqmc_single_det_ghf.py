@@ -16,8 +16,6 @@ class SingleDetGHF(SingleDet):
         self.psi = wavefunction
         self.handler = handler
 
-    def build(self,hamiltonian):
-        nb = self.nbasis
-        psi = [self.psi[:nb],self.psi[nb:]]
-        super().build(hamiltonian,psi=psi)
+    def get_psi(self):
+        return [self.psi[:self.nbasis],self.psi[self.nbasis:]]
 

@@ -241,6 +241,7 @@ class LAFQMC(AFQMCBase):
         discard_weights_aftereq=False,
         additional_estimators: Optional[Dict[str, EstimatorBase]] = None,
         constraint_path=True,
+        importance_sample=True,
         eps_sq=None,
         max_nprod=20,
         max_nsum=500,
@@ -278,10 +279,10 @@ class LAFQMC(AFQMCBase):
         if walkers is not None:
             self.walkers = walkers
         if start_step>0:
-            load_walkers(self.walkers,comm,load_dirname)
+            self.walkers.load(comm,load_dirname)
         self.setup_timers()
         eshift = 0.0
-        self.walkers.orthogonalise()
+        self.walkers.reortho(None)
 
         self.pcontrol_eq = PopController(
             self.params.num_walkers,
@@ -308,8 +309,8 @@ class LAFQMC(AFQMCBase):
 
         start = time.time()
         iprint = 1 if comm.rank==0 else 0
-        self.trial.build(self.hamiltonian)
-        self.walkers.build(self.hamiltonian,self.trial)
+        self.trial.build(self.hamiltonian,conjugate=(not importance_sample))
+        self.walkers.build(self.hamiltonian,self.trial,density=importance_sample)
         if comm.rank==0:
             print('preprocess time=',time.time()-start)
 
@@ -318,24 +319,24 @@ class LAFQMC(AFQMCBase):
         synchronize()
         self.tsetup += time.time() - tzero_setup
 
-        for step in range(1+start_step, total_steps + 1+start_step):
+        for step in range(1, total_steps + 1):
             synchronize()
-            start_step = time.time()
+            #start_step = time.time()
             if step <= num_eqlb_steps:
                 if step % self.params.num_eq_stblz == 0:
                     start = time.time()
-                    self.walkers.orthogonalise()
+                    self.walkers.reortho(self.trial)
                     synchronize()
                     self.tortho += time.time() - start
             else:
                 if step % self.params.num_stblz == 0:
                     start = time.time()
-                    self.walkers.orthogonalise()
+                    self.walkers.reortho(self.trial)
                     synchronize()
                     self.tortho += time.time() - start
 
             start = time.time()
-            self.propagate_walkers(constraint_path=constraint_path)
+            self.propagate_walkers(constraint_path=constraint_path,importance_sample=importance_sample)
             self.tprop_update += time.time() - start 
 
             #start_clip = time.time()
@@ -393,14 +394,15 @@ class LAFQMC(AFQMCBase):
             if step > num_eqlb_steps:
                 if step % self.params.num_steps_per_block == 0:
                     block = (step - num_eqlb_steps) // self.params.num_steps_per_block
-                    self.estimate_energy(comm,block)
+                    #print(start_step)
+                    self.estimate_energy(comm,block+start_step)
                     self.accumulators.zero()
                     self.save(comm,dirname)
                     self.print_stats(comm,self.pcontrol)
             else:
                 if step % self.params.eq_num_steps_per_block == 0:
                     block = step // self.params.eq_num_steps_per_block
-                    self.estimate_energy(comm,block)
+                    self.estimate_energy(comm,block+start_step)
                     self.accumulators.zero()
                     self.save(comm,dirname)
                     self.print_stats(comm,self.pcontrol_eq)
@@ -424,27 +426,17 @@ class LAFQMC(AFQMCBase):
             #synchronize()
             #self.tstep += time.time() - start_step
 
-    def propagate_walkers(self, constraint_path=True):
-        # sample rotations 
-        ovlp = self.walkers.compute_ovlp_ratio(self.hamiltonian)
-        g = ovlp * self.hamiltonian.a[:,None]
-        p = xp.fabs(g)
-        sign = g/p
-        b = p.sum(axis=0)
-        p = p/b[None,:] 
-
-        nw = self.walkers.nwalkers
-        ixs = xp.asarray([xp.random.choice(self.hamiltonian.nterms,size=1,p=p[:,i])[0] for i in range(nw)])
-        #print(ixs)
-        self.hamiltonian.parse_samples(to_host(ixs))
-        self.walkers.update_walkers(self.hamiltonian,self.trial)
+    def propagate_walkers(self, constraint_path=True, importance_sample=True):
+        if importance_sample:
+            b,ixs = self.propagate_walkers_importance()
+        else:
+            b,ixs = self.propagate_walkers_bare()
         synchronize()
-    
-        # 4.update weight
-        b *= sign[ixs,xp.arange(nw)]
+
         bminus = xp.nonzero(b<0.)[0] 
         nminus = bminus.size
         if nminus>0: 
+            ixs = to_host(ixs)
             ixs = [ixs[i] for i in bminus]
             for ix in ixs:
                 chol_ix,spin,p,d = self.hamiltonian.get_term(ix)
@@ -455,6 +447,41 @@ class LAFQMC(AFQMCBase):
         self.walkers.weight *= b 
         #print(f'term_label={kixs[0]},weight multiplier={b[0]},accumulated weight={self.walkers.weight[0]},ovlp={1./self.walkers.Sa[0,0,0]}')
         synchronize()
+
+    def propagate_walkers_bare(self):
+        nterms = self.hamiltonian.nterms
+        nw = self.walkers.nwalkers
+
+        p = xp.fabs(self.hamiltonian.a)
+        p /= p.sum()
+        b = self.hamiltonian.a / p 
+        ixs = xp.random.choice(nterms,size=nw,p=p,replace=True)
+        b = b[ixs]
+
+        self.hamiltonian.parse_samples(to_host(ixs))
+        b = self.walkers.update_walkers(self.hamiltonian,self.trial,b=b)
+        return b,ixs
+
+    def propagate_walkers_importance(self):
+        # sample rotations 
+        nterms = self.hamiltonian.nterms
+        nw = self.walkers.nwalkers
+
+        ovlp = self.walkers.compute_ovlp_ratio(self.hamiltonian)
+        g = ovlp * self.hamiltonian.a[:,None]
+        p = xp.fabs(g)
+        sign = g/p
+        b = p.sum(axis=0)
+        p = p/b[None,:] 
+
+        ixs = xp.asarray([xp.random.choice(nterms,size=1,p=p[:,i])[0] for i in range(nw)])
+        #print(ixs)
+        self.hamiltonian.parse_samples(to_host(ixs))
+        self.walkers.update_walkers(self.hamiltonian,self.trial)
+    
+        # 4.update weight
+        b *= sign[ixs,xp.arange(nw)]
+        return b,ixs
 
     def pop_ctr(self,comm,pcontrol,pre_estimate=True):
         if self.params.pop_control_method=='stochastic_reconfiguration':

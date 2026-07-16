@@ -10,6 +10,7 @@ class SumOfRotationBase:
         self.term_dict = dict() 
         self.apply_spin_down = apply_spin_down
         self.thresh = thresh
+        self.chol = None
 
     def add_h1_term(self,key,new_term):
         if key not in self.term_dict:
@@ -92,6 +93,8 @@ class SumOfRotationBase:
         p_dict = dict() 
         d_dict = dict() 
         ix_dict = dict()
+        E1_ixs = []
+        E2_ixs = []
         for term_key in self.term_dict:
             chol_ix,p,spin = term_key
             assert spin in [(0,),(1,),(0,0),(1,1),(0,1)]
@@ -122,6 +125,11 @@ class SumOfRotationBase:
 
                 i = len(p_dict[key])-1
                 self.ix2key.append((key,i))
+                if chol_ix==self.chol_ix['h1'][0]:
+                    E1_ixs.append(ix)
+                else:
+                    E2_ixs.append(ix)
+
                 if iprint>0:
                     print(ix,key,i,p,d,a)
 
@@ -131,10 +139,14 @@ class SumOfRotationBase:
             d = xp.asarray(d_dict[key])
             ix = xp.asarray(ix_dict[key])
             self.term_dict[key] = {'p':p,'d':d,'ix':ix}
+        self.E1_ixs = xp.asarray(E1_ixs)
+        self.E2_ixs = xp.asarray(E2_ixs)
 
         self.a = xp.asarray(self.a)
-        self.Lambda = self.a.sum()
-        self.a /= self.Lambda
+        Lambda1 = self.a[self.E1_ixs].sum()
+        Lambda2 = self.a[self.E2_ixs].sum()
+        self.Lambda = xp.asarray([Lambda1,Lambda2,Lambda1+Lambda2])
+        self.a /= self.Lambda[-1]
         self.nterms = self.a.size
         if iprint>0:
             print('Lambda=',self.Lambda)
@@ -208,8 +220,8 @@ class HubbardSOR(SumOfRotationBase):
         self.hubbard_U = U
 
     def decompose_h1(self,h1e,at,iprint=0):
-        h1e = xp.asarray(h1e)
-        ek,vk = xp.linalg.eigh(h1e) 
+        self.h1e = xp.asarray(h1e)
+        ek,vk = xp.linalg.eigh(self.h1e) 
         self.chol_basis.append(vk)
         self.chol_bands.append(ek)
         return self._decompose_h1(ek+0.5*self.hubbard_U,at,iprint=iprint)
@@ -230,25 +242,39 @@ class HubbardSOR(SumOfRotationBase):
             self.add_term(ai,chol_ix,[i,i],[dp,dm],[0,1])
             self.add_term(ai,chol_ix,[i,i],[dm,dp],[0,1])
 
-    def local_energy(self,walkers):
-        D = walkers.get_UDU()
+    def local_energy(self,walkers,trial):
+        if walkers.fast_eloc:
+            Lambda1,Lambda2,Lambda = self.Lambda
+            E1 = Lambda1 - walkers.E1*Lambda
+            E2 = Lambda2 - walkers.E2*Lambda
+            return E1+E2,E1,E2
 
-        ix = self.chol_ix['h1'][0]
-        E1 = xp.einsum('p,wpp->w',self.chol_bands[ix],D[0,0][:,ix])
-        E1 += xp.einsum('p,wpp->w',self.chol_bands[ix],D[1,1][:,ix])
+        if 'UDU' in walkers.buff_names:
+            D = walkers.get_UDU()
+
+            ix = self.chol_ix['h1'][0]
+            E1 = xp.einsum('p,wpp->w',self.chol_bands[ix],D[0,0][:,ix])
+            E1 += xp.einsum('p,wpp->w',self.chol_bands[ix],D[1,1][:,ix])
     
-        ix = self.chol_ix['U'][0]
-        E2 = xp.einsum('wpp,wpp->w',D[0,0][:,ix],D[1,1][:,ix])
-        if (0,1) in D:
-            E2 -= xp.einsum('wpp,wpp->w',D[0,1][:,ix],D[1,0][:,ix])
+            ix = self.chol_ix['U'][0]
+            E2 = xp.einsum('wpp,wpp->w',D[0,0][:,ix],D[1,1][:,ix])
+            if (0,1) in D:
+                E2 -= xp.einsum('wpp,wpp->w',D[0,1][:,ix],D[1,0][:,ix])
+        else:
+            SC = walkers.compute_SC(trial)
+            E1 = walkers.compute_E1(trial,SC)
+            Daa,Dbb,Dab,Dba = walkers.compute_1rdm_diag(trial,SC)
+            E2 = xp.einsum('wp,wp->w',Daa,Dbb)
+            if Dab is not None:
+                E2 -= xp.einsum('wp,wp->w',Dab,Dba)
         E2 *= self.hubbard_U
         return E1+E2,E1,E2
 
 class QCSOR(SumOfRotationBase):
 
     def decompose_h1(self,h1e,at,iprint=0):
-        h1e = xp.asarray(h1e)
-        ek,vk = xp.linalg.eigh(h1e) 
+        self.h1e = xp.asarray(h1e)
+        ek,vk = xp.linalg.eigh(self.h1e) 
         self.chol_basis.append(vk)
         self.chol_bands.append(ek)
 
@@ -259,8 +285,8 @@ class QCSOR(SumOfRotationBase):
         if iprint>0:
             print('ai,aisq=',ai,aisq)
         self.chol_ix['chol'] = []
-        chol = xp.asarray(chol)
-        for L in chol:
+        self.chol = xp.asarray(chol)
+        for L in self.chol:
             ek,vk = xp.linalg.eigh(L) 
             self.chol_basis.append(vk)
             self.chol_bands.append(ek)
@@ -289,29 +315,40 @@ class QCSOR(SumOfRotationBase):
                         self.add_term(aisq,chol_ix,[q,p],[dq,-dp],[0,1])
                         self.add_term(aisq,chol_ix,[q,p],[-dq,dp],[0,1])
 
-    def local_energy(self,walkers):
-        D = walkers.get_UDU()
+    def local_energy(self,walkers,trial):
+        if walkers.fast_eloc:
+            Lambda1,Lambda2,Lambda = self.Lambda
+            E1 = Lambda1 - walkers.E1*Lambda
+            E2 = Lambda2 - walkers.E2*Lambda
+            return E1+E2,E1,E2
 
-        ix = self.chol_ix['h1'][0]
-        E1 = xp.einsum('p,wpp->w',self.chol_bands[ix],D[0,0][:,ix])
-        E1 += xp.einsum('p,wpp->w',self.chol_bands[ix],D[1,1][:,ix])
+        if 'UDU' in walkers.buff_names:
+            D = walkers.get_UDU()
 
-        ix = self.chol_ix['chol']
-        Sigma = self.chol_bands[ix]
-        Daa,Dbb = D[0,0][:,ix],D[1,1][:,ix]
-        Daa = Sigma[None,:,:,None]*Daa
-        Dbb = Sigma[None,:,:,None]*Dbb
-        tr = xp.einsum('wdpp->wd',Daa)
-        tr += xp.einsum('wdpp->wd',Dbb)
-        E2 = (tr**2).sum(axis=1) 
+            ix = self.chol_ix['h1'][0]
+            E1 = xp.einsum('p,wpp->w',self.chol_bands[ix],D[0,0][:,ix])
+            E1 += xp.einsum('p,wpp->w',self.chol_bands[ix],D[1,1][:,ix])
 
-        E2 -= xp.einsum('wdpq,wdqp->w',Daa,Daa)
-        E2 -= xp.einsum('wdpq,wdqp->w',Dbb,Dbb)
-        if (0,1) in D: 
-            Dab,Dba = D[0,1][:,ix],D[1,0][:,ix]
-            Dab = Sigma[None,:,:,None]*Dab
-            Dba = Sigma[None,:,:,None]*Dba
-            E2 -= 2.*xp.einsum('wdpq,wdqp->w',Dab,Dba)
-        E2 *= .5
+            ix = self.chol_ix['chol']
+            Sigma = self.chol_bands[ix]
+            Daa,Dbb = D[0,0][:,ix],D[1,1][:,ix]
+            Daa = Sigma[None,:,:,None]*Daa
+            Dbb = Sigma[None,:,:,None]*Dbb
+            tr = xp.einsum('wdpp->wd',Daa)
+            tr += xp.einsum('wdpp->wd',Dbb)
+            E2 = (tr**2).sum(axis=1) 
+
+            E2 -= xp.einsum('wdpq,wdqp->w',Daa,Daa)
+            E2 -= xp.einsum('wdpq,wdqp->w',Dbb,Dbb)
+            if (0,1) in D: 
+                Dab,Dba = D[0,1][:,ix],D[1,0][:,ix]
+                Dab = Sigma[None,:,:,None]*Dab
+                Dba = Sigma[None,:,:,None]*Dba
+                E2 -= 2.*xp.einsum('wdpq,wdqp->w',Dab,Dba)
+            E2 *= .5
+        else:
+            SC = walkers.compute_SC(trial)
+            E1 = walkers.compute_E1(trial,SC)
+            E2 = walkers.compute_chol(trial,SC)
         return E1+E2,E1,E2
     

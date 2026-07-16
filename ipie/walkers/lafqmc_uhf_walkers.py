@@ -21,7 +21,7 @@ def update_phi(C,u,d):
     uC = xp.einsum('xwr,wxi->wri',u,C)
     duC = d[:,:,None]*uC
     C += xp.einsum('xwr,wri->wxi',u,duC)
-    return C
+    return C,uC
 
 def compute_right2(uB,SCU,M1,d):
     right2 = xp.einsum('wri,wdip->wdrp',uB,SCU)
@@ -79,8 +79,6 @@ class UHFWalkers(BaseWalkers):
 
         self.phi = xp.array([initial_walker.copy() for iw in range(self.nwalkers)])
 
-        self.phase = xp.ones(self.nwalkers) 
-
     def cast_to_cupy(self, verbose=False):
         cast_to_device(self, verbose)
 
@@ -94,21 +92,31 @@ class UHFWalkers(BaseWalkers):
         self.phi[:,:,nu:] = phi[1]
 
     @plum.dispatch
-    def compute_S(self,trial:SingleDet):
+    def compute_S(self,trial:SingleDet,set_attribute=True,set_buff=False):
         phi = self.get_phi()
         CB = [xp.einsum('wxi,xj->wij',Ci,Bi) for Ci,Bi in zip(phi,trial.psi)] 
-        return [xp.linalg.inv(Si) for Si in CB]
+        S = [xp.linalg.inv(Si) for Si in CB]
+        if set_attribute:
+            self.Sa,self.Sb = S
+        if set_buff:
+            self.buff_names = ['Sa','Sb']
+        return S
     
     @plum.dispatch
-    def compute_S(self,trial:SingleDetGHF):
+    def compute_S(self,trial:SingleDetGHF,set_attribute=True,set_buff=False):
         phi = self.get_phi()
         B = [trial.psi[:self.nbasis],trial.psi[self.nbasis:]]
         CB = [xp.einsum('wxi,xj->wij',Ci,Bi) for Ci,Bi in zip(phi,B)] 
         CB = xp.concatenate(CB,axis=1)
-        return xp.linalg.inv(CB)
+        S = xp.linalg.inv(CB)
+        if set_attribute:
+            self.S = S
+        if set_buff:
+            self.buff_names = ['S']
+        return S
 
-    def build(self,hamiltonian,trial):
-        S = self.compute_S(trial)
+    def compute_density(self,hamiltonian,trial,set_buff=True):
+        S = self.compute_S(trial,set_attribute=False,set_buff=False)
         U = hamiltonian.chol_basis
         UC = xp.einsum('dxp,wxi->wdpi',U,self.phi)
         nu = self.nup
@@ -127,8 +135,20 @@ class UHFWalkers(BaseWalkers):
             self.UDU = xp.zeros((self.nwalkers,hamiltonian.nchol,nb*2,nb*2))
             self.UDU[:,:,:nb] = xp.einsum('dpi,wdiq->wdpq',trial.UB[0],self.SCU)
             self.UDU[:,:,nb:] = xp.einsum('dpi,wdiq->wdpq',trial.UB[1],self.SCU)
+        if set_buff:
+            self.buff_names = ['SCU','UDU']
 
-        self.buff_names = ['phi','weight','phase','SCU','UDU']
+    def build(self,hamiltonian,trial,density=True):
+        if density:
+            self.compute_density(hamiltonian,trial)
+        else:
+            self.compute_S(trial,set_buff=True)
+        self.phase = xp.ones(self.nwalkers) 
+        self.E1 = xp.zeros(self.nwalkers)
+        self.E2 = xp.zeros(self.nwalkers)
+        self.fast_eloc = False
+        self.buff_names += ['phi','weight','phase','E1','E2']
+
         self.buff_size = round(self.set_buff_size_single_walker() / float(self.nwalkers))
         self.walker_buffer = xp.zeros(self.buff_size)
 
@@ -232,27 +252,39 @@ class UHFWalkers(BaseWalkers):
         self.M[key] = uDu,M
         return ovlp.T
 
-    def compute_ovlp_ratio(self,hamiltonian):
-        ovlp = xp.zeros((hamiltonian.nterms,self.nwalkers))
+    def compute_ovlp_ratio(self,ham):
+        ovlp = xp.zeros((ham.nterms,self.nwalkers))
         self.M = dict()
         keys = 'p','d','ix'
-        for key,dat in hamiltonian.term_dict.items():
+        for key,dat in ham.term_dict.items():
             p,d,ix = [dat[k] for k in keys]
             ovlp[ix] = self.compute_M1(key,p,d)
+
+        self.E1 = xp.dot(ham.a[ham.E1_ixs],ovlp[ham.E1_ixs])
+        self.E2 = xp.dot(ham.a[ham.E2_ixs],ovlp[ham.E2_ixs])
+        self.fast_eloc = True
         return ovlp
 
-    def update_walkers(self,hamiltonian,trial):
+    def update_walkers(self,hamiltonian,trial,b=None):
         self.itm = dict()
         for key,ixs in hamiltonian.samples.items():
             w,i = ixs['w'],ixs['i']
             p,d,u,u2 = hamiltonian.get_batch_ud(key,i)
 
-            self.update_phi(key,w,u,d)
+            uC = self.update_phi(key,w,u,d)
+
             chol_ix,spin = key
-            if spin==(0,1):
-                self.update_density_2(key,w,i,p,d,u,u2,trial)
+            if b is None:
+               if spin==(0,1):
+                   self.update_density_2(key,w,i,p,d,u,u2,trial)
+               else:
+                   self.update_density_1(key,w,i,p,d,u,u2,trial)
             else:
-                self.update_density_1(key,w,i,p,d,u,u2,trial)
+               if spin==(0,1):
+                   b = self.update_ovlp_2(key,w,p,d,uC,trial,b)
+               else:
+                   b = self.update_ovlp_1(key,w,p,d,uC,trial,b)
+        return b
 
     def update_phi(self,key,w,u,d):
         _,spin = key
@@ -260,12 +292,14 @@ class UHFWalkers(BaseWalkers):
         if spin==(0,1):
             d = [d[:,:1],d[:,1:]]
             u = [u[:,:,:1],u[:,:,1:]]
+            uC = [None] * 2
             for s in (0,1):
-                phi[s][w] = update_phi(phi[s][w],u[s],d[s])
+                phi[s][w],uC[s] = update_phi(phi[s][w],u[s],d[s])
         else:
             s = spin[0]
-            phi[s][w] = update_phi(phi[s][w],u,d)
+            phi[s][w],uC = update_phi(phi[s][w],u,d)
         self.set_phi(phi)
+        return uC
 
     @plum.dispatch
     def update_density_1(self,key,w,i,p,d,u,u2,trial:SingleDet):
@@ -359,11 +393,104 @@ class UHFWalkers(BaseWalkers):
         self.UDU[w,:,:nb] = update_UDU(self.UDU[w,:,:nb],trial.UB[0],SCu,right)
         self.UDU[w,:,nb:] = update_UDU(self.UDU[w,:,nb:],trial.UB[1],SCu,right)
 
-    def reortho(self):
+    @plum.dispatch
+    def update_ovlp_1(self,key,w,p,d,uC,trial:SingleDet,b):
+        chol_ix,spin = key
+        s = spin[0]
+
+        uB = trial.UB[s][chol_ix,p] 
+        S = [self.Sa,self.Sb][s]
+        uBS = xp.einsum('wri,wij->wrj',uB,S[w])
+        SCu = xp.einsum('wij,wrj->wir',S[w],uC)
+
+        M = xp.einsum('wri,wsi->wrs',uBS,uC)
+        M = xp.eye(p.shape[1])[None,:,:] + d[:,:,None]*M
+        b[w] *= xp.linalg.det(M)
+
+        M = xp.linalg.inv(M) * d[:,None,:]
+        right = xp.einsum('wrs,wsj->wrj',M,uBS)
+        S[w] -= xp.einsum('wir,wrj->wij',SCu,right)
+        if s==0:
+            self.Sa = S
+        else:
+            self.Sb = S
+        return b 
+
+    @plum.dispatch
+    def update_ovlp_1(self,key,w,p,d,uC,trial:SingleDetGHF,b):
+        chol_ix,spin = key
+        s = spin[0]
+        uB = trial.UB[s][chol_ix,p] 
+        uBS = xp.einsum('wri,wij->wrj',uB,self.S[w])
+        if s==0:
+            SCu = xp.einsum('wij,wrj->wir',self.S[w,:,:self.nup],uC)
+        else:
+            SCu = xp.einsum('wij,wrj->wir',self.S[w,:,self.nup:],uC)
+
+        if s==0:
+            M = xp.einsum('wri,wsi->wrs',uBS[:,:,:self.nup],uC)
+        else:
+            M = xp.einsum('wri,wsi->wrs',uBS[:,:,self.nup:],uC)
+        M = xp.eye(p.shape[1])[None,:,:] + d[:,:,None]*M
+        b[w] *= xp.linalg.det(M)
+
+        M = xp.linalg.inv(M) * d[:,None,:]
+        right = xp.einsum('wrs,wsj->wrj',M,uBS)
+        self.S[w] -= xp.einsum('wir,wrj->wij',SCu,right)
+        return b 
+
+    @plum.dispatch
+    def update_ovlp_2(self,key,w,p,d,uC,trial:SingleDet,b):
+        chol_ix,_ = key
+
+        p = [p[:,:1],p[:,1:]]
+        uB = [trial.UB[s][chol_ix,p[s]] for s in (0,1)]
+        S = [self.Sa,self.Sb]
+        for s in (0,1):
+            uBS = xp.einsum('wi,wij->wj',uB[s][:,0],S[s][w])
+            SCu = xp.einsum('wij,wj->wi',S[s][w],uC[s][:,0])
+
+            M = xp.einsum('wi,wi->w',uBS,uC[s][:,0])
+            M = d[:,s]*M + 1.
+            b[w] *= M
+
+            M = 1./M * d[:,s]
+            right = xp.einsum('w,wj->wj',M,uBS)
+            S[s][w] -= xp.einsum('wi,wj->wij',SCu,right)
+
+        self.Sa,self.Sb = S
+        return b 
+
+    @plum.dispatch
+    def update_ovlp_2(self,key,w,p,d,uC,trial:SingleDetGHF,b):
+        chol_ix,spin = key
+        p = [p[:,:1],p[:,1:]]
+        uB = xp.concatenate([trial.UB[s][chol_ix,p[s]] for s in (0,1)],axis=1)
+        uBS = xp.einsum('wri,wij->wrj',uB,self.S[w])
+        SCu = [None] * 2
+        SCu[0] = xp.einsum('wij,wrj->wir',self.S[w,:,:self.nup],uC[0])
+        SCu[1] = xp.einsum('wij,wrj->wir',self.S[w,:,self.nup:],uC[1])
+        SCu = xp.concatenate(SCu,axis=2)
+
+        M = [None] * 2 
+        M[0] = xp.einsum('wri,wsi->wrs',uBS[:,:,:self.nup],uC[0])
+        M[1] = xp.einsum('wri,wsi->wrs',uBS[:,:,self.nup:],uC[1])
+        M = xp.concatenate(M,axis=2)
+        M = xp.eye(2)[None,:,:] + d[:,:,None]*M
+        b[w] *= xp.linalg.det(M)
+
+        M = xp.linalg.inv(M) * d[:,None,:]
+        right = xp.einsum('wrs,wsj->wrj',M,uBS)
+        self.S[w] -= xp.einsum('wir,wrj->wij',SCu,right)
+        return b 
+
+    def reortho(self,trial):
         phi = self.get_phi()
         for s in (0,1):
             phi[s] = qr(phi[s])
         self.set_phi(phi)
+        if 'S' in self.buff_names or 'Sa' in self.buff_names:
+            self.compute_S(trial)
 
     def save(self,comm,dirname):
         RANK,SIZE = comm.rank,comm.size
@@ -379,7 +506,7 @@ class UHFWalkers(BaseWalkers):
             f.create_dataset('phi',data=np.concatenate(phi,axis=0))
             f.create_dataset('weights',data=np.concatenate(weights,axis=0))
     
-    def load_walkers(self,comm,dirname):
+    def load(self,comm,dirname):
         with h5py.File(f'{dirname}/walkers.hdf5','r') as f:
             phi = f['phi'][:]
             weights = f['weights'][:]
@@ -409,4 +536,41 @@ class UHFWalkers(BaseWalkers):
     def reortho_batched(self):
         pass
 
+    def compute_SC(self,trial):
+        phi = self.get_phi()
+        S = self.S if 'S' in self.buff_names else [self.Sa,self.Sb]
+        if isinstance(S,list):
+            return [xp.einsum('wij,wxj->wix',Si,Ci) for Si,Ci in zip(S,phi)]
+        else:
+            nb = self.nbasis
+            nu = self.nup
+            Sa = xp.einsum('wij,wxj->wix',S[:,:,:nu],phi[0])
+            Sb = xp.einsum('wij,wxj->wix',S[:,:,nu:],phi[1])
+            return [Sa,Sb]
 
+    def compute_E1(self,trial,SC):
+        E1 = [xp.einsum('xi,wix->w',hBi,SCi) for hBi,SCi in zip(trial.hB,SC)]
+        return E1[0]+E1[1]
+
+    def compute_chol(self,trial,SC):
+        tr = [xp.einsum('dxi,wix->wd',LBi,SCi) for LBi,SCi in zip(trial.LB,SC)]
+        E2 = ((tr[0]+tr[1])**2).sum(axis=1)
+
+        SCLB = [xp.einsum('wix,dxj->wdij',SCi,LBi) for SCi,LBi in zip(SC,trial.LB)]
+        for s in (0,1):
+            E2 -= xp.einsum('wdij,wdji->w',SCLB[s],SCLB[s])
+        if SC[0].shape[1]==self.nelec and SC[1].shape[1]==self.nelec:
+            E2 -= 2.*xp.einsum('wdij,wdji->w',SCLB[0],SCLB[1])
+        return 0.5*E2
+
+    def compute_1rdm_diag(self,trial,SC):
+        psi = trial.get_psi()
+
+        Daa = xp.einsum('xi,wix->wx',psi[0],SC[0])
+        Dbb = xp.einsum('xi,wix->wx',psi[1],SC[1])
+
+        Dab,Dba = None,None
+        if psi[0].shape[1]==self.nelec:
+            Dba = xp.einsum('xi,wix->wx',psi[1],SC[0])
+            Dab = xp.einsum('xi,wix->wx',psi[0],SC[1])
+        return Daa,Dbb,Dab,Dba

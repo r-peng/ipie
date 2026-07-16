@@ -19,16 +19,25 @@ class GHFWalkers(UHFWalkers):
         self.phi[:,self.nbasis:] = phi[1]
 
     @plum.dispatch
-    def compute_S(self,trial:SingleDet):
+    def compute_S(self,trial:SingleDet,**kwargs):
         raise NotImplementedError
 
     @plum.dispatch
-    def compute_S(self,trial:SingleDetGHF):
+    def compute_S(self,trial:SingleDetGHF,set_attribute=True,set_buff=False):
         CB = xp.einsum('wxi,xj->wij',self.phi,trial.psi)
-        return xp.linalg.inv(CB)
+        S = xp.linalg.inv(CB)
+        if set_attribute:
+            self.S = S
+        if set_buff:
+            self.buff_names += ['S']
+        return S
 
     @plum.dispatch
-    def build(self,hamiltonian,trial:SingleDetGHF):
+    def compute_density(self,hamiltonian,trial:SingleDet,set_buff=True):
+        raise NotImplementedError
+
+    @plum.dispatch
+    def compute_density(self,hamiltonian,trial:SingleDetGHF,set_buff=True):
         S = self.compute_S(trial)
 
         nchol = hamiltonian.nchol 
@@ -43,9 +52,8 @@ class GHFWalkers(UHFWalkers):
         self.UDU[:,:,:nb] = xp.einsum('dpi,wdiq->wdpq',trial.UB[0],self.SCU)
         self.UDU[:,:,nb:] = xp.einsum('dpi,wdiq->wdpq',trial.UB[1],self.SCU)
 
-        self.buff_names = ['phi','weight','phase','SCU','UDU']
-        self.buff_size = round(self.set_buff_size_single_walker() / float(self.nwalkers))
-        self.walker_buffer = xp.zeros(self.buff_size)
+        if set_buff:
+            self.buff_names = ['SCU','UDU']
 
     def update_UBS_2(self,key,w,i,uC):
         M = self.M2[key][i,w]
@@ -58,5 +66,61 @@ class GHFWalkers(UHFWalkers):
         uBS = xp.concatenate(uBS,axis=1)
         self.UBS[w] = update_UBS(self.UBS[w],left,uBS)
 
-    def reortho(self):
+    @plum.dispatch
+    def update_ovlp_1(self,key,w,p,d,uC,trial:SingleDet,b):
+        raise NotImplementedError
+
+    @plum.dispatch
+    def update_ovlp_1(self,key,w,p,d,uC,trial:SingleDetGHF,b):
+        chol_ix,spin = key
+        s = spin[0]
+
+        uB = trial.UB[s][chol_ix,p] 
+        uBS = xp.einsum('wri,wij->wrj',uB,self.S[w])
+        SCu = xp.einsum('wij,wrj->wir',self.S[w],uC)
+
+        M = xp.einsum('wri,wsi->wrs',uBS,uC)
+        M = xp.eye(p.shape[1])[None,:,:] + d[:,:,None]*M
+        b[w] *= xp.linalg.det(M)
+
+        M = xp.linalg.inv(M) * d[:,None,:]
+        right = xp.einsum('wrs,wsj->wrj',M,uBS)
+        self.S[w] -= xp.einsum('wir,wrj->wij',SCu,right)
+        return b 
+
+    @plum.dispatch
+    def update_ovlp_2(self,key,w,p,d,uC,trial:SingleDet,b):
+        raise NotImplementedError
+
+    @plum.dispatch
+    def update_ovlp_2(self,key,w,p,d,uC,trial:SingleDetGHF,b):
+        chol_ix,spin = key
+        p = [p[:,:1],p[:,1:]]
+        uB = xp.concatenate([trial.UB[s][chol_ix,p[s]] for s in (0,1)],axis=1)
+        uBS = xp.einsum('wri,wij->wrj',uB,self.S[w])
+        uC = xp.concatenate(uC,axis=1)
+        SCu = xp.einsum('wij,wrj->wir',self.S[w],uC)
+
+        M = xp.einsum('wri,wsi->wrs',uBS,uC)
+        M = xp.eye(2)[None,:,:] + d[:,:,None]*M
+        b[w] *= xp.linalg.det(M)
+
+        M = xp.linalg.inv(M) * d[:,None,:]
+        right = xp.einsum('wrs,wsj->wrj',M,uBS)
+        self.S[w] -= xp.einsum('wir,wrj->wij',SCu,right)
+        return b 
+
+    def reortho(self,trial):
         self.phi = qr(self.phi)
+        if 'S' in self.buff_names:
+            self.compute_S(trial)
+
+    @plum.dispatch
+    def compute_SC(self,trial:SingleDet):
+        raise NotImplementedError
+
+    @plum.dispatch
+    def compute_SC(self,trial:SingleDetGHF):
+        phi = self.get_phi()
+        return [xp.einsum('wij,wxj->wix',self.S,Ci) for Ci in phi]
+

@@ -3,17 +3,32 @@ import scipy,itertools,plum
 from ipie.walkers.lafqmc_uhf_walkers import UHFWalkers 
 from ipie.walkers.lafqmc_ghf_walkers import GHFWalkers 
 
+importance_sample = True 
+
 def get_data(walkers):
-    data = [None] * 3
-    data[0] = walkers.phi.copy()
-    data[1] = walkers.SCU.copy()
-    data[2] = walkers.UDU.copy()
+    data = [walkers.phi.copy()]
+    if importance_sample:
+        data.append(walkers.SCU.copy())
+        data.append(walkers.UDU.copy())
+    else:
+        if 'S' in walkers.buff_names:
+            data.append(walkers.S.copy())
+        else:
+            data.append(walkers.Sa.copy())
+            data.append(walkers.Sb.copy())
     return data
 
 def set_data(walkers,data):
     walkers.phi = data[0].copy()
-    walkers.SCU = data[1].copy()
-    walkers.UDU = data[2].copy()
+    if importance_sample:
+        walkers.SCU = data[1].copy()
+        walkers.UDU = data[2].copy()
+    else:
+        if len(data)==2:
+            walkers.S = data[1]
+        else:
+            walkers.Sa = data[1]
+            walkers.Sb = data[2]
 
 def compute_scalar_ovlp(walkers,trial):
     S = walkers.compute_S(trial) 
@@ -59,13 +74,15 @@ def _update_walkers_single(ham,ix,walkers:GHFWalkers):
 
 def update_walkers_slow(ham,ixs,walkers,trial):
     old_data = get_data(walkers)
+    denom = compute_scalar_ovlp(walkers,trial)
 
     _update_walkers_slow(ham,ixs,walkers)
-    walkers.build(ham,trial)
+    walkers.build(ham,trial,density=importance_sample)
+    num = compute_scalar_ovlp(walkers,trial)
     new_data = get_data(walkers)
 
     set_data(walkers,old_data)
-    return new_data 
+    return new_data,num/denom 
 
 @plum.dispatch
 def _update_walkers_slow(ham,ixs,walkers:UHFWalkers):
@@ -199,6 +216,7 @@ if __name__=='__main__':
     for ham,generic_real_chol in zip(hams,generic_real_chols):
         if ham is None:
             continue
+        print(type(ham))
         for walkers_type,trial_type in itertools.product(walkers_types,trial_types):
             if walkers_type=='ghf' and trial_type=='uhf':
                 continue
@@ -234,23 +252,33 @@ if __name__=='__main__':
                 afqmc = AFQMC.build(nelecs,generic_real_chol,trial_,walkers=walkers_,num_walkers=nwalker,num_steps_per_block=1,num_blocks=1,timestep=0.001)
                 afqmc.setup_estimators(None,None)
         
-            trial.build(ham)
-            walkers.build(ham,trial)
+            trial.build(ham,conjugate=True)
+            walkers.build(ham,trial,density=False)
             if walkers_type==trial_type:
-                eloc,e1,e2 = ham.local_energy(walkers)
+                eloc,e1,e2 = ham.local_energy(walkers,trial)
                 E = np.dot(eloc,walkers.weight)/sum(walkers.weight)
                 e1 = np.dot(e1,walkers.weight)/sum(walkers.weight)
                 e2 = np.dot(e2,walkers.weight)/sum(walkers.weight)
                 print('E,E1,E2=',E,e1,e2)
 
-            ovlp_ratio1 = np.zeros((ham.nterms,walkers.nwalkers))
-            for ix in range(ham.nterms):
-                ovlp_ratio1[ix] = compute_ovlp_ratio_single(ham,ix,walkers,trial)
-            ovlp_ratio2 = walkers.compute_ovlp_ratio(ham)
-            #print('ovlp ratio')
-            #print(ovlp_ratio1.T)
-            #print(ovlp_ratio2.T)
-            test_norm(ovlp_ratio1,ovlp_ratio2)
+            walkers.build(ham,trial,density=importance_sample)
+            if walkers_type==trial_type:
+                eloc,e1,e2 = ham.local_energy(walkers,trial)
+                E = np.dot(eloc,walkers.weight)/sum(walkers.weight)
+                e1 = np.dot(e1,walkers.weight)/sum(walkers.weight)
+                e2 = np.dot(e2,walkers.weight)/sum(walkers.weight)
+                print('E,E1,E2=',E,e1,e2)
+            continue
+
+            if importance_sample:
+                ovlp_ratio1 = np.zeros((ham.nterms,walkers.nwalkers))
+                for ix in range(ham.nterms):
+                    ovlp_ratio1[ix] = compute_ovlp_ratio_single(ham,ix,walkers,trial)
+                ovlp_ratio2 = walkers.compute_ovlp_ratio(ham)
+                #print('ovlp ratio')
+                #print(ovlp_ratio1.T)
+                #print(ovlp_ratio2.T)
+                test_norm(ovlp_ratio1,ovlp_ratio2)
 
             niter = ham.nterms // walkers.nwalkers + 1
             start = 0
@@ -260,14 +288,22 @@ if __name__=='__main__':
                 #print('ixs=',ixs)
                 #print('keys=',[ham.ix2key[ix] for ix in ixs])
 
-                data1 = update_walkers_slow(ham,ixs,walkers,trial)
+                data1,b1 = update_walkers_slow(ham,ixs,walkers,trial)
 
                 data_old = get_data(walkers)
                 ham.parse_samples(ixs)
-                walkers.update_walkers(ham,trial)
+                b2 = None if importance_sample else np.ones(walkers.nwalkers)
+                b2 = walkers.update_walkers(ham,trial,b=b2)
+                if b2 is not None:
+                    #print(b1)
+                    #print(b2)
+                    test_norm(b1,b2)
                 data2 = get_data(walkers)
                 set_data(walkers,data_old)
                 for item1,item2 in zip(data1,data2):
+                    #print(item1.shape)
+                    #print(item1)
+                    #print(item2)
                     test_norm(item1,item2)
                 start = stop
 
