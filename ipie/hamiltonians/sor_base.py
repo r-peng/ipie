@@ -60,20 +60,22 @@ class SumOfRotationBase:
                 self.term_dict[key] = []
             self.term_dict[key].append(term)
 
-    def _decompose_h1(self,ek,at,iprint=0):
+    def _decompose_h1(self,ek,at=None,dt=None,iprint=0):
         self.nbasis = ek.size
         chol_ix = len(self.chol_basis)-1
         self.chol_ix['h1'] = [chol_ix]
 
         if iprint>0:
-            print('at=',at)
             print('bands=',ek)
-        assert at>xp.amax(xp.fabs(ek))
+            if at is None:
+                at = xp.fabs(ek)/dt
+                at[at<1.] = 1.
+            print('at=',at)
 
-        for k,e_k in enumerate(ek):
-            self.add_term(at,chol_ix,[k],[-e_k/at],[0])
+        for k in range(ek.size):
+            self.add_term(at[k],chol_ix,[k],[-ek[k]/at[k]],[0])
             if self.apply_spin_down:
-                self.add_term(at,chol_ix,[k],[-e_k/at],[1])
+                self.add_term(at[k],chol_ix,[k],[-ek[k]/at[k]],[1])
         return ek
 
     def parse_decomposition(self,iprint=0):
@@ -219,12 +221,12 @@ class HubbardSOR(SumOfRotationBase):
         super().__init__(**kwargs)
         self.hubbard_U = U
 
-    def decompose_h1(self,h1e,at,iprint=0):
+    def decompose_h1(self,h1e,at=None,dt=None,iprint=0):
         self.h1e = xp.asarray(h1e)
         ek,vk = xp.linalg.eigh(self.h1e) 
         self.chol_basis.append(vk)
         self.chol_bands.append(ek)
-        return self._decompose_h1(ek+0.5*self.hubbard_U,at,iprint=iprint)
+        return self._decompose_h1(ek+0.5*self.hubbard_U,at=at,dt=dt,iprint=iprint)
 
     def decompose_h2(self,gu,iprint=0,nelec=None):
         self.chol_basis.append(xp.eye(self.nbasis))
@@ -272,21 +274,18 @@ class HubbardSOR(SumOfRotationBase):
 
 class QCSOR(SumOfRotationBase):
 
-    def decompose_h1(self,h1e,at,iprint=0):
+    def decompose_h1(self,h1e,at=None,dt=None,iprint=0):
         self.h1e = xp.asarray(h1e)
         ek,vk = xp.linalg.eigh(self.h1e) 
         self.chol_basis.append(vk)
         self.chol_bands.append(ek)
 
-        self._decompose_h1(ek,at,iprint=iprint)
+        self._decompose_h1(ek,at=at,dt=dt,iprint=iprint)
 
-    def decompose_h2(self,chol,ai,iprint=0):
-        aisq = ai**2/2
-        if iprint>0:
-            print('ai,aisq=',ai,aisq)
+    def decompose_h2(self,chol,coeff=None,di=None,iprint=0):
         self.chol_ix['chol'] = []
         self.chol = xp.asarray(chol)
-        for L in self.chol:
+        for i,L in enumerate(self.chol):
             ek,vk = xp.linalg.eigh(L) 
             self.chol_basis.append(vk)
             self.chol_bands.append(ek)
@@ -296,24 +295,33 @@ class QCSOR(SumOfRotationBase):
             if iprint>0:
                 print('nchol idx=',chol_ix)
                 print('bands=',ek)
-            assert ai>xp.amax(xp.fabs(ek))
+                if coeff is None:
+                    ai = xp.fabs(ek)/di
+                    ai[ai<1.] = 1.
+                else:
+                    ai = coeff[i]
+                print('ai=',ai)
 
             for p in range(self.nbasis):
-                dp = ek[p]/ai
+                ap = ai[p]
+                dp = ek[p]/ap
+                apsq = ap**2/2.
                 if self.apply_spin_down:
-                    self.add_term(aisq,chol_ix,[p,p],[-dp,dp],[0,1])
-                    self.add_term(aisq,chol_ix,[p,p],[dp,-dp],[0,1])
+                    self.add_term(apsq,chol_ix,[p,p],[-dp,dp],[0,1])
+                    self.add_term(apsq,chol_ix,[p,p],[dp,-dp],[0,1])
                 for q in range(p+1,self.nbasis):
-                    dq = ek[q]/ai
-                    self.add_term(aisq,chol_ix,[p,q],[-dp,dq],[0,0])
-                    self.add_term(aisq,chol_ix,[p,q],[dp,-dq],[0,0])
+                    aq = ai[q]
+                    dq = ek[q]/aq
+                    apq = ap*aq/2.
+                    self.add_term(apq,chol_ix,[p,q],[-dp,dq],[0,0])
+                    self.add_term(apq,chol_ix,[p,q],[dp,-dq],[0,0])
                     if self.apply_spin_down: 
-                        self.add_term(aisq,chol_ix,[p,q],[-dp,dq],[1,1])
-                        self.add_term(aisq,chol_ix,[p,q],[dp,-dq],[1,1])
-                        self.add_term(aisq,chol_ix,[p,q],[-dp,dq],[0,1])
-                        self.add_term(aisq,chol_ix,[p,q],[dp,-dq],[0,1])
-                        self.add_term(aisq,chol_ix,[q,p],[dq,-dp],[0,1])
-                        self.add_term(aisq,chol_ix,[q,p],[-dq,dp],[0,1])
+                        self.add_term(apq,chol_ix,[p,q],[-dp,dq],[1,1])
+                        self.add_term(apq,chol_ix,[p,q],[dp,-dq],[1,1])
+                        self.add_term(apq,chol_ix,[p,q],[-dp,dq],[0,1])
+                        self.add_term(apq,chol_ix,[p,q],[dp,-dq],[0,1])
+                        self.add_term(apq,chol_ix,[q,p],[dq,-dp],[0,1])
+                        self.add_term(apq,chol_ix,[q,p],[-dq,dp],[0,1])
 
     def local_energy(self,walkers,trial):
         if walkers.fast_eloc:

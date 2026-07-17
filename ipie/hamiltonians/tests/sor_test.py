@@ -174,7 +174,7 @@ def test_hamiltonian(ham,nsite,nelecs,h1e,eri=None):
         H,basis,basis_map = hubbard2MB(h1e,ham.hubbard_U,nelecs=nelecs)
     else:
        H,basis,basis_map = chol2MB(h1e,eri=eri,symmetry='u11',nelecs=nelecs)
-    G1 = np.eye(len(basis))-H/ham.Lambda
+    G1 = np.eye(len(basis))-H/ham.Lambda[-1]
     G2 = get_MB_gf(ham,basis,basis_map)
     test_norm(G1,G2)
 
@@ -207,10 +207,10 @@ if __name__=='__main__':
     print('\ncheck GF decomposition for Hubbard...')
     U = 4 
     ham = HubbardSOR(U) 
+    d = 0.1
     iprint = 1
-    at = 10 
     gu = 0.5 
-    ham.decompose_h1(h1e,at,iprint=iprint)
+    ham.decompose_h1(h1e,dt=d,iprint=iprint)
     ham.decompose_h2(gu,iprint=iprint)
     ham.parse_decomposition()
     test_hamiltonian(ham,nsite,nelecs,h1e)
@@ -229,12 +229,9 @@ if __name__=='__main__':
     #chol = np.zeros_like(chol)
     #eri = np.zeros_like(eri)
     
-    at = 20. 
-    ai = 5.
-    iprint = 1
     ham = QCSOR(apply_spin_down=(nelecs[1]>0)) 
-    ham.decompose_h1(h1e,at,iprint=iprint)
-    ham.decompose_h2(chol,ai,iprint=iprint)
+    ham.decompose_h1(h1e,dt=d,iprint=iprint)
+    ham.decompose_h2(chol,di=d,iprint=iprint)
     ham.parse_decomposition()
     test_hamiltonian(ham,nsite,nelecs,h1e,eri=eri)
     print('greens function tested')
