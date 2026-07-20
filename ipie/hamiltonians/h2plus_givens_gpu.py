@@ -1,20 +1,20 @@
+import time
+from ipie.utils.backend import arraylib as xp
+from ipie.utils.backend import to_host 
 import numpy as np
-import h5py, time
-from ipie.hamiltonians.sor_base import QCSOR
-from ipie.utils.linalg import modified_cholesky
 
-np.set_printoptions(suppress=True, precision=6)
+#np.set_printoptions(suppress=True, precision=6)
 
 
-def complete_orthonormal_basis(first_vec, thresh=1e-12):
+def complete_orthonormal_basis_gs(first_vec, thresh=1e-12):
     """
     Build a deterministic orthonormal basis B whose first column is first_vec / ||first_vec||.
 
     B maps local Givens coordinates to the original AO/MO coefficient basis:
         c_original = B @ c_local.
     """
-    v0 = np.asarray(first_vec, dtype=np.float64).copy()
-    nrm = np.linalg.norm(v0)
+    v0 = first_vec.copy()
+    nrm = xp.linalg.norm(v0)
     if nrm < thresh:
         raise ValueError("Reference vector has near-zero norm.")
     v0 /= nrm
@@ -22,11 +22,11 @@ def complete_orthonormal_basis(first_vec, thresh=1e-12):
     M = v0.size
     cols = [v0]
     for k in range(M):
-        v = np.zeros(M)
+        v = xp.zeros(M)
         v[k] = 1.0
         for q in cols:
-            v -= q * np.dot(q, v)
-        nv = np.linalg.norm(v)
+            v -= q * xp.dot(q, v)
+        nv = xp.linalg.norm(v)
         if nv > thresh:
             cols.append(v / nv)
         if len(cols) == M:
@@ -35,11 +35,36 @@ def complete_orthonormal_basis(first_vec, thresh=1e-12):
     if len(cols) != M:
         raise RuntimeError("Failed to construct a complete orthonormal basis.")
 
-    B = np.column_stack(cols)
+    B = xp.column_stack(cols)
     # Small sanity checks.
-    if np.linalg.norm(B.T @ B - np.eye(M)) > 1e-10:
+    if xp.linalg.norm(B.T @ B - xp.eye(M)) > 1e-10:
         raise RuntimeError("Internal error: basis is not orthonormal.")
-    if np.linalg.norm(B[:, 0] - v0) > 1e-10:
+    if xp.linalg.norm(B[:, 0] - v0) > 1e-10:
+        raise RuntimeError("Internal error: first basis vector does not match reference.")
+    return B
+
+def complete_orthonormal_basis(first_vec, thresh=1e-12):
+    """
+    Build a deterministic orthonormal basis B whose first column is first_vec / ||first_vec||.
+
+    B maps local Givens coordinates to the original AO/MO coefficient basis:
+        c_original = B @ c_local.
+    """
+    v0 = first_vec.copy()
+    nrm = xp.linalg.norm(v0)
+    if nrm < thresh:
+        raise ValueError("Reference vector has near-zero norm.")
+    v0 /= nrm
+
+    M = v0.size
+    A = xp.concatenate([v0.reshape(M,1),xp.eye(M)],axis=1)
+    B,R = xp.linalg.qr(A,mode='complete')
+    if xp.dot(B[:,0],v0)<0.:
+        B[:,0] *= -1
+    # Small sanity checks.
+    if xp.linalg.norm(B.T @ B - xp.eye(M)) > 1e-10:
+        raise RuntimeError("Internal error: basis is not orthonormal.")
+    if xp.linalg.norm(B[:, 0] - v0) > 1e-10:
         raise RuntimeError("Internal error: first basis vector does not match reference.")
     return B
 
@@ -73,8 +98,8 @@ class GivensMasterEquation:
 
         # Same midpoint grid used in the AFQMC Fokker-Planck paper:
         # theta(p) = -pi/2 + (p + 1/2) * pi / Ng, p=0,...,Ng-1.
-        self.dtheta = np.pi / self.Ng
-        self.theta_vals = -0.5 * np.pi + (np.arange(self.Ng) + 0.5) * self.dtheta
+        self.dtheta = xp.pi / self.Ng
+        self.theta_vals = -0.5 * xp.pi + (xp.arange(self.Ng) + 0.5) * self.dtheta
 
         self.Nh = self.Ng ** 3
         print(f"Givens grid: Ng={self.Ng}, Nh={self.Nh}, dtheta={self.dtheta}")
@@ -82,11 +107,12 @@ class GivensMasterEquation:
 
         print("computing all grid orbitals...")
         t0 = time.time()
-        p0, p1, p2 = np.indices((self.Ng, self.Ng, self.Ng), dtype=np.int64)
-        thetas = np.stack(
+        p0, p1, p2 = xp.indices((self.Ng, self.Ng, self.Ng), dtype=xp.int64)
+        thetas = xp.stack(
             [self.theta_vals[p0], self.theta_vals[p1], self.theta_vals[p2]], axis=-1
         ).reshape(-1, 3)
         self.theta_grid = thetas
+        print(self.theta_grid.shape)
         self.mos_local = self.givens_to_local_vec(thetas)
         # self.mos in original basis is constructed in build(), after the trial basis is known.
         self.mos = None
@@ -96,7 +122,6 @@ class GivensMasterEquation:
         return (i1 * self.Ng + i2) * self.Ng + i3
 
     def flat2idx(self, ix):
-        ix = np.asarray(ix)
         i1 = ix // (self.Ng * self.Ng)
         rem = ix % (self.Ng * self.Ng)
         i2 = rem // self.Ng
@@ -108,19 +133,18 @@ class GivensMasterEquation:
     @staticmethod
     def givens_to_local_vec(theta):
         """Convert shape (..., 3) Givens angles to shape (..., 4) normalized local vectors."""
-        theta = np.asarray(theta, dtype=np.float64)
         t1 = theta[..., 0]
         t2 = theta[..., 1]
         t3 = theta[..., 2]
 
-        c1 = np.cos(t1)
-        s1 = np.sin(t1)
-        c2 = np.cos(t2)
-        s2 = np.sin(t2)
-        c3 = np.cos(t3)
-        s3 = np.sin(t3)
+        c1 = xp.cos(t1)
+        s1 = xp.sin(t1)
+        c2 = xp.cos(t2)
+        s2 = xp.sin(t2)
+        c3 = xp.cos(t3)
+        s3 = xp.sin(t3)
 
-        out = np.empty(theta.shape[:-1] + (4,), dtype=np.float64)
+        out = xp.empty(theta.shape[:-1] + (4,), dtype=theta.dtype)
         out[..., 0] = c3 * c2 * c1
         out[..., 1] = s1
         out[..., 2] = s2 * c1
@@ -132,31 +156,30 @@ class GivensMasterEquation:
         Convert normalized local vectors with u[...,0] >= 0 to Givens angles.
         Values very near the nodal boundary u0=0 are clipped to the finite grid domain.
         """
-        u = np.asarray(u, dtype=np.float64)
         x0 = u[..., 0]
         x1 = u[..., 1]
         x2 = u[..., 2]
         x3 = u[..., 3]
 
-        t1 = np.arcsin(np.clip(x1, -1.0, 1.0))
-        rem1 = np.sqrt(np.maximum(1.0 - x1 * x1, thresh))
+        t1 = xp.arcsin(xp.clip(x1, -1.0, 1.0))
+        rem1 = xp.sqrt(xp.maximum(1.0 - x1 * x1, thresh))
 
-        y2 = np.clip(x2 / rem1, -1.0, 1.0)
-        t2 = np.arcsin(y2)
-        rem2 = np.sqrt(np.maximum(rem1 * rem1 - x2 * x2, thresh))
+        y2 = xp.clip(x2 / rem1, -1.0, 1.0)
+        t2 = xp.arcsin(y2)
+        rem2 = xp.sqrt(xp.maximum(rem1 * rem1 - x2 * x2, thresh))
 
         # Since the sign convention enforces x0 >= 0, atan2 gives t3 in [-pi/2, pi/2].
-        t3 = np.arctan2(x3, np.maximum(x0, 0.0))
-        t3 = np.clip(t3, self.theta_vals[0], self.theta_vals[-1])
+        t3 = xp.arctan2(x3, xp.maximum(x0, 0.0))
+        t3 = xp.clip(t3, self.theta_vals[0], self.theta_vals[-1])
 
-        theta = np.stack([t1, t2, t3], axis=-1)
-        theta = np.clip(theta, self.theta_vals[0], self.theta_vals[-1])
+        theta = xp.stack([t1, t2, t3], axis=-1)
+        theta = xp.clip(theta, self.theta_vals[0], self.theta_vals[-1])
         return theta
 
     def theta_to_nearest_indices(self, theta):
         """Coordinate-rounded grid indices for theta values."""
-        p = np.rint((theta - self.theta_vals[0]) / self.dtheta).astype(np.int64)
-        return np.clip(p, 0, self.Ng - 1)
+        p = xp.rint((theta - self.theta_vals[0]) / self.dtheta).astype(np.int64)
+        return xp.clip(p, 0, self.Ng - 1)
 
     def project_vecs_coordinate(self, vecs, thresh=1e-12):
         """
@@ -167,10 +190,10 @@ class GivensMasterEquation:
             raise RuntimeError("Call build() before projecting vectors.")
 
         orig_shape = vecs.shape[:-1]
-        v = np.asarray(vecs, dtype=np.float64).reshape(-1, self.M)
+        v = vecs.reshape(-1, self.M)
 
-        norms = np.linalg.norm(v, axis=1)
-        if np.any(norms < thresh):
+        norms = xp.linalg.norm(v, axis=1)
+        if xp.any(norms < thresh):
             raise ValueError("Encountered near-zero vector during projection.")
 
         u_orig = v / norms[:, None]
@@ -200,10 +223,10 @@ class GivensMasterEquation:
             raise RuntimeError("Call build() before projecting vectors.")
 
         orig_shape = vecs.shape[:-1]
-        v = np.asarray(vecs, dtype=np.float64).reshape(-1, self.M)
+        v = vecs.reshape(-1, self.M)
 
-        norms = np.linalg.norm(v, axis=1)
-        if np.any(norms < thresh):
+        norms = xp.linalg.norm(v, axis=1)
+        if xp.any(norms < thresh):
             raise ValueError("Encountered near-zero vector during projection.")
 
         u_orig = v / norms[:, None]
@@ -218,7 +241,7 @@ class GivensMasterEquation:
         p0 = self.theta_to_nearest_indices(theta)
 
         best_ix = self.flatten_idx(p0[:, 0], p0[:, 1], p0[:, 2])
-        best_overlap = np.einsum("ij,ij->i", u, self.mos_local[best_ix], optimize=True)
+        best_overlap = xp.einsum("ij,ij->i", u, self.mos_local[best_ix], optimize=True)
 
         for d1 in range(-stencil, stencil + 1):
             for d2 in range(-stencil, stencil + 1):
@@ -247,14 +270,15 @@ class GivensMasterEquation:
         if self.B is None:
             raise RuntimeError("Call build() before projecting vectors.")
 
+        mos_local = to_host(self.mos_local) 
         if not hasattr(self, "_tree") or self._tree is None:
-            self._tree = cKDTree(self.mos_local)
+            self._tree = cKDTree(mos_local)
 
         orig_shape = vecs.shape[:-1]
-        v = np.asarray(vecs, dtype=np.float64).reshape(-1, self.M)
+        v = vecs.reshape(-1, self.M)
 
-        norms = np.linalg.norm(v, axis=1)
-        if np.any(norms < thresh):
+        norms = xp.linalg.norm(v, axis=1)
+        if xp.any(norms < thresh):
             raise ValueError("Encountered near-zero vector during projection.")
 
         u_orig = v / norms[:, None]
@@ -265,13 +289,17 @@ class GivensMasterEquation:
         fac[flip] *= -1.0
         u[flip] *= -1.0
 
-        _, ix = self._tree.query(u, k=1, workers=workers)
+        dist, ix = self._tree.query(to_host(u), k=1, workers=workers)
+        ix = xp.asarray(ix)
+        dist = xp.asarray(dist)*fac
+        print('  max dist=',xp.amax(dist))
+        print('  rms dist=',xp.sqrt((dist**2).sum()/dist.size))
         return ix.reshape(orig_shape), fac.reshape(orig_shape)
 
     def build(self, ham, trial, projection="kdtree", check=False, tol=1e-8):
         self.ham = ham
-        self.trial = np.asarray(trial, dtype=np.float64).copy()
-        self.trial /= np.linalg.norm(self.trial)
+        self.trial = trial.copy()
+        self.trial /= xp.linalg.norm(self.trial)
         self.M = self.trial.size
         if self.M != 4:
             raise ValueError("This implementation assumes one electron in M=4 real orbitals.")
@@ -285,8 +313,9 @@ class GivensMasterEquation:
 
         print("precomputing Umos...")
         t0 = time.time()
-        self.Us = np.asarray([ham.get_rotation_matrix(ix)[0] for ix in range(ham.nterms)])
-        self.Umos = np.einsum("axy,iy->aix", self.Us, self.mos, optimize=True)
+        self.Us = xp.asarray([ham.get_rotation_matrix(ix)[0] for ix in range(ham.nterms)])
+        self.Umos = xp.einsum("axy,iy->aix", self.Us, self.mos, optimize=True)
+        self.aUmos = xp.einsum("a,aix->ix", self.ham.a, self.Umos, optimize=True)
         print("computing Umo time=", time.time() - t0)
 
         print(f"projecting Umos with method={projection!r}...")
@@ -301,38 +330,54 @@ class GivensMasterEquation:
             raise ValueError("projection must be one of {'coordinate', 'local', 'kdtree'}.")
         print("projection time=", time.time() - t0)
 
-        self.check_projection_error(tol=tol)
+        #self.check_projection_error(tol=tol)
+        #exit()
 
         # Precompute weighted map for fast matvec.
         self.map_ix = self.Umos_ixs.ravel()
-        self.map_fac = (np.asarray(ham.a)[:, None] * self.Umos_fac).ravel()
+        self.map_fac = (ham.a[:, None] * self.Umos_fac).ravel()
 
         self.trial_mos = self.mos @ self.trial
-        self.trial_Umos = np.einsum("a,x,aix->i", np.asarray(self.ham.a), self.trial, self.Umos, optimize=True)
+        self.trial_Umos = xp.dot(self.aUmos,self.trial)
 
         # Vector gtrial such that <trial|G|v> = gtrial @ v for any one-electron vector v.
-        self.gtrial = np.einsum("a,x,axy->y", np.asarray(self.ham.a), self.trial, self.Us, optimize=True)
-        print("trial_Umos check=", np.linalg.norm(self.mos @ self.gtrial - self.trial_Umos))
+        self.gtrial = xp.einsum("a,x,axy->y", self.ham.a, self.trial, self.Us, optimize=True)
+        dist =  xp.linalg.norm(self.mos @ self.gtrial - self.trial_Umos)
+        assert dist<1e-8
+        print("trial_Umos check=", dist)
 
+        if not check:
+            return
         t0 = time.time()
-        psi_test = np.random.rand(self.Nh) * 2 - 1
+        psi_test = xp.random.rand(self.Nh) * 2 - 1
         G1 = self.mat_vec(psi_test)
         G2 = self.mat_vec_chunked(psi_test, chunk_terms=32)
-        print("check matvec=", np.linalg.norm(G1 - G2), np.linalg.norm(G1))
+        G3 = self.mat_vec(psi_test)
+        print("check matvec=", xp.linalg.norm(G1 - G3), xp.linalg.norm(G1))
+        print("check matvec=", xp.linalg.norm(G2 - G3), xp.linalg.norm(G2))
         print("check vector time=", time.time() - t0)
+        exit()
 
     def mat_vec(self, psi):
-        vals = self.map_fac * np.broadcast_to(psi, self.Umos_fac.shape).ravel()
-        return np.bincount(self.map_ix, weights=vals, minlength=self.Nh)
+        vals = self.map_fac * xp.broadcast_to(psi, self.Umos_fac.shape).ravel()
+        return xp.bincount(self.map_ix, weights=vals, minlength=self.Nh)
 
     def mat_vec_chunked(self, psi, chunk_terms=512):
-        out = np.zeros(self.Nh, dtype=np.result_type(psi, self.Umos_fac))
-        ham_a = np.asarray(self.ham.a)
+        out = xp.zeros(self.Nh, dtype=xp.result_type(psi, self.Umos_fac))
         for start in range(0, self.ham.nterms, chunk_terms):
             stop = min(start + chunk_terms, self.ham.nterms)
-            vals = (ham_a[start:stop, None] * self.Umos_fac[start:stop]) * psi[None, :]
-            out += np.bincount(self.Umos_ixs[start:stop].ravel(), weights=vals.ravel(), minlength=self.Nh)
+            vals = (self.ham.a[start:stop, None] * self.Umos_fac[start:stop]) * psi[None, :]
+            out += xp.bincount(self.Umos_ixs[start:stop].ravel(), weights=vals.ravel(), minlength=self.Nh)
         return out
+
+    def mat_vec_slow(self,psi):
+        psi_new = xp.zeros_like(psi)
+        for ai,Ui in zip(self.ham.a,self.Us):
+            for i,mo in enumerate(self.mos):
+                Umo = xp.dot(Ui,mo)
+                ix,fac = self.project_vecs_kdtree(Umo.reshape(Umo.size,1))
+                psi_new[ix] += fac*psi[i]*ai
+        return psi_new
 
     def check_projection_error(self, tol=1e-8, chunk_terms=256):
         nterms, Nh, norb = self.Umos.shape
@@ -347,18 +392,18 @@ class GivensMasterEquation:
             fac_chunk = self.Umos_fac[a0:a1]
             reconstructed = self.mos[ix_chunk] * fac_chunk[..., None]
             diff = reconstructed - self.Umos[a0:a1]
-            err = np.linalg.norm(diff, axis=-1)
+            err = xp.linalg.norm(diff, axis=-1)
 
-            local_max = np.max(err)
+            local_max = xp.max(err)
             if local_max > max_err:
-                local_arg = np.unravel_index(np.argmax(err), err.shape)
+                local_arg = xp.unravel_index(xp.argmax(err), err.shape)
                 worst = (a0 + local_arg[0], local_arg[1], local_max)
                 max_err = local_max
 
-            sum_err2 += np.sum(err * err)
-            bad_count += np.count_nonzero(err > tol)
+            sum_err2 += xp.sum(err * err)
+            bad_count += xp.count_nonzero(err > tol)
 
-        rms_err = np.sqrt(sum_err2 / (nterms * Nh))
+        rms_err = xp.sqrt(sum_err2 / (nterms * Nh))
         print("projection check:")
         print("  max_err  =", max_err)
         print("  rms_err  =", rms_err)
@@ -385,11 +430,11 @@ class GivensMasterEquation:
 
         den_curr = np.dot(self.trial_mos, psi)
         num_curr = np.dot(self.trial_Umos, psi)
-        E_curr = Lambda * (1.0 - num_curr / den_curr) if abs(den_curr) > eps else np.nan
+        E_curr = Lambda * (1.0 - num_curr / den_curr) if abs(den_curr) > eps else xp.nan
 
-        den_next_proj = np.dot(self.trial_mos, Gpsi)
-        num_next_proj = np.dot(self.trial_Umos, Gpsi)
-        E_next_proj = Lambda * (1.0 - num_next_proj / den_next_proj) if abs(den_next_proj) > eps else np.nan
+        den_next_proj = xp.dot(self.trial_mos, Gpsi)
+        num_next_proj = xp.dot(self.trial_Umos, Gpsi)
+        E_next_proj = Lambda * (1.0 - num_next_proj / den_next_proj) if abs(den_next_proj) > eps else xp.nan
 
         # Exact unprojected next denominator is <T|G|psi>.
         den_next_exact = num_curr
@@ -401,40 +446,39 @@ class GivensMasterEquation:
         max_pointwise_resid = 0.0
         max_weighted_resid = 0.0
         worst = None
-        ham_a = np.asarray(self.ham.a)
 
         for a0 in range(0, self.ham.nterms, chunk_terms):
             a1 = min(a0 + chunk_terms, self.ham.nterms)
             U_chunk = self.Umos[a0:a1]
             ix_chunk = self.Umos_ixs[a0:a1]
             fac_chunk = self.Umos_fac[a0:a1]
-            a_chunk = ham_a[a0:a1]
+            a_chunk = self.ham.a[a0:a1]
 
-            exact_next_overlap = np.einsum("x,aix->ai", self.gtrial, U_chunk, optimize=True)
+            exact_next_overlap = xp.einsum("x,aix->ai", self.gtrial, U_chunk, optimize=True)
             coeff = a_chunk[:, None] * psi[None, :]
-            num_next_exact += np.sum(coeff * exact_next_overlap)
+            num_next_exact += xp.sum(coeff * exact_next_overlap)
 
             reconstructed = fac_chunk[..., None] * self.mos[ix_chunk]
             resid = U_chunk - reconstructed
-            resid_norm = np.linalg.norm(resid, axis=-1)
-            exact_norm = np.linalg.norm(U_chunk, axis=-1)
-            weight_abs = np.abs(coeff)
+            resid_norm = xp.linalg.norm(resid, axis=-1)
+            exact_norm = xp.linalg.norm(U_chunk, axis=-1)
+            weight_abs = xp.abs(coeff)
 
-            weighted_resid2 += np.sum((weight_abs * resid_norm) ** 2)
-            weighted_exact2 += np.sum((weight_abs * exact_norm) ** 2)
+            weighted_resid2 += xp.sum((weight_abs * resid_norm) ** 2)
+            weighted_exact2 += xp.sum((weight_abs * exact_norm) ** 2)
 
-            local_max = np.max(resid_norm)
+            local_max = xp.max(resid_norm)
             if local_max > max_pointwise_resid:
-                local_arg = np.unravel_index(np.argmax(resid_norm), resid_norm.shape)
+                local_arg = xp.unravel_index(xp.argmax(resid_norm), resid_norm.shape)
                 worst = (a0 + local_arg[0], local_arg[1])
                 max_pointwise_resid = local_max
 
-            max_weighted_resid = max(max_weighted_resid, np.max(weight_abs * resid_norm))
+            max_weighted_resid = max(max_weighted_resid, xp.max(weight_abs * resid_norm))
 
         E_next_exact = (
             Lambda * (1.0 - num_next_exact / den_next_exact)
             if abs(den_next_exact) > eps
-            else np.nan
+            else xp.nan
         )
 
         return {
@@ -459,25 +503,63 @@ class GivensMasterEquation:
         }
 
     def get_initial_state(self):
-        psi = np.zeros(self.Nh)
+        psi = xp.zeros(self.Nh)
         ix, _ = self.project_vecs_kdtree(self.trial[None, :])
         print('trial initial state index',ix,self.flat2idx(ix))
         psi[int(ix[0])] = 1.0
         return psi
 
     def energy(self, psi):
-        denom = np.dot(self.trial_mos, psi)
-        num = np.dot(self.trial_Umos, psi)
-        return self.ham.Lambda[-1] * (1.0 - num / denom)
+        denom = xp.dot(self.trial_mos, psi)
+        num = xp.dot(self.trial_Umos, psi)
+        return self.ham.Lambda[-1] * (1.0 - num / denom),denom
 
     def exact_trial_energy_under_G(self):
         """Energy estimator evaluated at the exact trial orbital, not the grid delta."""
-        denom = np.dot(self.trial, self.trial)
-        num = np.dot(self.gtrial, self.trial)
+        denom = xp.dot(self.trial, self.trial)
+        num = xp.dot(self.gtrial, self.trial)
         return self.ham.Lambda[-1] * (1.0 - num / denom)
+
+    def run(self,start,stop,psi,print_every=1):
+        Lambda = self.ham.Lambda[-1]
+        for i in range(start,stop):
+            E_i,denom = self.energy(psi)
+        
+            Gpsi_proj = self.mat_vec(psi) # projected 
+            Gpsi_proj_mb = xp.dot(Gpsi_proj,self.mos)
+            num_proj = xp.dot(self.trial,Gpsi_proj_mb)
+
+            Gpsi_unproj_mb = xp.dot(psi,self.aUmos) 
+            num_unproj = xp.dot(self.trial,Gpsi_unproj_mb)
+            assert xp.fabs(Lambda*(1.0-num_unproj/denom)-E_i)<1e-10
+
+            wfn_dist = xp.linalg.norm(Gpsi_proj_mb-Gpsi_unproj_mb)
+
+            norm_proj = xp.linalg.norm(Gpsi_proj_mb)
+            Gpsi_proj_mb /= norm_proj
+            norm_unproj = xp.linalg.norm(Gpsi_unproj_mb)
+            Gpsi_unproj_mb /= norm_unproj 
+            wfn_dist_normalized = xp.linalg.norm(Gpsi_proj_mb-Gpsi_unproj_mb)
+
+            #diag = me.projection_effect_on_actual_energy(psi, Gpsi=Gpsi)
+            if i%print_every==0:
+                print(
+                    f"step={i},E={E_i},",
+                    f"dtrial_proj={xp.fabs(num_proj-num_unproj)},",
+                    f"abs wfn dist={wfn_dist},",
+                    f"rel wfn dist={wfn_dist/norm_unproj},",
+                    f'norm proj={norm_proj},',
+                    f'norm unproj={norm_unproj},',
+                    f"normalized wfn dist={wfn_dist_normalized},"
+                )
+
+            psi = Gpsi_proj
+        return psi
 
 
 if __name__ == "__main__":
+    import h5py, time
+    import numpy as np
     # For rough cost matching with your previous polar grid:
     #   polar (Nangle=20, Nr=10): Nh = 11 * 80 * 41 = 36080
     #   givens Ng=33:             Nh = 33^3 = 35937
@@ -500,6 +582,7 @@ if __name__ == "__main__":
     Eref += 0.5 * np.einsum("prqs,p,r,q,s->", eri, trial, trial, trial, trial)
     Eref -= 0.5 * np.einsum("prqs,p,s,q,r->", eri, trial, trial, trial, trial)
     print("Eref=", Eref)
+    trial = xp.asarray(trial)
 
     nsite = eri.shape[0]
     cmax = nsite**2
@@ -518,13 +601,14 @@ if __name__ == "__main__":
     me.build(ham, trial, projection=projection, tol=1e-3)
     print("exact trial energy under G=", me.exact_trial_energy_under_G())
 
-    start,stop = 2000,3000 
+    start,stop = 0,1000 
     if start==0:
         psi = me.get_initial_state()
         print("grid initial energy=", me.energy(psi))
         print("initial projection energy error=", me.energy(psi) - me.exact_trial_energy_under_G())
     else:
         psi = np.load(f'at{at}_ai{ai}_Ng{Ng}_stop{start}.npy')
+        psi = xp.asarray(psi)
 
     E = []
     for i in range(start,stop):

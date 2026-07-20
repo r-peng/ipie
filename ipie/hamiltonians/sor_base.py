@@ -132,7 +132,7 @@ class SumOfRotationBase:
                 else:
                     E2_ixs.append(ix)
 
-                if iprint>0:
+                if iprint>1:
                     print(ix,key,i,p,d,a)
 
         self.term_dict = dict() 
