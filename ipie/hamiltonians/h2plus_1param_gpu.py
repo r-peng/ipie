@@ -5,154 +5,23 @@ import numpy as np
 
 #np.set_printoptions(suppress=True, precision=6)
 
-
-def complete_orthonormal_basis_gs(first_vec, thresh=1e-12):
-    """
-    Build a deterministic orthonormal basis B whose first column is first_vec / ||first_vec||.
-
-    B maps local Givens coordinates to the original AO/MO coefficient basis:
-        c_original = B @ c_local.
-    """
-    v0 = first_vec.copy()
-    nrm = xp.linalg.norm(v0)
-    if nrm < thresh:
-        raise ValueError("Reference vector has near-zero norm.")
-    v0 /= nrm
-
-    M = v0.size
-    cols = [v0]
-    for k in range(M):
-        v = xp.zeros(M)
-        v[k] = 1.0
-        for q in cols:
-            v -= q * xp.dot(q, v)
-        nv = xp.linalg.norm(v)
-        if nv > thresh:
-            cols.append(v / nv)
-        if len(cols) == M:
-            break
-
-    if len(cols) != M:
-        raise RuntimeError("Failed to construct a complete orthonormal basis.")
-
-    B = xp.column_stack(cols)
-    # Small sanity checks.
-    if xp.linalg.norm(B.T @ B - xp.eye(M)) > 1e-10:
-        raise RuntimeError("Internal error: basis is not orthonormal.")
-    if xp.linalg.norm(B[:, 0] - v0) > 1e-10:
-        raise RuntimeError("Internal error: first basis vector does not match reference.")
-    return B
-
-def complete_orthonormal_basis(first_vec, thresh=1e-12):
-    """
-    Build a deterministic orthonormal basis B whose first column is first_vec / ||first_vec||.
-
-    B maps local Givens coordinates to the original AO/MO coefficient basis:
-        c_original = B @ c_local.
-    """
-    v0 = first_vec.copy()
-    nrm = xp.linalg.norm(v0)
-    if nrm < thresh:
-        raise ValueError("Reference vector has near-zero norm.")
-    v0 /= nrm
-
-    M = v0.size
-    A = xp.concatenate([v0.reshape(M,1),xp.eye(M)],axis=1)
-    B,R = xp.linalg.qr(A,mode='complete')
-    if xp.dot(B[:,0],v0)<0.:
-        B[:,0] *= -1
-    # Small sanity checks.
-    if xp.linalg.norm(B.T @ B - xp.eye(M)) > 1e-10:
-        raise RuntimeError("Internal error: basis is not orthonormal.")
-    if xp.linalg.norm(B[:, 0] - v0) > 1e-10:
-        raise RuntimeError("Internal error: first basis vector does not match reference.")
-    return B
-
-
 class GivensMasterEquation:
-    """
-    Deterministic grid/master-equation representation of one-electron determinants
-    using a Givens chart relative to the trial orbital.
-
-    For M=4, N=1, a normalized orbital is represented in the reference basis as
-
-        c_local(theta) = G_03(theta3) G_02(theta2) G_01(theta1) e0
-
-    with theta_i in (-pi/2, pi/2). Explicitly,
-
-        c0 = cos(t3) cos(t2) cos(t1)
-        c1 = sin(t1)
-        c2 = sin(t2) cos(t1)
-        c3 = sin(t3) cos(t2) cos(t1)
-
-    This chart covers the patch with positive overlap with the reference/trial
-    determinant. The physical global sign c ~ -c is fixed by enforcing c0 >= 0.
-    """
 
     def __init__(self, Ng=33, importance=True):
         self.importance = importance
         self.Ng = int(Ng)
-        if self.Ng < 3:
-            raise ValueError("Ng must be at least 3.")
-        if self.Ng % 2 == 0:
-            print("WARNING: Ng is even, so theta=0 is not a grid point. Odd Ng is usually better.")
+        self.Nh = self.Ng
 
         # Same midpoint grid used in the AFQMC Fokker-Planck paper:
-        # theta(p) = -pi/2 + (p + 1/2) * pi / Ng, p=0,...,Ng-1.
-        self.dtheta = xp.pi / self.Ng
-        self.theta_vals = -0.5 * xp.pi + (xp.arange(self.Ng) + 0.5) * self.dtheta
+        self.dtheta = 2. / self.Ng
+        self.theta_vals = -1. + (xp.arange(self.Ng) + 0.5) * self.dtheta
+        print(f"Givens grid: Ng={self.Ng}, Nh={self.Nh}, xvals={self.theta_vals}")
 
-        self.Nh = self.Ng ** 3
-        print(f"Givens grid: Ng={self.Ng}, Nh={self.Nh}, dtheta={self.dtheta}")
-        print("theta range:", self.theta_vals[0], self.theta_vals[-1])
+        self.mos = xp.zeros((self.Nh,4))
+        self.mos[:,1] = self.theta_vals
+        self.mos[:,3] = xp.sqrt(1.-self.theta_vals**2)
 
-        print("computing all grid orbitals...")
-        t0 = time.time()
-        p0, p1, p2 = xp.indices((self.Ng, self.Ng, self.Ng), dtype=xp.int64)
-        thetas = xp.stack(
-            [self.theta_vals[p0], self.theta_vals[p1], self.theta_vals[p2]], axis=-1
-        ).reshape(-1, 3)
-        self.theta_grid = thetas
-        print(self.theta_grid.shape)
-        self.mos_local = self.givens_to_local_vec(thetas)
-        # self.mos in original basis is constructed in build(), after the trial basis is known.
-        self.mos = None
-        print("computing grid orbital time=", time.time() - t0)
-
-    def flatten_idx(self, i1, i2, i3):
-        return (i1 * self.Ng + i2) * self.Ng + i3
-
-    def flat2idx(self, ix):
-        i1 = ix // (self.Ng * self.Ng)
-        rem = ix % (self.Ng * self.Ng)
-        i2 = rem // self.Ng
-        i3 = rem % self.Ng
-        if ix.ndim == 0:
-            return int(i1), int(i2), int(i3)
-        return i1, i2, i3
-
-    @staticmethod
-    def givens_to_local_vec(theta):
-        """Convert shape (..., 3) Givens angles to shape (..., 4) normalized local vectors."""
-        t1 = theta[..., 0]
-        t2 = theta[..., 1]
-        t3 = theta[..., 2]
-
-        c1 = xp.cos(t1)
-        s1 = xp.sin(t1)
-        c2 = xp.cos(t2)
-        s2 = xp.sin(t2)
-        c3 = xp.cos(t3)
-        s3 = xp.sin(t3)
-
-        out = xp.empty(theta.shape[:-1] + (4,), dtype=theta.dtype)
-        out[..., 0] = c3 * c2 * c1
-        out[..., 1] = s1
-        out[..., 2] = s2 * c1
-        out[..., 3] = s3 * c2 * c1
-        return out
-
-    def local_vec_to_givens(self, u, thresh=1e-12):
+    def local_vec_to_x(self, u, thresh=1e-12):
         """
         Convert normalized local vectors with u[...,0] >= 0 to Givens angles.
         Values very near the nodal boundary u0=0 are clipped to the finite grid domain.
@@ -161,103 +30,9 @@ class GivensMasterEquation:
         x1 = u[..., 1]
         x2 = u[..., 2]
         x3 = u[..., 3]
-
-        t1 = xp.arcsin(xp.clip(x1, -1.0, 1.0))
-        rem1 = xp.sqrt(xp.maximum(1.0 - x1 * x1, thresh))
-
-        y2 = xp.clip(x2 / rem1, -1.0, 1.0)
-        t2 = xp.arcsin(y2)
-        rem2 = xp.sqrt(xp.maximum(rem1 * rem1 - x2 * x2, thresh))
-
-        # Since the sign convention enforces x0 >= 0, atan2 gives t3 in [-pi/2, pi/2].
-        t3 = xp.arctan2(x3, xp.maximum(x0, 0.0))
-        t3 = xp.clip(t3, self.theta_vals[0], self.theta_vals[-1])
-
-        theta = xp.stack([t1, t2, t3], axis=-1)
-        theta = xp.clip(theta, self.theta_vals[0], self.theta_vals[-1])
-        return theta
-
-    def theta_to_nearest_indices(self, theta):
-        """Coordinate-rounded grid indices for theta values."""
-        p = xp.rint((theta - self.theta_vals[0]) / self.dtheta).astype(np.int64)
-        return xp.clip(p, 0, self.Ng - 1)
-
-    def project_vecs_coordinate(self, vecs, thresh=1e-12):
-        """
-        Project original-basis vectors to the Givens grid by coordinate rounding.
-        This is fast but not globally nearest in determinant distance.
-        """
-        if self.B is None:
-            raise RuntimeError("Call build() before projecting vectors.")
-
-        orig_shape = vecs.shape[:-1]
-        v = vecs.reshape(-1, self.M)
-
-        norms = xp.linalg.norm(v, axis=1)
-        if xp.any(norms < thresh):
-            raise ValueError("Encountered near-zero vector during projection.")
-
-        u_orig = v / norms[:, None]
-        u = u_orig @ self.B  # equivalent to B.T @ u_orig for row vectors
-
-        # Fix global sign so the overlap with the trial/reference orbital is positive.
-        flip = u[:, 0] < 0.0
-        fac = norms.copy()
-        fac[flip] *= -1.0
-        u[flip] *= -1.0
-
-        theta = self.local_vec_to_givens(u, thresh=thresh)
-        p = self.theta_to_nearest_indices(theta)
-        ix = self.flatten_idx(p[:, 0], p[:, 1], p[:, 2])
-        return ix.reshape(orig_shape), fac.reshape(orig_shape)
-
-    def project_vecs_local_nearest(self, vecs, thresh=1e-12, stencil=1):
-        """
-        Project by first converting to Givens coordinates and rounding, then selecting
-        the nearest determinant within a local stencil.
-
-        The nearest criterion is maximum dot product with normalized grid orbitals after
-        fixing the global sign by positive trial overlap. This is locally optimal, not
-        guaranteed globally optimal.
-        """
-        if self.B is None:
-            raise RuntimeError("Call build() before projecting vectors.")
-
-        orig_shape = vecs.shape[:-1]
-        v = vecs.reshape(-1, self.M)
-
-        norms = xp.linalg.norm(v, axis=1)
-        if xp.any(norms < thresh):
-            raise ValueError("Encountered near-zero vector during projection.")
-
-        u_orig = v / norms[:, None]
-        u = u_orig @ self.B
-
-        flip = u[:, 0] < 0.0
-        fac = norms.copy()
-        fac[flip] *= -1.0
-        u[flip] *= -1.0
-
-        theta = self.local_vec_to_givens(u, thresh=thresh)
-        p0 = self.theta_to_nearest_indices(theta)
-
-        best_ix = self.flatten_idx(p0[:, 0], p0[:, 1], p0[:, 2])
-        best_overlap = xp.einsum("ij,ij->i", u, self.mos_local[best_ix], optimize=True)
-
-        for d1 in range(-stencil, stencil + 1):
-            for d2 in range(-stencil, stencil + 1):
-                for d3 in range(-stencil, stencil + 1):
-                    p = p0.copy()
-                    p[:, 0] = np.clip(p[:, 0] + d1, 0, self.Ng - 1)
-                    p[:, 1] = np.clip(p[:, 1] + d2, 0, self.Ng - 1)
-                    p[:, 2] = np.clip(p[:, 2] + d3, 0, self.Ng - 1)
-                    ix = self.flatten_idx(p[:, 0], p[:, 1], p[:, 2])
-                    overlap = np.einsum("ij,ij->i", u, self.mos_local[ix], optimize=True)
-                    better = overlap > best_overlap
-                    best_overlap[better] = overlap[better]
-                    best_ix[better] = ix[better]
-
-        return best_ix.reshape(orig_shape), fac.reshape(orig_shape)
+        assert xp.linalg.norm(x0)<thresh
+        assert xp.linalg.norm(x2)<thresh
+        return x1 
 
     def project_vecs_kdtree(self, vecs, thresh=1e-12, workers=-1, iprint=0, tree_key=None):
         """
@@ -268,15 +43,12 @@ class GivensMasterEquation:
         """
         from scipy.spatial import cKDTree
 
-        if self.B is None:
-            raise RuntimeError("Call build() before projecting vectors.")
-
         if tree_key in self.tree: 
             tree = self.tree[tree_key] 
         else:
-            mos_local = to_host(self.mos_local) 
-            tree = cKDTree(mos_local)
-            self.tree[tree_key] = tree
+            theta_vals = to_host(self.theta_vals) 
+            tree = cKDTree(theta_vals.reshape(self.Ng,1))
+            self.tree[tree_key] = tree 
 
         orig_shape = vecs.shape[:-1]
         v = vecs.reshape(-1, self.M)
@@ -285,15 +57,18 @@ class GivensMasterEquation:
         if xp.any(norms < thresh):
             raise ValueError("Encountered near-zero vector during projection.")
 
-        u_orig = v / norms[:, None]
-        u = u_orig @ self.B
+        u = v / norms[:, None]
+        print(xp.linalg.norm(u[:,0]))
+        assert xp.linalg.norm(u[:,0])<thresh
+        assert xp.linalg.norm(u[:,2])<thresh
 
-        flip = u[:, 0] < 0.0
+        flip = u[:, 3] < 0.0
         fac = norms.copy()
         fac[flip] *= -1.0
         u[flip] *= -1.0
+        theta = u[:,1] 
 
-        dist, ix = tree.query(to_host(u), k=1, workers=workers)
+        dist, ix = tree.query(to_host(theta.reshape(theta.size,1)), k=1, workers=workers)
         ix = xp.asarray(ix)
         if iprint>0:
             dist = xp.asarray(dist)*fac
@@ -301,7 +76,7 @@ class GivensMasterEquation:
             print('  rms dist=',xp.sqrt((dist**2).sum()/dist.size))
         return ix.reshape(orig_shape), fac.reshape(orig_shape)
 
-    def compute_projection_map(self,Us,a,iprint=0,projection='kdtree',tree_key=None):
+    def compute_projection_map(self,Us,a,iprint=0,tree_key=None):
         t0 = time.time()
         Umos = xp.einsum("axy,iy->aix", Us, self.mos, optimize=True)
         aUmos = xp.einsum("a,aix->ix", a, Umos, optimize=True)
@@ -309,14 +84,7 @@ class GivensMasterEquation:
             print("computing Umo time=", time.time() - t0)
 
         t0 = time.time()
-        if projection == "coordinate":
-            Umos_ixs, Umos_fac = self.project_vecs_coordinate(Umos)
-        elif projection == "local":
-            Umos_ixs, Umos_fac = self.project_vecs_local_nearest(Umos, stencil=1)
-        elif projection == "kdtree":
-            Umos_ixs, Umos_fac = self.project_vecs_kdtree(Umos,iprint=iprint,tree_key=tree_key)
-        else:
-            raise ValueError("projection must be one of {'coordinate', 'local', 'kdtree'}.")
+        Umos_ixs, Umos_fac = self.project_vecs_kdtree(Umos,iprint=iprint,tree_key=tree_key)
         if iprint>0:
             print("projection time=", time.time() - t0)
 
@@ -327,7 +95,7 @@ class GivensMasterEquation:
             Umos_fac /= self.trial_mos[None,:]
         return Umos_ixs.ravel(),Umos_fac
 
-    def build(self, ham, trial, projection="kdtree", check=False, full=True):
+    def build(self, ham, trial, check=False, full=True):
         self.ham = ham
         self.trial = trial.copy()
         self.trial /= xp.linalg.norm(self.trial)
@@ -335,11 +103,7 @@ class GivensMasterEquation:
         if self.M != 4:
             raise ValueError("This implementation assumes one electron in M=4 real orbitals.")
 
-        # Reference basis: local e0 is the trial orbital.
-        self.B = complete_orthonormal_basis(self.trial)
-
         # Convert local grid orbitals to the original coefficient basis.
-        self.mos = self.mos_local @ self.B.T
         self.trial_mos = self.mos @ self.trial
         self.Us = xp.asarray([ham.get_rotation_matrix(ix)[0] for ix in range(ham.nterms)])
         self.aUs = xp.einsum('a,axy->xy',self.ham.a,self.Us)
@@ -392,10 +156,13 @@ class GivensMasterEquation:
 
     def mat_vec_slow(self,psi):
         psi_new = xp.zeros_like(psi)
-        for j in range(M.shape[0]):
-            for i in range(M.shape[1]):
-                ix = self.Umos_ixs[j,i]
-                psi_new[ix] += self.Umos_fac[j,i]
+        sh1,sh2 = self.Umos_fac.shape
+        Umos_ixs = self.Umos_ixs.reshape(sh1,sh2)
+        fac = self.Umos_fac * psi[None,:]
+        for j in range(sh1):
+            for i in range(sh2):
+                ix = Umos_ixs[j,i]
+                psi_new[ix] += fac[j,i]
         return psi_new
 
     #def check_projection_error(self, tol=1e-8, chunk_terms=256):
@@ -524,7 +291,7 @@ class GivensMasterEquation:
     def get_initial_state(self):
         psi = xp.zeros(self.Nh)
         ix, _ = self.project_vecs_kdtree(self.trial[None, :])
-        print('trial initial state index',ix,self.flat2idx(ix))
+        print('trial initial state index',ix)
         psi[int(ix[0])] = 1.0
         return psi
 
