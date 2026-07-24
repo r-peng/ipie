@@ -58,7 +58,8 @@ class GivensMasterEquation:
             raise ValueError("Encountered near-zero vector during projection.")
 
         u = v / norms[:, None]
-        print(xp.linalg.norm(u[:,0]))
+        print(u[:,0].reshape(orig_shape))
+        print(u[:,2].reshape(orig_shape))
         assert xp.linalg.norm(u[:,0])<thresh
         assert xp.linalg.norm(u[:,2])<thresh
 

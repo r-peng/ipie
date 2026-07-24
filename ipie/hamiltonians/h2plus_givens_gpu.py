@@ -43,7 +43,7 @@ def complete_orthonormal_basis_gs(first_vec, thresh=1e-12):
         raise RuntimeError("Internal error: first basis vector does not match reference.")
     return B
 
-def complete_orthonormal_basis(first_vec, thresh=1e-12):
+def complete_orthonormal_basis_qr(first_vec, thresh=1e-12):
     """
     Build a deterministic orthonormal basis B whose first column is first_vec / ||first_vec||.
 
@@ -66,8 +66,40 @@ def complete_orthonormal_basis(first_vec, thresh=1e-12):
         raise RuntimeError("Internal error: basis is not orthonormal.")
     if xp.linalg.norm(B[:, 0] - v0) > 1e-10:
         raise RuntimeError("Internal error: first basis vector does not match reference.")
+    print(B)
     return B
 
+def complete_orthonormal_basis(first_vec, thresh=1e-12):
+    """
+    Build a deterministic orthonormal basis B whose first column is first_vec / ||first_vec||.
+
+    B maps local Givens coordinates to the original AO/MO coefficient basis:
+        c_original = B @ c_local.
+    """
+    v0 = first_vec.copy()
+    nrm = xp.linalg.norm(v0)
+    if nrm < thresh:
+        raise ValueError("Reference vector has near-zero norm.")
+    v0 /= nrm
+
+    M = v0.size
+    print(v0)
+    assert xp.fabs(v0[0])<thresh
+    assert xp.fabs(v0[2])<thresh
+    _,a,_,b = v0
+    B = xp.zeros((4, 4), dtype=v0.dtype)
+    B[0, 2] = 1
+    B[1, 0] = a
+    B[1, 1] = -b
+    B[2, 3] = 1
+    B[3, 0] = b
+    B[3, 1] = a
+    # Small sanity checks.
+    if xp.linalg.norm(B.T @ B - xp.eye(M)) > 1e-10:
+        raise RuntimeError("Internal error: basis is not orthonormal.")
+    if xp.linalg.norm(B[:, 0] - v0) > 1e-10:
+        raise RuntimeError("Internal error: first basis vector does not match reference.")
+    return B
 
 class GivensMasterEquation:
     """

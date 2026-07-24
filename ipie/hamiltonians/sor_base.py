@@ -3,11 +3,12 @@ from ipie.utils.backend import arraylib as xp
 
 class SumOfRotationBase:
 
-    def __init__(self,apply_spin_down=True,thresh=1e-6):
+    def __init__(self,scale=1.,apply_spin_down=True,thresh=1e-6):
         self.chol_basis = []
         self.chol_bands = []
         self.chol_ix = dict()
         self.term_dict = dict() 
+        self.scale = scale
         self.apply_spin_down = apply_spin_down
         self.thresh = thresh
         self.chol = None
@@ -71,6 +72,7 @@ class SumOfRotationBase:
                 at = xp.fabs(ek)/dt
                 at[at<1.] = 1.
             print('at=',at)
+        ek = ek * self.scale
 
         for k in range(ek.size):
             self.add_term(at[k],chol_ix,[k],[-ek[k]/at[k]],[0])
@@ -220,6 +222,7 @@ class HubbardSOR(SumOfRotationBase):
     def __init__(self,U,**kwargs):
         super().__init__(**kwargs)
         self.hubbard_U = U
+        assert xp.fabs(self.scale-1.)<1e-10
 
     def decompose_h1(self,h1e,at=None,dt=None,iprint=0):
         self.h1e = xp.asarray(h1e)
@@ -282,9 +285,12 @@ class QCSOR(SumOfRotationBase):
 
         self._decompose_h1(ek,at=at,dt=dt,iprint=iprint)
 
-    def decompose_h2(self,chol,coeff=None,di=None,iprint=0):
+    def decompose_h2(self,chol,ai=1.,iprint=0):
         self.chol_ix['chol'] = []
         self.chol = xp.asarray(chol)
+        if iprint>0:
+            aisq = ai**2/2.
+            print('ai=',ai,aisq)
         for i,L in enumerate(self.chol):
             ek,vk = xp.linalg.eigh(L) 
             self.chol_basis.append(vk)
@@ -295,39 +301,30 @@ class QCSOR(SumOfRotationBase):
             if iprint>0:
                 print('nchol idx=',chol_ix)
                 print('bands=',ek)
-                if coeff is None:
-                    ai = xp.fabs(ek)/di
-                    ai[ai<1.] = 1.
-                else:
-                    ai = coeff[i]
-                print('ai=',ai)
+            ek = ek * np.sqrt(self.scale)
 
             for p in range(self.nbasis):
-                ap = ai[p]
-                dp = ek[p]/ap
-                apsq = ap**2/2.
+                dp = ek[p]/ai
                 if self.apply_spin_down:
-                    self.add_term(apsq,chol_ix,[p,p],[-dp,dp],[0,1])
-                    self.add_term(apsq,chol_ix,[p,p],[dp,-dp],[0,1])
+                    self.add_term(aisq,chol_ix,[p,p],[-dp,dp],[0,1])
+                    self.add_term(aisq,chol_ix,[p,p],[dp,-dp],[0,1])
                 for q in range(p+1,self.nbasis):
-                    aq = ai[q]
-                    dq = ek[q]/aq
-                    apq = ap*aq/2.
-                    self.add_term(apq,chol_ix,[p,q],[-dp,dq],[0,0])
-                    self.add_term(apq,chol_ix,[p,q],[dp,-dq],[0,0])
+                    dq = ek[q]/ai
+                    self.add_term(aisq,chol_ix,[p,q],[-dp,dq],[0,0])
+                    self.add_term(aisq,chol_ix,[p,q],[dp,-dq],[0,0])
                     if self.apply_spin_down: 
-                        self.add_term(apq,chol_ix,[p,q],[-dp,dq],[1,1])
-                        self.add_term(apq,chol_ix,[p,q],[dp,-dq],[1,1])
-                        self.add_term(apq,chol_ix,[p,q],[-dp,dq],[0,1])
-                        self.add_term(apq,chol_ix,[p,q],[dp,-dq],[0,1])
-                        self.add_term(apq,chol_ix,[q,p],[dq,-dp],[0,1])
-                        self.add_term(apq,chol_ix,[q,p],[-dq,dp],[0,1])
+                        self.add_term(aisq,chol_ix,[p,q],[-dp,dq],[1,1])
+                        self.add_term(aisq,chol_ix,[p,q],[dp,-dq],[1,1])
+                        self.add_term(aisq,chol_ix,[p,q],[-dp,dq],[0,1])
+                        self.add_term(aisq,chol_ix,[p,q],[dp,-dq],[0,1])
+                        self.add_term(aisq,chol_ix,[q,p],[dq,-dp],[0,1])
+                        self.add_term(aisq,chol_ix,[q,p],[-dq,dp],[0,1])
 
     def local_energy(self,walkers,trial):
         if walkers.fast_eloc:
             Lambda1,Lambda2,Lambda = self.Lambda
-            E1 = Lambda1 - walkers.E1*Lambda
-            E2 = Lambda2 - walkers.E2*Lambda
+            E1 = (Lambda1 - walkers.E1*Lambda)/self.scale
+            E2 = (Lambda2 - walkers.E2*Lambda)/self.scale
             return E1+E2,E1,E2
 
         if 'UDU' in walkers.buff_names:
