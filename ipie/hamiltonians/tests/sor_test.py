@@ -8,6 +8,7 @@ from ipie.hamiltonians.bitstring_utils import (
         apply_a_dag_dense_sign,
         get_config_from_occ,
 )
+np.set_printoptions(suppress=True,precision=6,linewidth=100000)
 
 def get_MB_kappa(ham,ix,basis,basis_map):
     chol_ix,spin,ps,ds = ham.get_term(ix)
@@ -176,6 +177,8 @@ def test_hamiltonian(ham,nsite,nelecs,h1e,eri=None):
        H,basis,basis_map = chol2MB(h1e,eri=eri,symmetry='u11',nelecs=nelecs)
     G1 = np.eye(len(basis))-H/ham.Lambda[-1]
     G2 = get_MB_gf(ham,basis,basis_map)
+    #print(G1)
+    #print(G2)
     test_norm(G1,G2)
     print('G tested.')
 
@@ -201,18 +204,19 @@ if __name__=='__main__':
     from ipie.utils.linalg import modified_cholesky
 
     nsite = 5 
-    nelecs = 2,1
+    nelecs = 2,0
+    method = 2 
     h1e = np.random.rand(nsite,nsite)*2-1
     h1e += h1e.T
     
     print('\ncheck GF decomposition for Hubbard...')
     U = 4 
-    ham = HubbardSOR(U) 
-    at = 5 
+    ham = HubbardSOR(nsite) 
+    at = 10. 
     iprint = 1
-    gu = 0.5 
-    ham.decompose_h1(h1e,at=at,iprint=iprint)
-    ham.decompose_h2(gu,iprint=iprint)
+    gu = 0.2 
+    ham.decompose_h2(U,gu,iprint=iprint)
+    ham.decompose_h1(h1e,at,iprint=iprint)
     ham.parse_decomposition()
     test_hamiltonian(ham,nsite,nelecs,h1e)
 
@@ -230,9 +234,12 @@ if __name__=='__main__':
     #chol = np.zeros_like(chol)
     #eri = np.zeros_like(eri)
     
-    ham = QCSOR(apply_spin_down=(nelecs[1]>0)) 
+    ham = QCSOR(nsite) 
+    if method==1:
+        ham.decompose_h2_method_1(chol,ai=2.,iprint=iprint,apply_spin_down=(nelecs[1]>0))
+    else:
+        ham.decompose_h2_method_2(chol,gu,iprint=iprint)
     ham.decompose_h1(h1e,at,iprint=iprint)
-    ham.decompose_h2(chol,ai=2.,iprint=iprint)
     ham.parse_decomposition()
     test_hamiltonian(ham,nsite,nelecs,h1e,eri=eri)
     print('greens function tested')
