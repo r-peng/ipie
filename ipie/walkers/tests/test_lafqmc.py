@@ -145,12 +145,12 @@ if __name__=='__main__':
     iprint = 1
 
     U = 4 
+    gu = 0.2
     if nelecs[1]>0:
-        hams[0] = HubbardSOR(U) 
+        hams[0] = HubbardSOR(nsite) 
         at = 10 
-        gu = 0.5 
+        hams[0].decompose_h2(U,gu,iprint=iprint)
         hams[0].decompose_h1(h1e,at,iprint=iprint)
-        hams[0].decompose_h2(gu,iprint=iprint)
         hams[0].parse_decomposition()
         eri = np.zeros((nsite,)*4)
         for i in range(nsite):
@@ -170,9 +170,9 @@ if __name__=='__main__':
     chol = modified_cholesky(M,cmax=cmax) 
     chol = chol.reshape(chol.shape[0],nsite,nsite)
     at = 20. 
-    hams[1] = QCSOR(apply_spin_down=(nelecs[1]>0)) 
+    hams[1] = QCSOR(nsite) 
+    hams[1].decompose_h2_method_2(chol,gu,iprint=iprint)
     hams[1].decompose_h1(h1e,at,iprint=iprint)
-    hams[1].decompose_h2(chol,ai=5,iprint=iprint)
     hams[1].parse_decomposition()
     chol = chol.reshape(nchol,nsite**2)
     generic_real_chols[1] = GenericRealChol(np.array([h1e,h1e]),chol.T,0)

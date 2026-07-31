@@ -253,6 +253,7 @@ class HubbardSOR(SumOfRotationBase):
             return E1+E2,E1,E2
 
         if 'UDU' in walkers.buff_names:
+            print('called')
             D = walkers.get_UDU()
 
             ix = self.chol_ix['h1'][0]
@@ -381,6 +382,7 @@ class QCSOR(SumOfRotationBase):
             return E1+E2,E1,E2
 
         if 'UDU' in walkers.buff_names:
+            print('called')
             D = walkers.get_UDU()
 
             ix = self.chol_ix['h1'][0]
