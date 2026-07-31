@@ -150,7 +150,7 @@ class UHFWalkers(BaseWalkers):
         self.buff_names += ['phi','weight','phase','E1','E2']
 
         self.buff_size = round(self.set_buff_size_single_walker() / float(self.nwalkers))
-        self.walker_buffer = xp.zeros(self.buff_size)
+        self.walker_buffer = np.zeros(self.buff_size, dtype=np.complex128)
 
     def get_SCU(self,chol_ix=None):
         nb = self.nbasis

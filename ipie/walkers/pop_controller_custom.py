@@ -15,7 +15,7 @@ from ipie.walkers.pop_controller import PopController as PopController_
 class PopController(PopController_):
     def pop_control(self,walkers,comm):
         if self.method!='stochastic_reconfiguration':
-            raise NotImplementedError
+            #raise NotImplementedError
             super().pop_control(walkers,comm)
             self.pop_control_counter += 1
             return None

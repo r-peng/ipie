@@ -37,7 +37,8 @@ from ipie.utils.backend import to_host
 from ipie.utils.backend import synchronize
 from ipie.utils.mpi import MPIHandler
 from ipie.walkers.base_walkers import WalkerAccumulator
-from ipie.walkers.pop_controller_custom import PopController
+#from ipie.walkers.pop_controller_custom import PopController
+from ipie.walkers.pop_controller import PopController
 from ipie.qmc.afqmc import AFQMCBase
    
 class LAFQMC(AFQMCBase):
@@ -78,7 +79,7 @@ class LAFQMC(AFQMCBase):
         num_blocks: int = 100,
         stabilize_freq=5,
         eq_stabilize_freq=2,
-        pop_control_method="stochastic_reconfiguration",
+        pop_control_method="pair_branch",
         pop_control_freq=5,
         eq_pop_control_freq=2,
         eq_num_steps_per_block=None,
@@ -433,14 +434,15 @@ class LAFQMC(AFQMCBase):
             b,ixs = self.propagate_walkers_bare()
         synchronize()
 
-        bminus = xp.nonzero(b<0.)[0] 
-        nminus = bminus.size
-        if nminus>0: 
-            ixs = to_host(ixs)
-            ixs = [ixs[i] for i in bminus]
-            for ix in ixs:
-                chol_ix,spin,p,d = self.hamiltonian.get_term(ix)
-                print(f'chol_ix={chol_ix},spin={spin},p={p},d={d}')
+        #bminus = xp.nonzero(b<0.)[0] 
+        #nminus = bminus.size
+        #if nminus>0: 
+        #    print('nminus=',nminus)
+        #    ixs = to_host(ixs)
+        #    ixs = [ixs[i] for i in bminus]
+        #    for ix in ixs:
+        #        chol_ix,spin,p,d = self.hamiltonian.get_term(ix)
+        #        print(f'chol_ix={chol_ix},spin={spin},p={p},d={d}')
 
         if constraint_path:
             xp.clip(b, a_min=0.0, a_max=None, out=b)  
@@ -469,9 +471,24 @@ class LAFQMC(AFQMCBase):
 
         ovlp = self.walkers.compute_ovlp_ratio(self.hamiltonian)
         g = ovlp * self.hamiltonian.a[:,None]
+
+        gp = g.copy()
+        gp = xp.clip(gp,a_min=0.,a_max=None,out=gp)
+        bp = gp.sum(axis=0)
+        gm = g.copy()
+        gm = xp.clip(gm,a_min=None,a_max=0.,out=gm)
+        bm = -gm.sum(axis=0)
+        gsum = g.sum(axis=0)
+        assert xp.linalg.norm(bp-bm-gsum)<1e-10
+
+        ixs = xp.nonzero(bm)[0]
+        if ixs.size>0:
+            print('bm,bp=',bm[ixs],bp[ixs])
+
         p = xp.fabs(g)
         sign = g/p
         b = p.sum(axis=0)
+        assert xp.linalg.norm(bp+bm-b)<1e-10
         p = p/b[None,:] 
 
         ixs = xp.asarray([xp.random.choice(nterms,size=1,p=p[:,i])[0] for i in range(nw)])

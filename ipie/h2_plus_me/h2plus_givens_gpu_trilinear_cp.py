@@ -169,6 +169,7 @@ class GivensMasterEquation:
         self.gtrial = None
         self.ham = None
         self.last_cp_stats = None
+        self.last_initial_info = None
 
         # Extended-grid boundary lookup, built after the interior grid exists.
         self._build_extended_boundary_map()
@@ -554,31 +555,201 @@ class GivensMasterEquation:
             corner_batch=corner_batch
         )
 
-    def get_initial_state(self):
-        """Return the trial determinant on the grid.
+#    def get_initial_state(self):
+#        """Return the trial determinant on the grid.
+#
+#        For odd Ng this is exactly one central grid node.  For even Ng, the
+#        trial is represented by trilinear weights on the eight surrounding
+#        nodes.
+#        """
+#        psi = xp.zeros(self.Nh, dtype=self.mos_local.dtype)
+#        q = (xp.zeros(3, dtype=self.mos_local.dtype) - self.theta0) / self.dtheta
+#        lo = xp.floor(q).astype(xp.int64)
+#        frac = q - lo
+#
+#        for bits in itertools.product((0, 1), repeat=3):
+#            b0, b1, b2 = bits
+#            p1, p2, p3 = lo[0] + b0, lo[1] + b1, lo[2] + b2
+#            w = (
+#                (frac[0] if b0 else 1.0 - frac[0])
+#                * (frac[1] if b1 else 1.0 - frac[1])
+#                * (frac[2] if b2 else 1.0 - frac[2])
+#            )
+#            dest, bc_sign = self._lookup_boundary(p1, p2, p3)
+#            val = w * bc_sign
+#            if self.importance:
+#                val *= self.trial_mos[dest]
+#            psi[dest] += val
+#        return psi
 
-        For odd Ng this is exactly one central grid node.  For even Ng, the
-        trial is represented by trilinear weights on the eight surrounding
-        nodes.
+    def get_initial_state(
+        self,
+        initial=None,
+        coefficient: float = 1.0,
+        deposition: str = "auto",
+    ):
+        """Represent an arbitrary one-electron Slater determinant on the grid.
+
+        Parameters
+        ----------
+        initial
+            Length-4 real orbital vector in the original basis.  ``None`` uses
+            the trial orbital, preserving the behavior of the previous code.
+            The vector need not be normalized; its norm is retained in the
+            represented state.
+        coefficient
+            Overall coefficient multiplying the initial determinant.  For a
+            constrained-path run this must be positive.
+        deposition
+            ``"wavefunction"`` interpolates the determinant itself and is the
+            recommended initialization for energies/reconstructed states.
+            ``"walker"`` distributes the exact initial importance weight and
+            is available only for constrained-path importance-sampled runs.
+            ``"auto"`` uses ``self.cp_deposition`` for constrained path and
+            ``"wavefunction"`` for free projection.
+
+        Notes
+        -----
+        In a constrained-path calculation, the initial determinant must have
+        nonzero overlap with the trial.  If that overlap is negative, the
+        determinant is multiplied by -1 before gridding.  This changes only
+        the physically irrelevant global phase of a single initial state and
+        places the walker in the positive-overlap sector required by CP.
         """
+        if self.B is None or self.mos is None:
+            raise RuntimeError("Call build() before get_initial_state().")
+
+        if initial is None:
+            initial_vec = self.trial.copy()
+        else:
+            initial_vec = xp.asarray(initial, dtype=self.mos_local.dtype).copy()
+
+        if initial_vec.ndim != 1 or int(initial_vec.size) != self.M:
+            raise ValueError(
+                f"initial must be a length-{self.M} orbital vector; "
+                f"received shape {initial_vec.shape}."
+            )
+
+        coeff = xp.asarray(coefficient, dtype=self.mos_local.dtype)
+        coeff_host = float(to_host(coeff))
+        if not np.isfinite(coeff_host):
+            raise ValueError("coefficient must be finite.")
+        if self.constraint_path and coeff_host <= 0.0:
+            raise ValueError(
+                "A constrained-path initial walker must have a positive coefficient."
+            )
+
+        deposition = str(deposition).lower()
+        if deposition == "auto":
+            deposition = self.cp_deposition if self.constraint_path else "wavefunction"
+        if deposition not in {"wavefunction", "walker"}:
+            raise ValueError("deposition must be 'auto', 'wavefunction', or 'walker'.")
+        if deposition == "walker" and not (self.constraint_path and self.importance):
+            raise ValueError(
+                "deposition='walker' requires constraint_path=True and importance=True."
+            )
+
+        initial_norm = xp.linalg.norm(initial_vec)
+        initial_norm_host = float(to_host(initial_norm))
+        if initial_norm_host < self.nodal_tol:
+            raise ValueError("Initial determinant has near-zero norm.")
+
+        raw_overlap = xp.dot(self.trial, initial_vec)
+        raw_overlap_host = float(to_host(raw_overlap))
+        phase_flipped = False
+
+        if self.constraint_path:
+            # The CP importance ratio is undefined at the trial node.
+            overlap_scale = max(initial_norm_host, 1.0)
+            if abs(raw_overlap_host) <= self.cp_tol * overlap_scale:
+                raise ValueError(
+                    "The initial determinant is orthogonal (within cp_tol) to the "
+                    "trial state and cannot initialize a constrained-path walk."
+                )
+            if raw_overlap_host < 0.0:
+                initial_vec *= -1.0
+                raw_overlap *= -1.0
+                raw_overlap_host *= -1.0
+                phase_flipped = True
+
+        # Exact continuum target: initial_vec = signed_norm * phi(theta).
+        theta_batch, signed_norm_batch = self._vectors_to_principal(
+            initial_vec[None, :]
+        )
+        theta = theta_batch[0]
+        signed_norm = signed_norm_batch[0]
+        lo, frac = self._target_cell(theta[None, :])
+        lo = lo[0]
+        frac = frac[0]
+
         psi = xp.zeros(self.Nh, dtype=self.mos_local.dtype)
-        q = (xp.zeros(3, dtype=self.mos_local.dtype) - self.theta0) / self.dtheta
-        lo = xp.floor(q).astype(xp.int64)
-        frac = q - lo
+        retained_weight = xp.asarray(0.0, dtype=self.mos_local.dtype)
+
+        if deposition == "wavefunction":
+            # Bare coefficient multiplying the canonical determinant.
+            base = coeff * signed_norm
+        else:
+            # Exact importance-sampled weight of the single initial walker.
+            base = coeff * raw_overlap
 
         for bits in itertools.product((0, 1), repeat=3):
             b0, b1, b2 = bits
-            p1, p2, p3 = lo[0] + b0, lo[1] + b1, lo[2] + b2
-            w = (
+            p1 = lo[0] + b0
+            p2 = lo[1] + b1
+            p3 = lo[2] + b2
+            interp = (
                 (frac[0] if b0 else 1.0 - frac[0])
                 * (frac[1] if b1 else 1.0 - frac[1])
                 * (frac[2] if b2 else 1.0 - frac[2])
             )
-            dest, bc_sign = self._lookup_boundary(p1, p2, p3)
-            val = w * bc_sign
-            if self.importance:
+
+            if self.constraint_path and self.cp_boundary == "absorbing":
+                valid = (
+                    (p1 >= 0) & (p1 < self.Ng)
+                    & (p2 >= 0) & (p2 < self.Ng)
+                    & (p3 >= 0) & (p3 < self.Ng)
+                )
+                if not bool(to_host(valid)):
+                    continue
+                dest = self.flatten_idx(p1, p2, p3)
+                val = base * interp
+            else:
+                dest, bc_sign = self._lookup_boundary(p1, p2, p3)
+                val = base * interp
+                if deposition == "wavefunction":
+                    val *= bc_sign
+
+            if deposition == "wavefunction" and self.importance:
                 val *= self.trial_mos[dest]
+
             psi[dest] += val
+            retained_weight += interp
+
+        retained_weight_host = float(to_host(retained_weight))
+        self.last_initial_info = {
+            "raw_overlap_before_orientation": (
+                -raw_overlap_host if phase_flipped else raw_overlap_host
+            ),
+            "oriented_overlap": raw_overlap_host,
+            "phase_flipped_for_cp": phase_flipped,
+            "initial_norm": initial_norm_host,
+            "coefficient": coeff_host,
+            "deposition": deposition,
+            "retained_interpolation_weight": retained_weight_host,
+            "theta": to_host(theta).copy(),
+        }
+
+        if (
+            self.constraint_path
+            and self.cp_boundary == "absorbing"
+            and retained_weight_host < 1.0 - 1.0e-12
+        ):
+            print(
+                "WARNING: the initial determinant lies within one grid cell of "
+                "the CP nodal boundary; the absorbing interpolation retained "
+                f"{retained_weight_host:.12f} of its stencil weight."
+            )
+
         return psi
 
     def energy(self, weight):

@@ -3,12 +3,11 @@ from ipie.utils.backend import arraylib as xp
 
 class SumOfRotationBase:
 
-    def __init__(self,scale=1.,apply_spin_down=True,thresh=1e-6):
+    def __init__(self,apply_spin_down=True,thresh=1e-6):
         self.chol_basis = []
         self.chol_bands = []
         self.chol_ix = dict()
         self.term_dict = dict() 
-        self.scale = scale
         self.apply_spin_down = apply_spin_down
         self.thresh = thresh
         self.chol = None
@@ -61,23 +60,19 @@ class SumOfRotationBase:
                 self.term_dict[key] = []
             self.term_dict[key].append(term)
 
-    def _decompose_h1(self,ek,at=None,dt=None,iprint=0):
+    def _decompose_h1(self,ek,at,iprint=0):
         self.nbasis = ek.size
         chol_ix = len(self.chol_basis)-1
         self.chol_ix['h1'] = [chol_ix]
 
         if iprint>0:
             print('bands=',ek)
-            if at is None:
-                at = xp.fabs(ek)/dt
-                at[at<1.] = 1.
             print('at=',at)
-        ek = ek * self.scale
 
         for k in range(ek.size):
-            self.add_term(at[k],chol_ix,[k],[-ek[k]/at[k]],[0])
+            self.add_term(at,chol_ix,[k],[-ek[k]/at],[0])
             if self.apply_spin_down:
-                self.add_term(at[k],chol_ix,[k],[-ek[k]/at[k]],[1])
+                self.add_term(at,chol_ix,[k],[-ek[k]/at],[1])
         return ek
 
     def parse_decomposition(self,iprint=0):
@@ -222,14 +217,13 @@ class HubbardSOR(SumOfRotationBase):
     def __init__(self,U,**kwargs):
         super().__init__(**kwargs)
         self.hubbard_U = U
-        assert xp.fabs(self.scale-1.)<1e-10
 
-    def decompose_h1(self,h1e,at=None,dt=None,iprint=0):
+    def decompose_h1(self,h1e,at,iprint=0):
         self.h1e = xp.asarray(h1e)
         ek,vk = xp.linalg.eigh(self.h1e) 
         self.chol_basis.append(vk)
         self.chol_bands.append(ek)
-        return self._decompose_h1(ek+0.5*self.hubbard_U,at=at,dt=dt,iprint=iprint)
+        return self._decompose_h1(ek+0.5*self.hubbard_U,at,iprint=iprint)
 
     def decompose_h2(self,gu,iprint=0,nelec=None):
         self.chol_basis.append(xp.eye(self.nbasis))
@@ -277,19 +271,19 @@ class HubbardSOR(SumOfRotationBase):
 
 class QCSOR(SumOfRotationBase):
 
-    def decompose_h1(self,h1e,at=None,dt=None,iprint=0):
+    def decompose_h1(self,h1e,at,iprint=0):
         self.h1e = xp.asarray(h1e)
         ek,vk = xp.linalg.eigh(self.h1e) 
         self.chol_basis.append(vk)
         self.chol_bands.append(ek)
 
-        self._decompose_h1(ek,at=at,dt=dt,iprint=iprint)
+        self._decompose_h1(ek,at,iprint=iprint)
 
-    def decompose_h2(self,chol,ai=1.,iprint=0):
+    def decompose_h2(self,chol,ai,iprint=0):
         self.chol_ix['chol'] = []
         self.chol = xp.asarray(chol)
+        aisq = ai**2/2.
         if iprint>0:
-            aisq = ai**2/2.
             print('ai=',ai,aisq)
         for i,L in enumerate(self.chol):
             ek,vk = xp.linalg.eigh(L) 
@@ -301,7 +295,6 @@ class QCSOR(SumOfRotationBase):
             if iprint>0:
                 print('nchol idx=',chol_ix)
                 print('bands=',ek)
-            ek = ek * np.sqrt(self.scale)
 
             for p in range(self.nbasis):
                 dp = ek[p]/ai
@@ -323,8 +316,8 @@ class QCSOR(SumOfRotationBase):
     def local_energy(self,walkers,trial):
         if walkers.fast_eloc:
             Lambda1,Lambda2,Lambda = self.Lambda
-            E1 = (Lambda1 - walkers.E1*Lambda)/self.scale
-            E2 = (Lambda2 - walkers.E2*Lambda)/self.scale
+            E1 = Lambda1 - walkers.E1*Lambda
+            E2 = Lambda2 - walkers.E2*Lambda
             return E1+E2,E1,E2
 
         if 'UDU' in walkers.buff_names:
