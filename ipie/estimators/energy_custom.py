@@ -33,7 +33,7 @@ class EnergyEstimator(EnergyEstimator_):
 
     def compute_estimator(self, system=None, walkers=None, hamiltonian=None, trial=None):
         # Need to be able to dispatch here
-        Etot,E1,E2 = hamiltonian.local_energy(walkers,trial)
+        Etot,E1,E2 = walkers.local_energy(hamiltonian,trial)
         weight = walkers.weight.copy()
         weight /= walkers.nwalkers
 

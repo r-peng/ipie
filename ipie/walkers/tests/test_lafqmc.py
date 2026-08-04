@@ -77,7 +77,7 @@ def update_walkers_slow(ham,ixs,walkers,trial):
     denom = compute_scalar_ovlp(walkers,trial)
 
     _update_walkers_slow(ham,ixs,walkers)
-    walkers.build(ham,trial,density=importance_sample)
+    walkers.build(ham,trial,importance=importance_sample)
     num = compute_scalar_ovlp(walkers,trial)
     new_data = get_data(walkers)
 
@@ -171,7 +171,7 @@ if __name__=='__main__':
     chol = chol.reshape(chol.shape[0],nsite,nsite)
     at = 20. 
     hams[1] = QCSOR(nsite) 
-    hams[1].decompose_h2_method_2(chol,gu,iprint=iprint)
+    hams[1].decompose_h2(chol,gu,iprint=iprint)
     hams[1].decompose_h1(h1e,at,iprint=iprint)
     hams[1].parse_decomposition()
     chol = chol.reshape(nchol,nsite**2)
@@ -252,17 +252,17 @@ if __name__=='__main__':
                 afqmc.setup_estimators(None,None)
         
             trial.build(ham,conjugate=True)
-            walkers.build(ham,trial,density=False)
+            walkers.build(ham,trial,importance=False)
             if walkers_type==trial_type:
-                eloc,e1,e2 = ham.local_energy(walkers,trial)
+                eloc,e1,e2 = walkers.local_energy(ham,trial)
                 E = np.dot(eloc,walkers.weight)/sum(walkers.weight)
                 e1 = np.dot(e1,walkers.weight)/sum(walkers.weight)
                 e2 = np.dot(e2,walkers.weight)/sum(walkers.weight)
                 print('E,E1,E2=',E,e1,e2)
 
-            walkers.build(ham,trial,density=importance_sample)
+            walkers.build(ham,trial,importance=importance_sample)
             if walkers_type==trial_type:
-                eloc,e1,e2 = ham.local_energy(walkers,trial)
+                eloc,e1,e2 = walkers.local_energy(ham,trial)
                 E = np.dot(eloc,walkers.weight)/sum(walkers.weight)
                 e1 = np.dot(e1,walkers.weight)/sum(walkers.weight)
                 e2 = np.dot(e2,walkers.weight)/sum(walkers.weight)

@@ -311,7 +311,7 @@ class LAFQMC(AFQMCBase):
         start = time.time()
         iprint = 1 if comm.rank==0 else 0
         self.trial.build(self.hamiltonian,conjugate=(not importance_sample))
-        self.walkers.build(self.hamiltonian,self.trial,density=importance_sample)
+        self.walkers.build(self.hamiltonian,self.trial,importance=importance_sample)
         if comm.rank==0:
             print('preprocess time=',time.time()-start)
 

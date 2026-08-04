@@ -3,18 +3,18 @@ from ipie.utils.backend import arraylib as xp
 
 class SumOfRotationBase:
 
-    def __init__(self,nbasis,thresh=1e-6):
+    def __init__(self,nbasis,thresh=1e-6,apply_spin_down=True):
         self.nbasis = nbasis
         self.thresh = thresh
+        self.apply_spin_down = apply_spin_down
 
         self.chol_basis = []
-        self.chol_bands = []
-        self.chol_ix = dict()
+        #self.chol_bands = []
+        #self.chol_ix = dict()
         self.term_dict = dict() 
         self.chol = None
 
         self.run_2body_first = False
-        self.apply_spin_down = True
         self.v0 = 0. 
 
     def add_h1_term(self,key,new_term):
@@ -34,6 +34,10 @@ class SumOfRotationBase:
         self.term_dict[key] = term
         
     def add_term(self,a,chol_ix,p,d,s):
+        assert a>0.
+        if a<self.thresh:
+            return
+
         typ = None
         r = len(p)
         if r==1:
@@ -65,33 +69,43 @@ class SumOfRotationBase:
                 self.term_dict[key] = []
             self.term_dict[key].append(term)
 
-    def decompose_h1(self,h1e,at,iprint=0):
+    def decompose_h1(self,h1e,dt,uniform='coefficient',iprint=0):
         if not self.run_2body_first:
             raise ValueError('Run 2-body decomposition first!')
+        assert uniform in ['coefficient','rotation']
 
         self.h1e = xp.asarray(h1e)
         ek,vk = xp.linalg.eigh(self.h1e+self.v0) 
         self.chol_basis.append(vk)
-        self.chol_bands.append(ek)
+        #self.chol_bands.append(ek)
 
         chol_ix = len(self.chol_basis)-1
-        self.chol_ix['h1'] = [chol_ix]
+        #self.chol_ix['h1'] = [chol_ix]
 
         if iprint>0:
+            print('1-body decomposition: ')
             print('bands=',ek)
-            print('at=',at)
 
-        for k in range(ek.size):
-            self.add_term(at,chol_ix,[k],[-ek[k]/at],[0])
+        for p in range(ek.size):
+            if xp.fabs(ek[p])<self.thresh:
+                continue
+
+            if uniform=='coefficient':
+                ap = 1./dt
+            else:
+                ap = xp.fabs(ek[p]/dt)
+            dp = -ek[p]/ap
+
+            self.add_term(ap,chol_ix,[p],[dp],[0])
             if self.apply_spin_down:
-                self.add_term(at,chol_ix,[k],[-ek[k]/at],[1])
+                self.add_term(ap,chol_ix,[p],[dp],[1])
         return ek
 
     def parse_decomposition(self,iprint=0):
         self.chol_basis = xp.asarray(self.chol_basis)
-        self.chol_bands = xp.asarray(self.chol_bands)
-        for key in self.chol_ix:
-            self.chol_ix[key] = xp.asarray(self.chol_ix[key])
+        #self.chol_bands = xp.asarray(self.chol_bands)
+        #for key in self.chol_ix:
+        #    self.chol_ix[key] = xp.asarray(self.chol_ix[key])
         self.nchol = self.chol_basis.shape[0]
         self.chol_basis2 = {'eye':xp.eye(self.nbasis)}
         for i,Ui in enumerate(self.chol_basis):
@@ -136,7 +150,8 @@ class SumOfRotationBase:
 
                 i = len(p_dict[key])-1
                 self.ix2key.append((key,i))
-                if chol_ix==self.chol_ix['h1'][0]:
+                #if chol_ix==self.chol_ix['h1'][0]:
+                if len(d)==1:
                     E1_ixs.append(ix)
                 else:
                     E2_ixs.append(ix)
@@ -163,6 +178,7 @@ class SumOfRotationBase:
             print('Lambda=',self.Lambda)
             print('normalization=',xp.fabs(self.a).sum())
             print('number of terms=',self.nterms)
+            print('a=',self.a)
 
     def parse_samples(self,ixs):
         w_dict = dict()
@@ -226,57 +242,38 @@ class SumOfRotationBase:
 
 class HubbardSOR(SumOfRotationBase):
 
-    def decompose_h2(self,U,gu,iprint=0):
+    def decompose_h2(self,U,dt,iprint=0,param='eta'):
+        assert param in ['eta','lambda']
         self.hubbard_U = U
         self.chol_basis.append(xp.eye(self.nbasis))
-        self.chol_bands.append(xp.ones(self.nbasis))
+        #self.chol_bands.append(xp.ones(self.nbasis))
         chol_ix = len(self.chol_basis)-1
-        self.chol_ix['U'] = [chol_ix]
+        #self.chol_ix['U'] = [chol_ix]
 
-        ai = self.hubbard_U/(np.cosh(gu)-1.)/4.
-        dp = xp.exp(gu)-1.
-        dm = xp.exp(-gu)-1.
+        d = np.sqrt(dt)
+        if param=='eta':
+            ai = self.hubbard_U/(np.cosh(d)-1.)/4.
+            dp = xp.exp(d)-1.
+            dm = xp.exp(-d)-1.
+            self.v0 = np.eye(self.nbasis) * self.hubbard_U/2.
+        else:
+            dp,dm = d,-d
+            ai = self.hubbard_U/d**2/2. 
+
         if iprint>0:
-            print(f'eta={gu},ai={ai}')
+            print('Hubbard 2-body decomposition: ')
+            print('coefficient =',ai)
+            print('rotation =',d)
+
         for i in range(self.nbasis): 
             self.add_term(ai,chol_ix,[i,i],[dp,dm],[0,1])
             self.add_term(ai,chol_ix,[i,i],[dm,dp],[0,1])
-
-        self.v0 = np.eye(self.nbasis) * self.hubbard_U/2.
+       
         self.run_2body_first = True
-
-    def local_energy(self,walkers,trial):
-        if walkers.fast_eloc:
-            Lambda1,Lambda2,Lambda = self.Lambda
-            E1 = Lambda1 - walkers.E1*Lambda
-            E2 = Lambda2 - walkers.E2*Lambda
-            return E1+E2,E1,E2
-
-        if 'UDU' in walkers.buff_names:
-            print('called')
-            D = walkers.get_UDU()
-
-            ix = self.chol_ix['h1'][0]
-            E1 = xp.einsum('p,wpp->w',self.chol_bands[ix],D[0,0][:,ix])
-            E1 += xp.einsum('p,wpp->w',self.chol_bands[ix],D[1,1][:,ix])
-    
-            ix = self.chol_ix['U'][0]
-            E2 = xp.einsum('wpp,wpp->w',D[0,0][:,ix],D[1,1][:,ix])
-            if (0,1) in D:
-                E2 -= xp.einsum('wpp,wpp->w',D[0,1][:,ix],D[1,0][:,ix])
-        else:
-            SC = walkers.compute_SC(trial)
-            E1 = walkers.compute_E1(trial,SC)
-            Daa,Dbb,Dab,Dba = walkers.compute_1rdm_diag(trial,SC)
-            E2 = xp.einsum('wp,wp->w',Daa,Dbb)
-            if Dab is not None:
-                E2 -= xp.einsum('wp,wp->w',Dab,Dba)
-        E2 *= self.hubbard_U
-        return E1+E2,E1,E2
 
 class QCSOR(SumOfRotationBase):
 
-    def decompose_h2_method_1(self,chol,ai,iprint=0,apply_spin_down=True):
+    def decompose_h2_old(self,chol,ai,iprint=0):
         self.chol_ix['chol'] = []
         self.chol = xp.asarray(chol)
         aisq = ai**2/2.
@@ -285,9 +282,9 @@ class QCSOR(SumOfRotationBase):
         for i,L in enumerate(self.chol):
             ek,vk = xp.linalg.eigh(L) 
             self.chol_basis.append(vk)
-            self.chol_bands.append(ek)
+            #self.chol_bands.append(ek)
             chol_ix = len(self.chol_basis)-1
-            self.chol_ix['chol'].append(chol_ix)
+            #self.chol_ix['chol'].append(chol_ix)
 
             if iprint>0:
                 print('nchol idx=',chol_ix)
@@ -295,14 +292,14 @@ class QCSOR(SumOfRotationBase):
 
             for p in range(self.nbasis):
                 dp = ek[p]/ai
-                if apply_spin_down:
+                if self.apply_spin_down:
                     self.add_term(aisq,chol_ix,[p,p],[-dp,dp],[0,1])
                     self.add_term(aisq,chol_ix,[p,p],[dp,-dp],[0,1])
                 for q in range(p+1,self.nbasis):
                     dq = ek[q]/ai
                     self.add_term(aisq,chol_ix,[p,q],[-dp,dq],[0,0])
                     self.add_term(aisq,chol_ix,[p,q],[dp,-dq],[0,0])
-                    if apply_spin_down: 
+                    if self.apply_spin_down: 
                         self.add_term(aisq,chol_ix,[p,q],[-dp,dq],[1,1])
                         self.add_term(aisq,chol_ix,[p,q],[dp,-dq],[1,1])
                         self.add_term(aisq,chol_ix,[p,q],[-dp,dq],[0,1])
@@ -310,105 +307,91 @@ class QCSOR(SumOfRotationBase):
                         self.add_term(aisq,chol_ix,[q,p],[dq,-dp],[0,1])
                         self.add_term(aisq,chol_ix,[q,p],[-dq,dp],[0,1])
         self.run_2body_first = True
-        self.apply_spin_down = apply_spin_down
 
-    def decompose_h2_method_2(self,chol,gu,iprint=0,thresh=1e-6):
-        self.chol_ix['chol'] = []
+    def decompose_h2(self,chol,dt,iprint=0,uniform='coefficient'):
+        assert uniform in ['coefficient','rotation']
+        #self.chol_ix['chol'] = []
         self.chol = xp.asarray(chol)
-        ai = 1./(np.cosh(gu)-1.)/2.
-        dp = xp.exp(gu)-1.
-        dm = xp.exp(-gu)-1.
         if iprint>0:
-            print('ai=',ai)
+            print('2-body decomposition: ')
+
         for i,L in enumerate(self.chol):
             ek,vk = xp.linalg.eigh(L) 
             self.chol_basis.append(vk)
-            self.chol_bands.append(ek)
+            #self.chol_bands.append(ek)
             chol_ix = len(self.chol_basis)-1
-            self.chol_ix['chol'].append(chol_ix)
+            #self.chol_ix['chol'].append(chol_ix)
 
             if iprint>0:
                 print('nchol idx=',chol_ix)
                 print('bands=',ek)
 
-            for p in range(self.nbasis):
-                ep = ek[p]
-                if xp.fabs(ep)<thresh:
-                    continue
+            if self.apply_spin_down:
+                self._decompose_chol(chol_ix,ek,dt,uniform)
+            else:
+                self._decompose_chol_up_only(chol_ix,ek,dt,uniform)
 
-                epp = ep**2
-                ap = epp*ai/2.
-                self.add_term(ap,chol_ix,[p,p],[dp,dm],[0,1])
-                self.add_term(ap,chol_ix,[p,p],[dm,dp],[0,1])
-
-                for q in range(p+1,self.nbasis):
-                    eq = ek[q]
-                    if xp.fabs(eq)<thresh:
-                        continue
-
-                    epq = ep*eq
-                    dp1,dp2 = dp,dm
-                    if epq>0.:
-                        dq1,dq2 = dm,dp
-                    else:
-                        dq1,dq2 = dp,dm
-
-                    dpx,dpz = dp1,-dp1
-                    dpy,dpw = dp2,-dp2
-                    dqx,dqy = dq1,-dq1
-                    dqz,dqw = dq2,-dq2
-                    
-                    apq = -epq/dpx/dqx#/2.
-                    assert apq>0.
-                    self.add_term(apq,chol_ix,[p,q],[dpx,dqx],[0,0])
-                    apq = -epq/dpy/dqy#/2.
-                    assert apq>0.
-                    self.add_term(apq,chol_ix,[p,q],[dpy,dqy],[0,1])
-                    apq = -epq/dpz/dqz#/2.
-                    assert apq>0.
-                    self.add_term(apq,chol_ix,[q,p],[dqz,dpz],[0,1])
-                    apq = -epq/dpw/dqw#/2.
-                    assert apq>0.
-                    self.add_term(apq,chol_ix,[p,q],[dpw,dqw],[1,1])
-            v0 = ek**2/2. 
-            self.v0 += xp.dot(vk*v0[None,:],vk.T)
         self.run_2body_first = True
 
-    def local_energy(self,walkers,trial):
-        if walkers.fast_eloc:
-            Lambda1,Lambda2,Lambda = self.Lambda
-            E1 = Lambda1 - walkers.E1*Lambda
-            E2 = Lambda2 - walkers.E2*Lambda
-            return E1+E2,E1,E2
+    def _decompose_chol(self,chol_ix,ek,dt,uniform):
+        a = 1./np.sqrt(dt)
+        d = 1./a
+        for p in range(self.nbasis):
+            ep = ek[p]
+            if xp.fabs(ep)<self.thresh:
+                continue
 
-        if 'UDU' in walkers.buff_names:
-            print('called')
-            D = walkers.get_UDU()
+            if uniform=='coefficient':
+                ap = a
+            else:
+                ap = xp.fabs(ep)*a
+            dp = ep/ap
+            app = ap**2/2.
 
-            ix = self.chol_ix['h1'][0]
-            E1 = xp.einsum('p,wpp->w',self.chol_bands[ix],D[0,0][:,ix])
-            E1 += xp.einsum('p,wpp->w',self.chol_bands[ix],D[1,1][:,ix])
+            self.add_term(app,chol_ix,[p,p],[-dp,dp],[0,1])
+            self.add_term(app,chol_ix,[p,p],[dp,-dp],[0,1])
 
-            ix = self.chol_ix['chol']
-            Sigma = self.chol_bands[ix]
-            Daa,Dbb = D[0,0][:,ix],D[1,1][:,ix]
-            Daa = Sigma[None,:,:,None]*Daa
-            Dbb = Sigma[None,:,:,None]*Dbb
-            tr = xp.einsum('wdpp->wd',Daa)
-            tr += xp.einsum('wdpp->wd',Dbb)
-            E2 = (tr**2).sum(axis=1) 
+            for q in range(p+1,self.nbasis):
+                eq = ek[q]
+                if xp.fabs(eq)<self.thresh:
+                    continue
+                #print('p,q,ep,eq=',p,q,ep,eq)
 
-            E2 -= xp.einsum('wdpq,wdqp->w',Daa,Daa)
-            E2 -= xp.einsum('wdpq,wdqp->w',Dbb,Dbb)
-            if (0,1) in D: 
-                Dab,Dba = D[0,1][:,ix],D[1,0][:,ix]
-                Dab = Sigma[None,:,:,None]*Dab
-                Dba = Sigma[None,:,:,None]*Dba
-                E2 -= 2.*xp.einsum('wdpq,wdqp->w',Dab,Dba)
-            E2 *= .5
-        else:
-            SC = walkers.compute_SC(trial)
-            E1 = walkers.compute_E1(trial,SC)
-            E2 = walkers.compute_chol(trial,SC)
-        return E1+E2,E1,E2
+                if uniform=='coefficient':
+                    ap,aq = a,a
+                else:
+                    ap = xp.fabs(ep)*a
+                    aq = xp.fabs(eq)*a
+
+                dp,dq = -ep/ap,eq/aq
+                apq = ap*aq
+
+                self.add_term(apq,chol_ix,[p,q],[dp,dq],[0,0])
+                self.add_term(apq,chol_ix,[p,q],[-dp,-dq],[0,1])
+                self.add_term(apq,chol_ix,[q,p],[-dq,-dp],[0,1])
+                self.add_term(apq,chol_ix,[p,q],[dp,dq],[1,1])
+
+    def _decompose_chol_up_only(self,chol_ix,ek,dt,uniform):
+        a = 1./np.sqrt(dt)
+        d = 1./a
+        for p in range(self.nbasis):
+            ep = ek[p]
+            if xp.fabs(ep)<self.thresh:
+                continue
+            for q in range(p+1,self.nbasis):
+                eq = ek[q]
+                if xp.fabs(eq)<self.thresh:
+                    continue
+
+                if uniform=='coefficient': 
+                    ap,aq = a,a
+                else:
+                    ap = xp.fabs(ep)*a
+                    aq = xp.fabs(eq)*a
+
+                dp,dq = ep/ap,eq/aq
+                apq = ap*aq/2.
     
+                self.add_term(apq,chol_ix,[p,q],[-dp,dq],[0,0])
+                self.add_term(apq,chol_ix,[p,q],[dp,-dq],[0,0])
+

@@ -3,6 +3,7 @@ import plum,h5py
 from ipie.trial_wavefunction.lafqmc_single_det import SingleDet
 from ipie.trial_wavefunction.lafqmc_single_det_ghf import SingleDetGHF
 from ipie.walkers.base_walkers import BaseWalkers 
+from ipie.hamiltonians.sor_base import HubbardSOR,QCSOR
 from ipie.utils.backend import to_host,cast_to_device
 from ipie.utils.backend import arraylib as xp
 
@@ -138,16 +139,18 @@ class UHFWalkers(BaseWalkers):
         if set_buff:
             self.buff_names = ['SCU','UDU']
 
-    def build(self,hamiltonian,trial,density=True):
-        if density:
+    def build(self,hamiltonian,trial,importance):
+        self.importance = importance
+        self.has_E12 = False
+        if importance:
             self.compute_density(hamiltonian,trial)
+            self.E1 = xp.zeros(self.nwalkers) 
+            self.E2 = xp.zeros(self.nwalkers) 
+            self.buff_names += ['E1','E2']
         else:
             self.compute_S(trial,set_buff=True)
         self.phase = xp.ones(self.nwalkers) 
-        self.E1 = xp.zeros(self.nwalkers)
-        self.E2 = xp.zeros(self.nwalkers)
-        self.fast_eloc = False
-        self.buff_names += ['phi','weight','phase','E1','E2']
+        self.buff_names += ['phi','weight','phase']
 
         self.buff_size = round(self.set_buff_size_single_walker() / float(self.nwalkers))
         self.walker_buffer = np.zeros(self.buff_size, dtype=np.complex128)
@@ -262,11 +265,12 @@ class UHFWalkers(BaseWalkers):
 
         self.E1 = xp.dot(ham.a[ham.E1_ixs],ovlp[ham.E1_ixs])
         self.E2 = xp.dot(ham.a[ham.E2_ixs],ovlp[ham.E2_ixs])
-        self.fast_eloc = True
+        self.has_E12 = True
         return ovlp
 
     def update_walkers(self,hamiltonian,trial,b=None):
         self.itm = dict()
+        self.has_E12 = False 
         for key,ixs in hamiltonian.samples.items():
             w,i = ixs['w'],ixs['i']
             p,d,u,u2 = hamiltonian.get_batch_ud(key,i)
@@ -574,3 +578,36 @@ class UHFWalkers(BaseWalkers):
             Dba = xp.einsum('xi,wix->wx',psi[1],SC[0])
             Dab = xp.einsum('xi,wix->wx',psi[0],SC[1])
         return Daa,Dbb,Dab,Dba
+
+    def local_energy_fast(self,ham):
+        if not self.has_E12:
+            self.compute_ovlp_ratio(ham)
+        Lambda1,Lambda2,Lambda = ham.Lambda
+        E1 = Lambda1 - self.E1*Lambda
+        E2 = Lambda2 - self.E2*Lambda
+        return E1+E2,E1,E2
+
+    @plum.dispatch
+    def local_energy(self,ham:HubbardSOR,trial):
+        if self.importance:
+            return self.local_energy_fast(ham)
+
+        SC = self.compute_SC(trial)
+        E1 = self.compute_E1(trial,SC)
+        Daa,Dbb,Dab,Dba = self.compute_1rdm_diag(trial,SC)
+        E2 = xp.einsum('wp,wp->w',Daa,Dbb)
+        if Dab is not None:
+            E2 -= xp.einsum('wp,wp->w',Dab,Dba)
+        E2 *= ham.hubbard_U
+        return E1+E2,E1,E2
+
+    @plum.dispatch
+    def local_energy(self,ham:QCSOR,trial):
+        if self.importance:
+            return self.local_energy_fast(ham)
+
+        SC = self.compute_SC(trial)
+        E1 = self.compute_E1(trial,SC)
+        E2 = self.compute_chol(trial,SC)
+        return E1+E2,E1,E2
+

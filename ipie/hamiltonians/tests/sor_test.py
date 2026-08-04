@@ -156,7 +156,7 @@ def chol2MB(h1e,chol=None,eri=None,symmetry='u11',nelecs=None,basis=None,basis_m
             H += .5 * np.dot(L_,L_)
         return H,basis,basis_map
 
-def test_norm(D1,D2,thresh=1e-10):
+def test_norm(D1,D2,thresh=1e-6):
     if D1 is None:
         return
     norm = np.linalg.norm(D1)
@@ -204,21 +204,22 @@ if __name__=='__main__':
     from ipie.utils.linalg import modified_cholesky
 
     nsite = 5 
-    nelecs = 2,0
-    method = 2 
+    nelecs = 2,1
     h1e = np.random.rand(nsite,nsite)*2-1
     h1e += h1e.T
     
-    print('\ncheck GF decomposition for Hubbard...')
     U = 4 
-    ham = HubbardSOR(nsite) 
-    at = 10. 
+    dt1 = 0.1
+    dt2 = 0.05
     iprint = 1
-    gu = 0.2 
-    ham.decompose_h2(U,gu,iprint=iprint)
-    ham.decompose_h1(h1e,at,iprint=iprint)
-    ham.parse_decomposition()
-    test_hamiltonian(ham,nsite,nelecs,h1e)
+    for param in ['lambda','eta']:
+        print('\ncheck GF decomposition for Hubbard with...')
+        print('param=',param)
+        ham = HubbardSOR(nsite) 
+        ham.decompose_h2(U,dt2,iprint=iprint,param=param)
+        ham.decompose_h1(h1e,dt1,iprint=iprint)
+        ham.parse_decomposition()
+        test_hamiltonian(ham,nsite,nelecs,h1e)
 
     print('\ncheck GF decomposition for QC...')
     nchol = 3
@@ -234,13 +235,12 @@ if __name__=='__main__':
     #chol = np.zeros_like(chol)
     #eri = np.zeros_like(eri)
     
-    ham = QCSOR(nsite) 
-    if method==1:
-        ham.decompose_h2_method_1(chol,ai=2.,iprint=iprint,apply_spin_down=(nelecs[1]>0))
-    else:
-        ham.decompose_h2_method_2(chol,gu,iprint=iprint)
-    ham.decompose_h1(h1e,at,iprint=iprint)
-    ham.parse_decomposition()
-    test_hamiltonian(ham,nsite,nelecs,h1e,eri=eri)
-    print('greens function tested')
+    for uniform in ['coefficient','rotation']:
+        ham = QCSOR(nsite,apply_spin_down=(nelecs[1]>0)) 
+        ham.decompose_h2(chol,dt2,iprint=iprint,uniform=uniform)
+        ham.decompose_h1(h1e,dt1,iprint=iprint,uniform=uniform)
+        ham.parse_decomposition()
+        test_hamiltonian(ham,nsite,nelecs,h1e,eri=eri)
+        
+    print('all greens function tested')
 
