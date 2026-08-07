@@ -95,6 +95,7 @@ class SumOfRotationBase:
             else:
                 ap = xp.fabs(ek[p]/dt)
             dp = -ek[p]/ap
+            assert xp.fabs(dp)<1.
 
             self.add_term(ap,chol_ix,[p],[dp],[0])
             if self.apply_spin_down:
@@ -178,7 +179,7 @@ class SumOfRotationBase:
             print('Lambda=',self.Lambda)
             print('normalization=',xp.fabs(self.a).sum())
             print('number of terms=',self.nterms)
-            print('a=',self.a)
+            #print('a=',self.a)
 
     def parse_samples(self,ixs):
         w_dict = dict()
@@ -259,6 +260,8 @@ class HubbardSOR(SumOfRotationBase):
         else:
             dp,dm = d,-d
             ai = self.hubbard_U/d**2/2. 
+        assert xp.fabs(dp)<1.
+        assert xp.fabs(dm)<1.
 
         if iprint>0:
             print('Hubbard 2-body decomposition: ')
@@ -364,6 +367,8 @@ class QCSOR(SumOfRotationBase):
                     aq = xp.fabs(eq)*a
 
                 dp,dq = -ep/ap,eq/aq
+                assert xp.fabs(dp)<1.
+                assert xp.fabs(dq)<1.
                 apq = ap*aq
 
                 self.add_term(apq,chol_ix,[p,q],[dp,dq],[0,0])
@@ -390,6 +395,8 @@ class QCSOR(SumOfRotationBase):
                     aq = xp.fabs(eq)*a
 
                 dp,dq = ep/ap,eq/aq
+                assert xp.fabs(dp)<1.
+                assert xp.fabs(dq)<1.
                 apq = ap*aq/2.
     
                 self.add_term(apq,chol_ix,[p,q],[-dp,dq],[0,0])

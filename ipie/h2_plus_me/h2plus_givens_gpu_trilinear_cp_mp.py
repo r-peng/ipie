@@ -43,6 +43,7 @@ import time
 from typing import Optional, Tuple
 
 import numpy as np
+from ipie.utils.mpi import MPIHandler
 
 try:
     from ipie.utils.backend import arraylib as xp
@@ -53,6 +54,22 @@ except ImportError:  # CPU fallback for testing outside an ipie environment.
     def to_host(x):
         return np.asarray(x)
 
+class ParallelHolder:
+    def __init__(self,batches):
+        self.batches = batches
+
+        self.psi = None
+        self.cp_total = None
+        self.cp_rejected = None
+        self.cp_total_flux = None
+        self.cp_rejected_flux = None
+
+    def reset(self,psi):
+        self.psi = xp.zeros_like(psi)
+        self.cp_total = 0
+        self.cp_rejected = xp.asarray(0, dtype=xp.int64)
+        self.cp_total_flux = xp.asarray(0.0, dtype=psi.dtype)
+        self.cp_rejected_flux = xp.asarray(0.0, dtype=psi.dtype)
 
 def h2plus_symmetry_basis(trial, thresh: float = 1.0e-12):
     """Return the requested trial/symmetry-adapted orthogonal basis.
@@ -379,8 +396,6 @@ class GivensMasterEquation:
     def mat_vec(
         self,
         psi,
-        term_chunk: int = 8,
-        source_chunk: int = 65536,
         corner_batch: int = 4,
         synchronize: bool = False,
     ):
@@ -403,133 +418,26 @@ class GivensMasterEquation:
         psi = xp.asarray(psi)
         if psi.size != self.Nh:
             raise ValueError(f"psi has size {psi.size}, expected {self.Nh}.")
-        if term_chunk < 1:
-            raise ValueError("term_chunk must be at least 1.")
-        if source_chunk < 1:
-            raise ValueError("source_chunk must be at least 1.")
         if corner_batch < 1 or corner_batch > 8:
             raise ValueError("corner_batch must be between 1 and 8.")
 
-        out = xp.zeros(self.Nh, dtype=psi.dtype)
-        nterms = int(self.ham.nterms)
-        corners = tuple(itertools.product((0, 1), repeat=3))
+        self.ph.reset(psi)
+        self.mat_vec_batched(psi,corner_batch)
+
+        out_local = to_host(self.ph.psi)
+        out = np.zeros_like(out_local)
+        self.comm.Reduce(out_local,out)
 
         if self.constraint_path:
-            cp_total = 0
-            cp_rejected = xp.asarray(0, dtype=xp.int64)
-            cp_total_flux = xp.asarray(0.0, dtype=psi.dtype)
-            cp_rejected_flux = xp.asarray(0.0, dtype=psi.dtype)
+            total_flux = float(to_host(self.ph.cp_total_flux))
+            rejected_flux = float(to_host(self.ph.cp_rejected_flux))
+            rejected = int(to_host(self.ph.cp_rejected))
 
-        for a0 in range(0, nterms, term_chunk):
-            a1 = min(a0 + term_chunk, nterms)
-            Us = self.Us[a0:a1]
-            coeff = xp.asarray(self.ham.a[a0:a1], dtype=psi.dtype)
+            cp_total = self.comm.reduce(self.ph.cp_total) 
+            rejected = self.comm.reduce(rejected)
+            total_flux = self.comm.reduce(total_flux)
+            rejected_flux = self.comm.reduce(rejected_flux)
 
-            for s0 in range(0, self.Nh, source_chunk):
-                s1 = min(s0 + source_chunk, self.Nh)
-                src_mos = self.mos[s0:s1]
-                src_psi = psi[s0:s1]
-                old_overlap = self.trial_mos[None, s0:s1]
-
-                # Exact unnormalized targets, shape (nterm,nsource,4).
-                targets = xp.einsum("apq,sq->asp", Us, src_mos, optimize=True)
-                theta, signed_norm = self._vectors_to_principal(targets)
-                lo, frac = self._target_cell(theta)
-
-                if self.constraint_path:
-                    raw_new_overlap = xp.einsum(
-                        "p,asp->as", self.trial, targets, optimize=True
-                    )
-                    gbar = coeff[:, None] * raw_new_overlap / old_overlap
-                    allowed = gbar > self.cp_tol
-
-                    branch_flux = xp.abs(gbar * src_psi[None, :])
-                    cp_total += int(allowed.size)
-                    cp_rejected += xp.count_nonzero(~allowed)
-                    cp_total_flux += xp.sum(branch_flux)
-                    cp_rejected_flux += xp.sum(
-                        xp.where(allowed, xp.zeros((), dtype=psi.dtype), branch_flux)
-                    )
-
-                    if self.cp_deposition == "walker":
-                        base = xp.where(
-                            allowed,
-                            gbar * src_psi[None, :],
-                            xp.zeros((), dtype=psi.dtype),
-                        )
-                        multiply_destination_overlap = False
-                    else:
-                        base = coeff[:, None] * signed_norm * src_psi[None, :]
-                        base = base / old_overlap
-                        base = xp.where(
-                            allowed, base, xp.zeros((), dtype=psi.dtype)
-                        )
-                        multiply_destination_overlap = True
-                else:
-                    base = coeff[:, None] * signed_norm * src_psi[None, :]
-                    if self.importance:
-                        base = base / old_overlap
-                    multiply_destination_overlap = self.importance
-
-                dest_batch = []
-                vals_batch = []
-                for icorner, bits in enumerate(corners):
-                    b0, b1, b2 = bits
-                    p1 = lo[..., 0] + b0
-                    p2 = lo[..., 1] + b1
-                    p3 = lo[..., 2] + b2
-
-                    w1 = frac[..., 0] if b0 else (1.0 - frac[..., 0])
-                    w2 = frac[..., 1] if b1 else (1.0 - frac[..., 1])
-                    w3 = frac[..., 2] if b2 else (1.0 - frac[..., 2])
-                    interp = w1 * w2 * w3
-
-                    if self.constraint_path and self.cp_boundary == "absorbing":
-                        valid = (
-                            (p1 >= 0) & (p1 < self.Ng)
-                            & (p2 >= 0) & (p2 < self.Ng)
-                            & (p3 >= 0) & (p3 < self.Ng)
-                        )
-                        p1_safe = xp.clip(p1, 0, self.Ng - 1)
-                        p2_safe = xp.clip(p2, 0, self.Ng - 1)
-                        p3_safe = xp.clip(p3, 0, self.Ng - 1)
-                        dest = self.flatten_idx(p1_safe, p2_safe, p3_safe)
-                        vals = base * interp
-                        if multiply_destination_overlap:
-                            vals = vals * self.trial_mos[dest]
-                        vals = xp.where(
-                            valid, vals, xp.zeros((), dtype=psi.dtype)
-                        )
-                    else:
-                        dest, bc_sign = self._lookup_boundary(p1, p2, p3)
-                        vals = base * interp * bc_sign
-                        if multiply_destination_overlap:
-                            vals = vals * self.trial_mos[dest]
-
-                    dest_batch.append(dest.ravel())
-                    vals_batch.append(vals.ravel())
-                    flush = (
-                        len(dest_batch) == corner_batch
-                        or icorner == len(corners) - 1
-                    )
-                    if flush:
-                        dest_all = xp.concatenate(dest_batch)
-                        vals_all = xp.concatenate(vals_batch)
-                        out += xp.bincount(
-                            dest_all, weights=vals_all, minlength=self.Nh
-                        )
-                        dest_batch.clear()
-                        vals_batch.clear()
-                        del dest_all, vals_all
-
-                del targets, theta, signed_norm, lo, frac, base
-                if self.constraint_path:
-                    del raw_new_overlap, gbar, allowed, branch_flux
-
-        if self.constraint_path:
-            total_flux = float(to_host(cp_total_flux))
-            rejected_flux = float(to_host(cp_rejected_flux))
-            rejected = int(to_host(cp_rejected))
             self.last_cp_stats = {
                 "total_branches": cp_total,
                 "rejected_branches": rejected,
@@ -543,17 +451,118 @@ class GivensMasterEquation:
 
         if synchronize and hasattr(xp, "cuda"):
             xp.cuda.Stream.null.synchronize()
-        return out
+        return xp.asarray(out)
 
-    def mat_vec_chunked(
-        self, psi, chunk_terms: int = 8, source_chunk: int = 65536,
-        corner_batch: int = 4, **_ignored
-    ):
-        """Compatibility wrapper for the old call site."""
-        return self.mat_vec(
-            psi, term_chunk=chunk_terms, source_chunk=source_chunk,
-            corner_batch=corner_batch
-        )
+    def mat_vec_batched(self,psi,corner_batch):
+        for batch in self.ph.batches:
+            self.mat_vec_chunked(psi,batch,corner_batch)
+
+    def mat_vec_chunked(self,psi,batch,corner_batch):
+        corners = tuple(itertools.product((0, 1), repeat=3))
+        a0,a1,s0,s1 = batch 
+
+        Us = self.Us[a0:a1]
+        coeff = self.ham.a[a0:a1]
+
+        src_mos = self.mos[s0:s1]
+        src_psi = psi[s0:s1]
+        old_overlap = self.trial_mos[None, s0:s1]
+
+        # Exact unnormalized targets, shape (nterm,nsource,4).
+        targets = xp.einsum("apq,sq->asp", Us, src_mos, optimize=True)
+        theta, signed_norm = self._vectors_to_principal(targets)
+        lo, frac = self._target_cell(theta)
+
+        if self.constraint_path:
+            raw_new_overlap = xp.einsum(
+                "p,asp->as", self.trial, targets, optimize=True
+            )
+            gbar = coeff[:, None] * raw_new_overlap / old_overlap
+            allowed = gbar > self.cp_tol
+
+            branch_flux = xp.abs(gbar * src_psi[None, :])
+            self.ph.cp_total += int(allowed.size)
+            self.ph.cp_rejected += xp.count_nonzero(~allowed)
+            self.ph.cp_total_flux += xp.sum(branch_flux)
+            self.ph.cp_rejected_flux += xp.sum(
+                xp.where(allowed, xp.zeros((), dtype=psi.dtype), branch_flux)
+            )
+
+            if self.cp_deposition == "walker":
+                base = xp.where(
+                    allowed,
+                    gbar * src_psi[None, :],
+                    xp.zeros((), dtype=psi.dtype),
+                )
+                multiply_destination_overlap = False
+            else:
+                base = coeff[:, None] * signed_norm * src_psi[None, :]
+                base = base / old_overlap
+                base = xp.where(
+                    allowed, base, xp.zeros((), dtype=psi.dtype)
+                )
+                multiply_destination_overlap = True
+        else:
+            base = coeff[:, None] * signed_norm * src_psi[None, :]
+            if self.importance:
+                base = base / old_overlap
+            multiply_destination_overlap = self.importance
+
+        dest_batch = []
+        vals_batch = []
+        for icorner, bits in enumerate(corners):
+            b0, b1, b2 = bits
+            p1 = lo[..., 0] + b0
+            p2 = lo[..., 1] + b1
+            p3 = lo[..., 2] + b2
+
+            w1 = frac[..., 0] if b0 else (1.0 - frac[..., 0])
+            w2 = frac[..., 1] if b1 else (1.0 - frac[..., 1])
+            w3 = frac[..., 2] if b2 else (1.0 - frac[..., 2])
+            interp = w1 * w2 * w3
+
+            if self.constraint_path and self.cp_boundary == "absorbing":
+                valid = (
+                    (p1 >= 0) & (p1 < self.Ng)
+                    & (p2 >= 0) & (p2 < self.Ng)
+                    & (p3 >= 0) & (p3 < self.Ng)
+                )
+                p1_safe = xp.clip(p1, 0, self.Ng - 1)
+                p2_safe = xp.clip(p2, 0, self.Ng - 1)
+                p3_safe = xp.clip(p3, 0, self.Ng - 1)
+                dest = self.flatten_idx(p1_safe, p2_safe, p3_safe)
+                vals = base * interp
+                if multiply_destination_overlap:
+                    vals = vals * self.trial_mos[dest]
+                vals = xp.where(
+                    valid, vals, xp.zeros((), dtype=psi.dtype)
+                )
+            else:
+                dest, bc_sign = self._lookup_boundary(p1, p2, p3)
+                vals = base * interp * bc_sign
+                if multiply_destination_overlap:
+                    vals = vals * self.trial_mos[dest]
+
+            dest_batch.append(dest.ravel())
+            vals_batch.append(vals.ravel())
+            flush = (
+                len(dest_batch) == corner_batch
+                or icorner == len(corners) - 1
+            )
+            if flush:
+                dest_all = xp.concatenate(dest_batch)
+                vals_all = xp.concatenate(vals_batch)
+                self.ph.psi += xp.bincount(
+                    dest_all, weights=vals_all, minlength=self.Nh
+                )
+                dest_batch.clear()
+                vals_batch.clear()
+                del dest_all, vals_all
+
+        del targets, theta, signed_norm, lo, frac, base
+        if self.constraint_path:
+            del raw_new_overlap, gbar, allowed, branch_flux
+
 
 #    def get_initial_state(self):
 #        """Return the trial determinant on the grid.
@@ -824,17 +833,37 @@ class GivensMasterEquation:
         source_chunk: int = 65536,
         corner_batch: int = 4,
         normalize_mode: str = "auto",
-        fname = None,
     ):
+        mpi_handler = MPIHandler()
+        self.comm = mpi_handler.comm
+        if term_chunk < 1:
+            raise ValueError("term_chunk must be at least 1.")
+        if source_chunk < 1:
+            raise ValueError("source_chunk must be at least 1.")
+        nterms = int(self.ham.nterms)
+        batches = []
+        for a0 in range(0, nterms, term_chunk):
+            a1 = min(a0 + term_chunk, nterms)
+            for s0 in range(0, self.Nh, source_chunk):
+                s1 = min(s0 + source_chunk, self.Nh)
+                batches.append((a0,a1,s0,s1))
+        ntotal = len(batches)
+        batch_size = ntotal // self.comm.size
+        batch_size = [batch_size] * self.comm.size
+        batch_size = np.array(batch_size)
+        remain = ntotal % self.comm.size
+        if remain>0:
+            batch_size[:remain] += 1
+        count = np.cumsum(batch_size)
+        rank = self.comm.rank
+        batch_start = 0 if rank==0 else count[rank-1]
+        batch_stop = count[rank]
+        self.ph = ParallelHolder(batches[start:stop])
+
         for i in range(start, stop):
-            Gpsi = self.mat_vec(
-                psi, term_chunk=term_chunk, source_chunk=source_chunk,
-                corner_batch=corner_batch
-            )
+            Gpsi = self.mat_vec(psi, corner_batch=corner_batch)
             if i % print_every == 0:
                 self.diagnostics(i, psi, Gpsi)
-                if fname is not None:
-                    np.save(fname,to_host(Gpsi))
             psi = Gpsi
             if i % normalize_every == 0:
                 psi = self.normalize(psi, mode=normalize_mode)

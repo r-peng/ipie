@@ -230,7 +230,7 @@ class LAFQMC(AFQMCBase):
             self.estimators.compute_estimators(self.system, self.hamiltonian, self.trial, self.walkers)
             self.estimators.print_block(comm, 0, self.accumulators)
         else:
-            self.estimators.load(load_dirname,comm.rank)
+            #self.estimators.load(load_dirname,comm.rank)
             self.estimate_energy(comm,start_step)
         self.accumulators.zero()
 
