@@ -17,5 +17,10 @@ class SingleDetGHF(SingleDet):
         self.handler = handler
 
     def get_psi(self):
-        return [self.psi[:self.nbasis],self.psi[self.nbasis:]]
+        nb = self.nbasis
+        return [self.psi[:nb],self.psi[nb:]]
 
+    def rotate_trial(self,U):
+        nb = self.nbasis
+        self.psi[:nb] = xp.dot(U.T,self.psi[:nb])
+        self.psi[nb:] = xp.dot(U.T,self.psi[nb:])

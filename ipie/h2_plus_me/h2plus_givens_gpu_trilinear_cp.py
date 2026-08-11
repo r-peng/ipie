@@ -788,7 +788,10 @@ class GivensMasterEquation:
 
         psi_mb = bare @ self.mos
         proj_mb = bare_next @ self.mos
-        exact_mb = self.aUs @ psi_mb
+        #exact_mb = self.aUs @ psi_mb
+
+        exact_mb = self.trial
+        proj_mb /= xp.linalg.norm(proj_mb)
 
         abs_err = xp.linalg.norm(proj_mb - exact_mb)
         rel_err = abs_err / xp.maximum(xp.linalg.norm(exact_mb), self.nodal_tol)

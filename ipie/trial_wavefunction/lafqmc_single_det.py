@@ -19,13 +19,22 @@ class SingleDet(TrialWavefunctionBase):
     def get_psi(self):
         return self.psi 
 
+    def rotate_trial(self,U):
+        self.psi = xp.dot(U.T,self.psi)
+
     def build(self,hamiltonian,conjugate=False):
+        if hamiltonian.exact_1body:
+            self.rotate_trial(hamiltonian.vk1)
+
         psi = self.get_psi()
         U = hamiltonian.chol_basis
         self.UB = [xp.einsum('dxp,xi->dpi',U,Bi) for Bi in psi]
         if not conjugate:
             return
-        self.hB = [xp.einsum('xy,yi->xi',hamiltonian.h1e,Bi) for Bi in psi]
+        if hamiltonian.exact_1body:
+            self.hB = [hamiltonian.ek1[:,None]*Bi for Bi in psi]
+        else:
+            self.hB = [xp.einsum('xy,yi->xi',hamiltonian.h1e,Bi) for Bi in psi]
         if hamiltonian.chol is not None:
             self.LB = [xp.einsum('dxy,yi->dxi',hamiltonian.chol,Bi) for Bi in psi]
 

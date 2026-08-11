@@ -139,7 +139,12 @@ class UHFWalkers(BaseWalkers):
         if set_buff:
             self.buff_names = ['SCU','UDU']
 
+    def rotate_walkers(self,U):
+        self.phi = xp.einsum('xp,wxi->wpi',U,self.phi)
+
     def build(self,hamiltonian,trial,importance):
+        if hamiltonian.exact_1body:
+            self.rotate_walkers(hamiltonian.vk1)
         self.importance = importance
         self.has_E12 = False
         if importance:
@@ -567,8 +572,11 @@ class UHFWalkers(BaseWalkers):
             E2 -= 2.*xp.einsum('wdij,wdji->w',SCLB[0],SCLB[1])
         return 0.5*E2
 
-    def compute_1rdm_diag(self,trial,SC):
+    def compute_1rdm_diag(self,trial,SC,U=None):
         psi = trial.get_psi()
+        if U is not None:
+            psi = [xp.dot(U,Bi) for Bi in psi]
+            SC = [xp.einsum('wip,xp->wix',SCi,U) for SCi in SC]
 
         Daa = xp.einsum('xi,wix->wx',psi[0],SC[0])
         Dbb = xp.einsum('xi,wix->wx',psi[1],SC[1])
@@ -590,11 +598,13 @@ class UHFWalkers(BaseWalkers):
     @plum.dispatch
     def local_energy(self,ham:HubbardSOR,trial):
         if self.importance:
+            assert not ham.exact_1body
             return self.local_energy_fast(ham)
 
         SC = self.compute_SC(trial)
         E1 = self.compute_E1(trial,SC)
-        Daa,Dbb,Dab,Dba = self.compute_1rdm_diag(trial,SC)
+        U = hamiltonian.vk1 if hamiltonian.exact_1body else None
+        Daa,Dbb,Dab,Dba = self.compute_1rdm_diag(trial,SC,U=U)
         E2 = xp.einsum('wp,wp->w',Daa,Dbb)
         if Dab is not None:
             E2 -= xp.einsum('wp,wp->w',Dab,Dba)
@@ -604,6 +614,7 @@ class UHFWalkers(BaseWalkers):
     @plum.dispatch
     def local_energy(self,ham:QCSOR,trial):
         if self.importance:
+            assert not ham.exact_1body
             return self.local_energy_fast(ham)
 
         SC = self.compute_SC(trial)

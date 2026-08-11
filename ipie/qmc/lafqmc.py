@@ -287,7 +287,7 @@ class LAFQMC(AFQMCBase):
 
         self.pcontrol_eq = PopController(
             self.params.num_walkers,
-            self.params.num_steps_per_block,
+            self.params.eq_num_steps_per_block,
             self.mpi_handler,
             pop_control_method=self.params.pop_control_method,
             verbose=self.verbose,

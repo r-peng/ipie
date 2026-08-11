@@ -202,11 +202,8 @@ class LAFQMC(AFQMCBase):
     def setup_estimators(
         self, filename, additional_estimators: Optional[Dict[str, EstimatorBase]] = None, start_step=0, load_dirname=None,
     ):
-        nsteps_per_block = getattr(
-            self, "num_prop_steps_per_block", self.params.num_steps_per_block
-        )
         self.accumulators = WalkerAccumulator(
-            ["Weight", "WeightFactor", "HybridEnergy"], nsteps_per_block
+            ["Weight", "WeightFactor", "HybridEnergy"], self.params.num_steps_per_block
         )
         comm = self.mpi_handler.comm
         self.estimators = EstimatorHandler(
@@ -246,6 +243,7 @@ class LAFQMC(AFQMCBase):
         additional_estimators: Optional[Dict[str, EstimatorBase]] = None,
         constraint_path=True,
         importance_sample=False,
+        prop_interval=5,
         poisson_rate=1.0,
         poisson_energy_shift=0.0,
         eps_sq=None,
@@ -281,24 +279,10 @@ class LAFQMC(AFQMCBase):
             raise ValueError("pop_control_freq must be positive.")
         if self.params.eq_pop_control_freq <= 0:
             raise ValueError("eq_pop_control_freq must be positive.")
-        if self.params.num_steps_per_block % self.params.pop_control_freq != 0:
-            raise ValueError("num_steps_per_block must be a multiple of pop_control_freq.")
-        if self.params.eq_num_steps_per_block % self.params.eq_pop_control_freq != 0:
-            raise ValueError(
-                "eq_num_steps_per_block must be a multiple of eq_pop_control_freq."
-            )
-        if num_eqlb_steps % self.params.eq_pop_control_freq != 0:
-            raise ValueError("equilibration steps must be a multiple of eq_pop_control_freq.")
         poisson_rate = float(poisson_rate)
         poisson_energy_shift = float(poisson_energy_shift)
         if poisson_rate <= 0.0:
             raise ValueError("poisson_rate must be positive.")
-        self.num_prop_steps_per_block = (
-            self.params.num_steps_per_block // self.params.pop_control_freq
-        )
-        self.num_eq_prop_steps_per_block = (
-            self.params.eq_num_steps_per_block // self.params.eq_pop_control_freq
-        )
         self.eps_sq = eps_sq
         self.max_nprod = max_nprod
         self.max_nsum = max_nsum
@@ -323,7 +307,7 @@ class LAFQMC(AFQMCBase):
 
         self.pcontrol_eq = PopController(
             self.params.num_walkers,
-            self.num_eq_prop_steps_per_block,
+            self.params.eq_num_steps_per_block,
             self.mpi_handler,
             pop_control_method=self.params.pop_control_method,
             verbose=self.verbose,
@@ -331,7 +315,7 @@ class LAFQMC(AFQMCBase):
 
         self.pcontrol = PopController(
             self.params.num_walkers,
-            self.num_prop_steps_per_block,
+            self.params.num_steps_per_block,
             self.mpi_handler,
             pop_control_method=self.params.pop_control_method,
             verbose=self.verbose,
@@ -356,37 +340,26 @@ class LAFQMC(AFQMCBase):
         synchronize()
         self.tsetup += time.time() - tzero_setup
 
-        step = 0
-        while step < total_steps:
+        for step in range(1, total_steps + 1):
             synchronize()
             #start_step = time.time()
-            in_equilibration = step < num_eqlb_steps
-            if in_equilibration:
-                prop_interval = self.params.eq_pop_control_freq
-                stblz_freq = self.params.num_eq_stblz
-                pcontrol = self.pcontrol_eq
-                chunk_steps_per_block = self.num_eq_prop_steps_per_block
+            if step <= num_eqlb_steps:
+                if step % self.params.num_eq_stblz == 0:
+                    start = time.time()
+                    self.walkers.reortho(self.trial)
+                    synchronize()
+                    self.tortho += time.time() - start
             else:
-                prop_interval = self.params.pop_control_freq
-                stblz_freq = self.params.num_stblz
-                pcontrol = self.pcontrol
-                chunk_steps_per_block = self.num_prop_steps_per_block
-            next_step = step + prop_interval
-            if next_step > total_steps:
-                raise RuntimeError("Poisson propagation interval does not tile total steps.")
-            if in_equilibration and next_step > num_eqlb_steps:
-                raise RuntimeError("eq_pop_control_freq does not tile equilibration steps.")
-
-            if stblz_freq > 0 and next_step // stblz_freq > step // stblz_freq:
-                start = time.time()
-                self.walkers.reortho(self.trial)
-                synchronize()
-                self.tortho += time.time() - start
+                if step % self.params.num_stblz == 0:
+                    start = time.time()
+                    self.walkers.reortho(self.trial)
+                    synchronize()
+                    self.tortho += time.time() - start
 
             start = time.time()
             self.propagate_walkers(
+                prop_interval,
                 constraint_path=constraint_path,
-                pop_control_freq=prop_interval,
                 poisson_rate=poisson_rate,
                 poisson_energy_shift=poisson_energy_shift,
             )
@@ -410,34 +383,44 @@ class LAFQMC(AFQMCBase):
             #self.tprop_clip += time.time() - start_clip
 
             start_barrier = time.time()
-            comm.Barrier()
+            if step % self.params.pop_control_freq == 0:
+                comm.Barrier()
             self.tprop_barrier += time.time() - start_barrier
 
             self.tprop += time.time() - start
-            start = time.time()
-            self.pop_ctr(comm,pcontrol)
-            synchronize()
-            self.tpopc += time.time() - start
-            self.tpopc_send = pcontrol.timer.send_time
-            self.tpopc_recv = pcontrol.timer.recv_time
-            self.tpopc_comm = pcontrol.timer.communication_time
-            self.tpopc_non_comm = pcontrol.timer.non_communication_time
+            if step <= num_eqlb_steps:
+                if step % self.params.eq_pop_control_freq == 0:
+                    start = time.time()
+                    self.pop_ctr(comm,self.pcontrol_eq)
+                    synchronize()
+                    self.tpopc += time.time() - start
+                    self.tpopc_send = self.pcontrol_eq.timer.send_time
+                    self.tpopc_recv = self.pcontrol_eq.timer.recv_time
+                    self.tpopc_comm = self.pcontrol_eq.timer.communication_time
+                    self.tpopc_non_comm = self.pcontrol_eq.timer.non_communication_time
+            else:
+                if step % self.params.pop_control_freq == 0:
+                    start = time.time()
+                    self.pop_ctr(comm,self.pcontrol)
+                    synchronize()
+                    self.tpopc += time.time() - start
+                    self.tpopc_send = self.pcontrol.timer.send_time
+                    self.tpopc_recv = self.pcontrol.timer.recv_time
+                    self.tpopc_comm = self.pcontrol.timer.communication_time
+                    self.tpopc_non_comm = self.pcontrol.timer.non_communication_time
 
             # accumulate weight, hybrid energy etc. across block
             start = time.time()
             self.accumulators.update(self.walkers)
             synchronize()
             self.testim += time.time() - start  # we dump this time into estimator
-            step = next_step
 
             # calculate estimators
             start = time.time()
             if step > num_eqlb_steps:
-                prod_step = step - num_eqlb_steps
-                if prod_step % self.params.num_steps_per_block == 0:
-                    block = prod_step // self.params.num_steps_per_block
+                if step % self.params.num_steps_per_block == 0:
+                    block = (step - num_eqlb_steps) // self.params.num_steps_per_block
                     #print(start_step)
-                    self.accumulators.nsteps_per_block = chunk_steps_per_block
                     self.estimate_energy(comm,block+start_step)
                     self.accumulators.zero()
                     self.save(comm,dirname)
@@ -445,7 +428,6 @@ class LAFQMC(AFQMCBase):
             else:
                 if step % self.params.eq_num_steps_per_block == 0:
                     block = step // self.params.eq_num_steps_per_block
-                    self.accumulators.nsteps_per_block = chunk_steps_per_block
                     self.estimate_energy(comm,block+start_step)
                     self.accumulators.zero()
                     self.save(comm,dirname)
@@ -505,14 +487,12 @@ class LAFQMC(AFQMCBase):
 
     def propagate_walkers(
         self,
+        prop_interval,
         constraint_path=True,
-        pop_control_freq=None,
         poisson_rate=1.0,
         poisson_energy_shift=0.0,
     ):
-        if pop_control_freq is None:
-            pop_control_freq = self.params.pop_control_freq
-        tau = self.poisson_tau_from_pop_control_freq(pop_control_freq)
+        tau = self.poisson_tau_from_pop_control_freq(prop_interval)
         b,ixs = self.propagate_walkers_bare_poisson(
             tau,
             rate=poisson_rate,
@@ -573,17 +553,17 @@ class LAFQMC(AFQMCBase):
         max_count = int(to_host(counts).max()) if nw > 0 else 0
 
         b = xp.ones(nw, dtype=self.hamiltonian.a.dtype)
-        self.hamiltonian.samples = dict()
         for event in range(max_count):
             active = xp.nonzero(counts > event)[0]
             if active.size == 0:
                 continue
             ixs = xp.random.choice(nterms, size=active.size, p=p, replace=True)
             b[active] = b[active] * event_weight[ixs]
-            self.parse_walker_samples(ixs, active)
+            self.hamiltonian.parse_samples(to_host(ixs), to_host(active))
             b = self.walkers.update_walkers(self.hamiltonian,self.trial,b=b)
 
         end_factor = math.exp(tau * ((rate - 1.0) * lambda_tot + energy_shift))
+        #print('max count=',max_count,'end factor=',end_factor)
         b *= end_factor
         return b,counts
 

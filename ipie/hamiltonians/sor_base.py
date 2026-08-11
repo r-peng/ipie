@@ -69,18 +69,21 @@ class SumOfRotationBase:
                 self.term_dict[key] = []
             self.term_dict[key].append(term)
 
-    def decompose_h1(self,h1e,dt,uniform='coefficient',iprint=0):
+    def decompose_h1(self,h1e,dt,uniform='coefficient',iprint=0,exact_1body=False):
         if not self.run_2body_first:
             raise ValueError('Run 2-body decomposition first!')
         assert uniform in ['coefficient','rotation']
 
         self.h1e = xp.asarray(h1e)
         ek,vk = xp.linalg.eigh(self.h1e+self.v0) 
-        self.chol_basis.append(vk)
-        #self.chol_bands.append(ek)
+        self.exact_1body = exact_1body
+        if self.exact_1body:
+            self.ek1 = ek
+            self.vk1 = vk
+            return
 
+        self.chol_basis.append(vk)
         chol_ix = len(self.chol_basis)-1
-        #self.chol_ix['h1'] = [chol_ix]
 
         if iprint>0:
             print('1-body decomposition: ')
@@ -104,9 +107,12 @@ class SumOfRotationBase:
 
     def parse_decomposition(self,iprint=0):
         self.chol_basis = xp.asarray(self.chol_basis)
-        #self.chol_bands = xp.asarray(self.chol_bands)
-        #for key in self.chol_ix:
-        #    self.chol_ix[key] = xp.asarray(self.chol_ix[key])
+        if self.exact_1body:
+            self.chol_basis = xp.einsum('xq,dxp->dqp',self.vk1,self.chol_basis)
+            if self.chol is not None:
+                self.chol = xp.einsum('dxy,yq->dxq',self.chol,self.vk1)
+                self.chol = xp.einsum('xp,dxq->dpq',self.vk1,self.chol)
+
         self.nchol = self.chol_basis.shape[0]
         self.chol_basis2 = {'eye':xp.eye(self.nbasis)}
         for i,Ui in enumerate(self.chol_basis):
@@ -151,7 +157,6 @@ class SumOfRotationBase:
 
                 i = len(p_dict[key])-1
                 self.ix2key.append((key,i))
-                #if chol_ix==self.chol_ix['h1'][0]:
                 if len(d)==1:
                     E1_ixs.append(ix)
                 else:
@@ -181,10 +186,12 @@ class SumOfRotationBase:
             print('number of terms=',self.nterms)
             #print('a=',self.a)
 
-    def parse_samples(self,ixs):
+    def parse_samples(self,ixs,active=None):
         w_dict = dict()
         i_dict = dict()
-        for w,ix in enumerate(ixs):
+        if active is None:
+            active = list(range(ixs.size))
+        for w,ix in zip(active,ixs):
             key,i = self.ix2key[ix]
             if key not in w_dict:
                 w_dict[key] = []
