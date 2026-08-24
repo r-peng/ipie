@@ -19,6 +19,19 @@ class SingleDet(TrialWavefunctionBase):
     def get_psi(self):
         return self.psi 
 
+    def compute_density(self,U=None,diag=True):
+        psi = self.get_psi()
+        if U is not None:
+            psi = [xp.dot(U,Bi) for Bi in psi]
+        D = [None] * 2
+        for s,Bi in enumerate(psi):
+            S = xp.dot(Bi.T,Bi)
+            Sinv = xp.linalg.inv(S)
+            D[s] = xp.dot(xp.dot(Bi,Sinv),Bi.T)
+            if diag:
+                D[s] = xp.diag(D[s])
+        return D
+
     def build(self,hamiltonian,conjugate=False):
         psi = self.get_psi()
         U = hamiltonian.chol_basis

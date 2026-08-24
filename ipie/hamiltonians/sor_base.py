@@ -1,6 +1,32 @@
 import numpy as np
 from ipie.utils.backend import arraylib as xp
 
+def parse_density(density,ixs,a,thresh):
+    if density is None:
+        return a,None
+    dmin = min([density[s][p] for (s,p) in ixs])
+    if dmin<thresh: 
+        return a,None
+    return a/dmin,density
+
+def get_coeffs_same_sign(ep,eq,p,q,sp,sq,sign_p,sign_q,a,uniform,density):
+    np_,nq_ = None,None
+    if density is not None:
+        np_,nq_ = density[sp][p],density[sq][q]
+        dp = sign_p/(np_*a)
+        dq = sign_q/(nq_*a)
+    else:
+        if uniform=='coefficient':
+            dp = sign_p*ep/a
+            dq = sign_q*eq/a
+        else:
+            dp = sign_p*xp.sign(ep)/a
+            dq = sign_q*xp.sign(eq)/a
+    apq = -ep*eq/(dp*dq)
+    print(ep,eq,np_,nq_,dp,dq,apq)
+    return dp,dq,apq
+
+
 class SumOfRotationBase:
 
     def __init__(self,nbasis,thresh=1e-6,has_aa=True,has_bb=True,has_ab=True):
@@ -305,16 +331,22 @@ class QCSOR(SumOfRotationBase):
                         self.add_term(aisq,chol_ix,[q,p],[-dq,dp],[0,1])
         self.run_2body_first = True
 
-    def decompose_h2(self,chol,dt,iprint=0,uniform='coefficient'):
+    def decompose_h2(self,chol,dt,iprint=0,uniform='coefficient',trial=None):
         assert uniform in ['coefficient','rotation']
         self.chol = xp.asarray(chol)
         if iprint>0:
             print('2-body decomposition: ')
 
+        density = None
         for i,L in enumerate(self.chol):
             ek,vk = xp.linalg.eigh(L) 
             self.chol_basis.append(vk)
             chol_ix = len(self.chol_basis)-1
+            if trial is not None:
+                density = trial.compute_density(U=vk)
+                if iprint>1:
+                    print('density up=',density[0])
+                    print('density down=',density[1])
 
             if iprint>0:
                 print('nchol idx=',chol_ix)
@@ -323,37 +355,34 @@ class QCSOR(SumOfRotationBase):
             if self.has_aa and self.has_ab and self.has_bb:
                 if iprint>1:
                     print('all terms')
-                self._decompose_chol(chol_ix,ek,dt,uniform)
+                self._decompose_chol(chol_ix,ek,dt,uniform,density=density)
             elif self.has_aa and (not self.has_ab) and (not self.has_bb):
                 if iprint>1:
                     print('up only')
-                self._decompose_chol_up_only(chol_ix,ek,dt,uniform)
+                self._decompose_chol_up_only(chol_ix,ek,dt,uniform,density=density)
             elif self.has_ab and (not self.has_aa) and (not self.has_bb):
                 if iprint>1:
                     print('ab only')
-                self._decompose_chol_ab_only(chol_ix,ek,dt,uniform)
+                self._decompose_chol_ab_only(chol_ix,ek,dt,uniform,density=density)
             else:
                 raise NotImplementedError
 
         self.run_2body_first = True
 
-    def _decompose_chol(self,chol_ix,ek,dt,uniform):
+    def _decompose_chol(self,chol_ix,ek,dt,uniform,density=None):
         a = 1./np.sqrt(dt)
         d = 1./a
         for p in range(self.nbasis):
             ep = ek[p]
             if xp.fabs(ep)<self.thresh:
                 continue
+            ixs = [(s,p) for s in (0,1)]
+            a_,density_ = parse_density(density,ixs,a,self.thresh)
 
-            if uniform=='coefficient':
-                ap = a
-            else:
-                ap = xp.fabs(ep)*a
-            dp = ep/ap
-            app = ap**2/2.
-
-            self.add_term(app,chol_ix,[p,p],[-dp,dp],[0,1])
-            self.add_term(app,chol_ix,[p,p],[dp,-dp],[0,1])
+            d0,d1,app = get_coeffs_same_sign(ep,ep,p,p,0,1,-1,1,a_,uniform,density_)
+            self.add_term(app/2.,chol_ix,[p,p],[d0,d1],[0,1])
+            d0,d1,app = get_coeffs_same_sign(ep,ep,p,p,0,1,1,-1,a_,uniform,density)
+            self.add_term(app/2.,chol_ix,[p,p],[d0,d1],[0,1])
 
             for q in range(p+1,self.nbasis):
                 eq = ek[q]
@@ -377,7 +406,7 @@ class QCSOR(SumOfRotationBase):
                 self.add_term(apq,chol_ix,[q,p],[-dq,-dp],[0,1])
                 self.add_term(apq,chol_ix,[p,q],[dp,dq],[1,1])
 
-    def _decompose_chol_up_only(self,chol_ix,ek,dt,uniform):
+    def _decompose_chol_up_only(self,chol_ix,ek,dt,uniform,density=None):
         a = 1./np.sqrt(dt)
         d = 1./a
         for p in range(self.nbasis):
@@ -389,37 +418,46 @@ class QCSOR(SumOfRotationBase):
                 if xp.fabs(eq)<self.thresh:
                     continue
 
-                if uniform=='coefficient': 
-                    ap,aq = a,a
-                else:
-                    ap = xp.fabs(ep)*a
-                    aq = xp.fabs(eq)*a
+                if ep*eq<0:
+                    if uniform=='coefficient': 
+                        ap,aq = a,a
+                    else:
+                        ap = xp.fabs(ep)*a
+                        aq = xp.fabs(eq)*a
 
-                dp,dq = ep/ap,eq/aq
-                assert xp.fabs(dp)<1.
-                assert xp.fabs(dq)<1.
-                apq = ap*aq/2.
+                    dp,dq = ep/ap,eq/aq
+                    assert xp.fabs(dp)<1.
+                    assert xp.fabs(dq)<1.
+                    apq = ap*aq/2.
     
-                self.add_term(apq,chol_ix,[p,q],[-dp,dq],[0,0])
-                self.add_term(apq,chol_ix,[p,q],[dp,-dq],[0,0])
+                    self.add_term(apq,chol_ix,[p,q],[-dp,dq],[0,0])
+                    self.add_term(apq,chol_ix,[p,q],[dp,-dq],[0,0])
+                else:
+                    ixs = [(0,x) for x in (p,q)]
+                    a_,density_ = parse_density(density,ixs,a,self.thresh)
 
-    def _decompose_chol_ab_only(self,chol_ix,ek,dt,uniform):
+                    dp,dq,apq = get_coeffs_same_sign(ep,eq,p,q,0,0,-1,1,a_,uniform,density_)
+                    self.add_term(apq/2.,chol_ix,[p,q],[dp,dq],[0,0])
+                    dp,dq,apq = get_coeffs_same_sign(ep,eq,p,q,0,0,1,-1,a_,uniform,density)
+                    self.add_term(apq/2.,chol_ix,[p,q],[dp,dq],[0,0])
+
+    def _decompose_chol_ab_only(self,chol_ix,ek,dt,uniform,density=None):
         a = 1./np.sqrt(dt)
         d = 1./a
+        def get_coeffs(ep,eq,p,q,sp,sq,sign_p,sign_q,a):
+            return get_coeffs_same_sign(ep,eq,p,q,sp,sq,sign_p,sign_q,a,uniform,density,self.thresh)
+
         for p in range(self.nbasis):
             ep = ek[p]
             if xp.fabs(ep)<self.thresh:
                 continue
+            ixs = [(s,p) for s in (0,1)]
+            a_,density_ = parse_density(density,ixs,a,self.thresh)
 
-            if uniform=='coefficient':
-                ap = a
-            else:
-                ap = xp.fabs(ep)*a
-            dp = ep/ap
-            app = ap**2/2.
-
-            self.add_term(app,chol_ix,[p,p],[-dp,dp],[0,1])
-            self.add_term(app,chol_ix,[p,p],[dp,-dp],[0,1])
+            d0,d1,app = get_coeffs_same_sign(ep,ep,p,p,0,1,-1,1,a_,uniform,density_)
+            self.add_term(app/2.,chol_ix,[p,p],[d0,d1],[0,1])
+            d0,d1,app = get_coeffs_same_sign(ep,ep,p,p,0,1,1,-1,a_,uniform,density_)
+            self.add_term(app/2.,chol_ix,[p,p],[d0,d1],[0,1])
 
             for q in range(p+1,self.nbasis):
                 eq = ek[q]
@@ -427,19 +465,36 @@ class QCSOR(SumOfRotationBase):
                     continue
                 #print('p,q,ep,eq=',p,q,ep,eq)
 
-                if uniform=='coefficient':
-                    ap,aq = a,a
+                if ep*eq<0:
+                    if uniform=='coefficient':
+                        ap,aq = a,a
+                    else:
+                        ap = xp.fabs(ep)*a
+                        aq = xp.fabs(eq)*a
+
+                    dp,dq = ep/ap,eq/aq
+                    assert xp.fabs(dp)<1.
+                    assert xp.fabs(dq)<1.
+                    apq = ap*aq/2.
+
+                    self.add_term(apq,chol_ix,[p,q],[-dp,dq],[0,1])
+                    self.add_term(apq,chol_ix,[p,q],[dp,-dq],[0,1])
+                    self.add_term(apq,chol_ix,[q,p],[dq,-dp],[0,1])
+                    self.add_term(apq,chol_ix,[q,p],[-dq,dp],[0,1])
                 else:
-                    ap = xp.fabs(ep)*a
-                    aq = xp.fabs(eq)*a
+                    ixs = [(0,p),(1,q)]
+                    a_,density_ = parse_density(density,ixs,a,self.thresh)
+                    dp,dq,apq = get_coeffs_same_sign(ep,eq,p,q,0,1,-1,1,a_,uniform,density_)
+                    self.add_term(apq/2.,chol_ix,[p,q],[dp,dq],[0,1])
+                    dp,dq,apq = get_coeffs_same_sign(ep,eq,p,q,0,1,1,-1,a_,uniform,density_)
+                    self.add_term(apq/2.,chol_ix,[p,q],[dp,dq],[0,1])
 
-                dp,dq = ep/ap,eq/aq
-                assert xp.fabs(dp)<1.
-                assert xp.fabs(dq)<1.
-                apq = ap*aq/2.
+                    ixs = [(1,p),(0,q)]
+                    a_,density_ = parse_density(density,ixs,a,self.thresh)
+                    dp,dq,apq = get_coeffs_same_sign(ep,eq,p,q,1,0,-1,1,a_,uniform,density_)
+                    self.add_term(apq/2.,chol_ix,[q,p],[dq,dp],[0,1])
+                    dp,dq,apq = get_coeffs_same_sign(ep,eq,p,q,1,0,1,-1,a_,uniform,density_)
+                    self.add_term(apq/2.,chol_ix,[q,p],[dq,dp],[0,1])
 
-                self.add_term(apq,chol_ix,[p,q],[-dp,dq],[0,1])
-                self.add_term(apq,chol_ix,[p,q],[dp,-dq],[0,1])
-                self.add_term(apq,chol_ix,[q,p],[dq,-dp],[0,1])
-                self.add_term(apq,chol_ix,[q,p],[-dq,dp],[0,1])
+
 

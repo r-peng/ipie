@@ -8,6 +8,7 @@ from ipie.hamiltonians.bitstring_utils import (
         apply_a_dag_dense_sign,
         get_config_from_occ,
 )
+from ipie.trial_wavefunction.lafqmc_single_det import SingleDet
 np.set_printoptions(suppress=True,precision=6,linewidth=100000)
 
 def get_MB_kappa(ham,ix,basis,basis_map):
@@ -204,9 +205,11 @@ if __name__=='__main__':
     from ipie.utils.linalg import modified_cholesky
 
     nsite = 5 
-    nelecs = 2,0 
+    nelecs = 1,1 
     h1e = np.random.rand(nsite,nsite)*2-1
     h1e += h1e.T
+    phi = np.random.rand(nsite,sum(nelecs))*2-1
+    trial = SingleDet(phi,nelecs,nsite)
     
     U = 4 
     dt1 = 0.1
@@ -248,9 +251,10 @@ if __name__=='__main__':
         has_aa = True
         has_ab = True
         has_bb = True
+    #trial = None
     for uniform in ['coefficient','rotation']:
         ham = QCSOR(nsite,has_aa=has_aa,has_ab=has_ab,has_bb=has_bb) 
-        ham.decompose_h2(chol,dt2,iprint=2,uniform=uniform)
+        ham.decompose_h2(chol,dt2,iprint=2,uniform=uniform,trial=trial)
         ham.decompose_h1(h1e,dt1,iprint=iprint,uniform=uniform)
         ham.parse_decomposition()
         test_hamiltonian(ham,nsite,nelecs,h1e,eri=eri)
