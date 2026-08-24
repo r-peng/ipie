@@ -311,7 +311,6 @@ class GivensMasterEquation:
 
     def build(self, ham, trial, check: bool = True, **_ignored):
         """Attach the Hamiltonian and construct the trial-adapted physical basis."""
-        self.ham = ham
         self.trial = xp.asarray(trial).copy()
         self.trial /= xp.linalg.norm(self.trial)
         self.M = int(self.trial.size)
@@ -326,6 +325,10 @@ class GivensMasterEquation:
         if bool(to_host(xp.any(self.trial_mos <= 0.0))):
             raise RuntimeError("Interior midpoint grid contains a non-positive trial overlap.")
 
+        if ham is None:
+            return
+
+        self.ham = ham
         self.Us = xp.asarray([ham.get_rotation_matrix(ix)[0] for ix in range(ham.nterms)])
         self.aUs = xp.einsum("a,apq->pq", ham.a, self.Us, optimize=True)
         self.gtrial = self.trial @ self.aUs

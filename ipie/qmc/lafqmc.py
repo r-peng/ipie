@@ -37,8 +37,8 @@ from ipie.utils.backend import to_host
 from ipie.utils.backend import synchronize
 from ipie.utils.mpi import MPIHandler
 from ipie.walkers.base_walkers import WalkerAccumulator
-#from ipie.walkers.pop_controller_custom import PopController
-from ipie.walkers.pop_controller import PopController
+from ipie.walkers.pop_controller_custom import PopController
+#from ipie.walkers.pop_controller import PopController
 from ipie.qmc.afqmc import AFQMCBase
    
 class LAFQMC(AFQMCBase):
@@ -230,7 +230,8 @@ class LAFQMC(AFQMCBase):
             self.estimators.compute_estimators(self.system, self.hamiltonian, self.trial, self.walkers)
             self.estimators.print_block(comm, 0, self.accumulators)
         else:
-            #self.estimators.load(load_dirname,comm.rank)
+            if self.params.pop_control_method=='stochastic_reconfiguration':
+                self.estimators.load(load_dirname,comm.rank)
             self.estimate_energy(comm,start_step)
         self.accumulators.zero()
 
@@ -283,7 +284,6 @@ class LAFQMC(AFQMCBase):
             self.walkers.load(comm,load_dirname)
         self.setup_timers()
         eshift = 0.0
-        self.walkers.reortho(None)
 
         self.pcontrol_eq = PopController(
             self.params.num_walkers,
@@ -310,6 +310,7 @@ class LAFQMC(AFQMCBase):
 
         start = time.time()
         iprint = 1 if comm.rank==0 else 0
+        self.walkers.reortho(None)
         self.trial.build(self.hamiltonian,conjugate=(not importance_sample))
         self.walkers.build(self.hamiltonian,self.trial,importance=importance_sample)
         if comm.rank==0:
@@ -386,7 +387,7 @@ class LAFQMC(AFQMCBase):
 
             # accumulate weight, hybrid energy etc. across block
             start = time.time()
-            self.accumulators.update(self.walkers)
+            #self.accumulators.update(self.walkers)
             synchronize()
             self.testim += time.time() - start  # we dump this time into estimator
 

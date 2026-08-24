@@ -204,7 +204,7 @@ if __name__=='__main__':
     from ipie.utils.linalg import modified_cholesky
 
     nsite = 5 
-    nelecs = 2,1
+    nelecs = 2,0 
     h1e = np.random.rand(nsite,nsite)*2-1
     h1e += h1e.T
     
@@ -235,9 +235,22 @@ if __name__=='__main__':
     #chol = np.zeros_like(chol)
     #eri = np.zeros_like(eri)
     
+    na,nb = nelecs 
+    if na>1 and nb==0:
+        has_aa = True
+        has_ab = False
+        has_bb = False
+    elif na==1 and nb==1:
+        has_aa = False
+        has_ab = True
+        has_bb = False
+    else:
+        has_aa = True
+        has_ab = True
+        has_bb = True
     for uniform in ['coefficient','rotation']:
-        ham = QCSOR(nsite,apply_spin_down=(nelecs[1]>0)) 
-        ham.decompose_h2(chol,dt2,iprint=iprint,uniform=uniform)
+        ham = QCSOR(nsite,has_aa=has_aa,has_ab=has_ab,has_bb=has_bb) 
+        ham.decompose_h2(chol,dt2,iprint=2,uniform=uniform)
         ham.decompose_h1(h1e,dt1,iprint=iprint,uniform=uniform)
         ham.parse_decomposition()
         test_hamiltonian(ham,nsite,nelecs,h1e,eri=eri)

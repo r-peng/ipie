@@ -3,14 +3,14 @@ from ipie.utils.backend import arraylib as xp
 
 class SumOfRotationBase:
 
-    def __init__(self,nbasis,thresh=1e-6,apply_spin_down=True):
+    def __init__(self,nbasis,thresh=1e-6,has_aa=True,has_bb=True,has_ab=True):
         self.nbasis = nbasis
         self.thresh = thresh
-        self.apply_spin_down = apply_spin_down
+        self.has_aa = has_aa
+        self.has_ab = has_ab
+        self.has_bb = has_bb
 
         self.chol_basis = []
-        #self.chol_bands = []
-        #self.chol_ix = dict()
         self.term_dict = dict() 
         self.chol = None
 
@@ -69,25 +69,20 @@ class SumOfRotationBase:
                 self.term_dict[key] = []
             self.term_dict[key].append(term)
 
-    def decompose_h1(self,h1e,dt,uniform='coefficient',iprint=0,exact_1body=False):
+    def decompose_h1(self,h1e,dt,uniform='coefficient',iprint=0):
         if not self.run_2body_first:
             raise ValueError('Run 2-body decomposition first!')
         assert uniform in ['coefficient','rotation']
 
         self.h1e = xp.asarray(h1e)
         ek,vk = xp.linalg.eigh(self.h1e+self.v0) 
-        self.exact_1body = exact_1body
-        if self.exact_1body:
-            self.ek1 = ek
-            self.vk1 = vk
-            return
-
         self.chol_basis.append(vk)
         chol_ix = len(self.chol_basis)-1
 
         if iprint>0:
             print('1-body decomposition: ')
             print('bands=',ek)
+            print('ai=',1./dt)
 
         for p in range(ek.size):
             if xp.fabs(ek[p])<self.thresh:
@@ -101,18 +96,12 @@ class SumOfRotationBase:
             assert xp.fabs(dp)<1.
 
             self.add_term(ap,chol_ix,[p],[dp],[0])
-            if self.apply_spin_down:
+            if self.has_ab or self.has_bb:
                 self.add_term(ap,chol_ix,[p],[dp],[1])
         return ek
 
     def parse_decomposition(self,iprint=0):
         self.chol_basis = xp.asarray(self.chol_basis)
-        if self.exact_1body:
-            self.chol_basis = xp.einsum('xq,dxp->dqp',self.vk1,self.chol_basis)
-            if self.chol is not None:
-                self.chol = xp.einsum('dxy,yq->dxq',self.chol,self.vk1)
-                self.chol = xp.einsum('xp,dxq->dpq',self.vk1,self.chol)
-
         self.nchol = self.chol_basis.shape[0]
         self.chol_basis2 = {'eye':xp.eye(self.nbasis)}
         for i,Ui in enumerate(self.chol_basis):
@@ -254,16 +243,14 @@ class HubbardSOR(SumOfRotationBase):
         assert param in ['eta','lambda']
         self.hubbard_U = U
         self.chol_basis.append(xp.eye(self.nbasis))
-        #self.chol_bands.append(xp.ones(self.nbasis))
         chol_ix = len(self.chol_basis)-1
-        #self.chol_ix['U'] = [chol_ix]
 
-        d = np.sqrt(dt)
+        d = np.sqrt(self.hubbard_U*dt)
         if param=='eta':
             ai = self.hubbard_U/(np.cosh(d)-1.)/4.
             dp = xp.exp(d)-1.
             dm = xp.exp(-d)-1.
-            self.v0 = np.eye(self.nbasis) * self.hubbard_U/2.
+            self.v0 = xp.eye(self.nbasis) * self.hubbard_U/2.
         else:
             dp,dm = d,-d
             ai = self.hubbard_U/d**2/2. 
@@ -320,7 +307,6 @@ class QCSOR(SumOfRotationBase):
 
     def decompose_h2(self,chol,dt,iprint=0,uniform='coefficient'):
         assert uniform in ['coefficient','rotation']
-        #self.chol_ix['chol'] = []
         self.chol = xp.asarray(chol)
         if iprint>0:
             print('2-body decomposition: ')
@@ -328,18 +314,26 @@ class QCSOR(SumOfRotationBase):
         for i,L in enumerate(self.chol):
             ek,vk = xp.linalg.eigh(L) 
             self.chol_basis.append(vk)
-            #self.chol_bands.append(ek)
             chol_ix = len(self.chol_basis)-1
-            #self.chol_ix['chol'].append(chol_ix)
 
             if iprint>0:
                 print('nchol idx=',chol_ix)
                 print('bands=',ek)
 
-            if self.apply_spin_down:
+            if self.has_aa and self.has_ab and self.has_bb:
+                if iprint>1:
+                    print('all terms')
                 self._decompose_chol(chol_ix,ek,dt,uniform)
-            else:
+            elif self.has_aa and (not self.has_ab) and (not self.has_bb):
+                if iprint>1:
+                    print('up only')
                 self._decompose_chol_up_only(chol_ix,ek,dt,uniform)
+            elif self.has_ab and (not self.has_aa) and (not self.has_bb):
+                if iprint>1:
+                    print('ab only')
+                self._decompose_chol_ab_only(chol_ix,ek,dt,uniform)
+            else:
+                raise NotImplementedError
 
         self.run_2body_first = True
 
@@ -408,4 +402,44 @@ class QCSOR(SumOfRotationBase):
     
                 self.add_term(apq,chol_ix,[p,q],[-dp,dq],[0,0])
                 self.add_term(apq,chol_ix,[p,q],[dp,-dq],[0,0])
+
+    def _decompose_chol_ab_only(self,chol_ix,ek,dt,uniform):
+        a = 1./np.sqrt(dt)
+        d = 1./a
+        for p in range(self.nbasis):
+            ep = ek[p]
+            if xp.fabs(ep)<self.thresh:
+                continue
+
+            if uniform=='coefficient':
+                ap = a
+            else:
+                ap = xp.fabs(ep)*a
+            dp = ep/ap
+            app = ap**2/2.
+
+            self.add_term(app,chol_ix,[p,p],[-dp,dp],[0,1])
+            self.add_term(app,chol_ix,[p,p],[dp,-dp],[0,1])
+
+            for q in range(p+1,self.nbasis):
+                eq = ek[q]
+                if xp.fabs(eq)<self.thresh:
+                    continue
+                #print('p,q,ep,eq=',p,q,ep,eq)
+
+                if uniform=='coefficient':
+                    ap,aq = a,a
+                else:
+                    ap = xp.fabs(ep)*a
+                    aq = xp.fabs(eq)*a
+
+                dp,dq = ep/ap,eq/aq
+                assert xp.fabs(dp)<1.
+                assert xp.fabs(dq)<1.
+                apq = ap*aq/2.
+
+                self.add_term(apq,chol_ix,[p,q],[-dp,dq],[0,1])
+                self.add_term(apq,chol_ix,[p,q],[dp,-dq],[0,1])
+                self.add_term(apq,chol_ix,[q,p],[dq,-dp],[0,1])
+                self.add_term(apq,chol_ix,[q,p],[-dq,dp],[0,1])
 

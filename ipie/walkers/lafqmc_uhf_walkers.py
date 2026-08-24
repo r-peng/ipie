@@ -79,6 +79,7 @@ class UHFWalkers(BaseWalkers):
         )
 
         self.phi = xp.array([initial_walker.copy() for iw in range(self.nwalkers)])
+        self.measure_sign = False
 
     def cast_to_cupy(self, verbose=False):
         cast_to_device(self, verbose)
@@ -139,12 +140,7 @@ class UHFWalkers(BaseWalkers):
         if set_buff:
             self.buff_names = ['SCU','UDU']
 
-    def rotate_walkers(self,U):
-        self.phi = xp.einsum('xp,wxi->wpi',U,self.phi)
-
     def build(self,hamiltonian,trial,importance):
-        if hamiltonian.exact_1body:
-            self.rotate_walkers(hamiltonian.vk1)
         self.importance = importance
         self.has_E12 = False
         if importance:
@@ -154,8 +150,7 @@ class UHFWalkers(BaseWalkers):
             self.buff_names += ['E1','E2']
         else:
             self.compute_S(trial,set_buff=True)
-        self.phase = xp.ones(self.nwalkers) 
-        self.buff_names += ['phi','weight','phase']
+        self.buff_names += ['phi','weight','phase','unscaled_weight','hybrid_energy']
 
         self.buff_size = round(self.set_buff_size_single_walker() / float(self.nwalkers))
         self.walker_buffer = np.zeros(self.buff_size, dtype=np.complex128)
@@ -530,8 +525,8 @@ class UHFWalkers(BaseWalkers):
         start = 0 if RANK==0 else counts[RANK-1]
         stop = counts[RANK]
         print(f'RANK={RANK},start={start},stop={stop}')
-        self.phi = xp.asarray(phi[start:stop])
-        self.weight = xp.asarray(weights[start:stop])
+        self.phi = np.asarray(phi[start:stop])
+        self.weight = np.asarray(weights[start:stop])
         #_check_nan(walkers.phi,'phi','loaded')
         #nu = walkers.nup
         #phi = walkers.phi[:,:,:nu]
@@ -572,12 +567,8 @@ class UHFWalkers(BaseWalkers):
             E2 -= 2.*xp.einsum('wdij,wdji->w',SCLB[0],SCLB[1])
         return 0.5*E2
 
-    def compute_1rdm_diag(self,trial,SC,U=None):
+    def compute_1rdm_diag(self,trial,SC):
         psi = trial.get_psi()
-        if U is not None:
-            psi = [xp.dot(U,Bi) for Bi in psi]
-            SC = [xp.einsum('wip,xp->wix',SCi,U) for SCi in SC]
-
         Daa = xp.einsum('xi,wix->wx',psi[0],SC[0])
         Dbb = xp.einsum('xi,wix->wx',psi[1],SC[1])
 
@@ -598,13 +589,11 @@ class UHFWalkers(BaseWalkers):
     @plum.dispatch
     def local_energy(self,ham:HubbardSOR,trial):
         if self.importance:
-            assert not ham.exact_1body
             return self.local_energy_fast(ham)
 
         SC = self.compute_SC(trial)
         E1 = self.compute_E1(trial,SC)
-        U = hamiltonian.vk1 if hamiltonian.exact_1body else None
-        Daa,Dbb,Dab,Dba = self.compute_1rdm_diag(trial,SC,U=U)
+        Daa,Dbb,Dab,Dba = self.compute_1rdm_diag(trial,SC)
         E2 = xp.einsum('wp,wp->w',Daa,Dbb)
         if Dab is not None:
             E2 -= xp.einsum('wp,wp->w',Dab,Dba)
@@ -614,7 +603,6 @@ class UHFWalkers(BaseWalkers):
     @plum.dispatch
     def local_energy(self,ham:QCSOR,trial):
         if self.importance:
-            assert not ham.exact_1body
             return self.local_energy_fast(ham)
 
         SC = self.compute_SC(trial)
@@ -622,3 +610,30 @@ class UHFWalkers(BaseWalkers):
         E2 = self.compute_chol(trial,SC)
         return E1+E2,E1,E2
 
+    def _measure_sign(self,hamiltonian,trial):
+        self.compute_density(hamiltonian,trial,set_buff=False)
+        ovlp = self.compute_ovlp_ratio(hamiltonian)
+        g = hamiltonian.a[:,None] * ovlp
+        gsum = g.sum(axis=0)
+        bsum = xp.fabs(g).sum(axis=0)
+
+        b_plus = g.copy()
+        xp.clip(b_plus, a_min=0.0, a_max=None, out=b_plus)  
+        b_plus = b_plus.sum(axis=0)
+
+        b_minus = g.copy()
+        xp.clip(b_minus, a_min=None, a_max=0.0, out=b_minus)  
+        b_minus = b_minus.sum(axis=0)
+        b_minus *= -1
+
+        err = xp.linalg.norm(b_plus+b_minus-bsum)
+        if err>1e-10:
+            print(err)
+            exit()
+        err = xp.linalg.norm(b_plus-b_minus-gsum)
+        if err>1e-10: 
+            print(err)
+            exit()
+        f = b_minus / bsum
+        s = xp.fabs(gsum) / bsum
+        return f,s

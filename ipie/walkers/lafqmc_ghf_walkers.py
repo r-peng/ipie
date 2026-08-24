@@ -18,11 +18,6 @@ class GHFWalkers(UHFWalkers):
         self.phi[:,:self.nbasis] = phi[0]
         self.phi[:,self.nbasis:] = phi[1]
 
-    def rotate_walkers(self,U):
-        nb = self.nbasis
-        self.phi[:,:nb] = xp.einsum('xp,wxi->wpi',U,self.phi[:,:nb])
-        self.phi[:,nb:] = xp.einsum('xp,wxi->wpi',U,self.phi[:,nb:])
-
     @plum.dispatch
     def compute_S(self,trial:SingleDet,**kwargs):
         raise NotImplementedError
@@ -129,3 +124,5 @@ class GHFWalkers(UHFWalkers):
         phi = self.get_phi()
         return [xp.einsum('wij,wxj->wix',self.S,Ci) for Ci in phi]
 
+    def _load_phi(self,phi):
+        self.phi = xp.asarray(phi)

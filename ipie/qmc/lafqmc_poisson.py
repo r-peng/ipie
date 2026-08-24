@@ -30,18 +30,16 @@ import numpy
 
 from ipie.config import config
 from ipie.estimators.estimator_base import EstimatorBase
-from ipie.estimators.handler_custom import EstimatorHandler
 from ipie.qmc.options import QMCParams
 from ipie.utils.backend import arraylib as xp
 from ipie.utils.backend import to_host
 from ipie.utils.backend import synchronize
 from ipie.utils.mpi import MPIHandler
-from ipie.walkers.base_walkers import WalkerAccumulator
-#from ipie.walkers.pop_controller_custom import PopController
-from ipie.walkers.pop_controller import PopController
-from ipie.qmc.afqmc import AFQMCBase
+from ipie.walkers.pop_controller_custom import PopController
+#from ipie.walkers.pop_controller import PopController
+from ipie.qmc.lafqmc import LAFQMC 
    
-class LAFQMC(AFQMCBase):
+class PLAFQMC(LAFQMC):
     """AFQMC driver for zero temperature open ended random walk.
 
     Parameters
@@ -67,7 +65,6 @@ class LAFQMC(AFQMCBase):
         Seed deduced from params.rng_seed which is generally different on each
             MPI process.
     """
-
     @staticmethod
     # TODO: wavefunction type, trial type, hamiltonian type
     def build(
@@ -171,7 +168,7 @@ class LAFQMC(AFQMCBase):
             reference_run=reference_run,
             walkermap_filepath=walkermap_filepath,
         )
-        return LAFQMC(
+        return PLAFQMC(
             None,
             hamiltonian,
             trial_wavefunction,
@@ -182,57 +179,6 @@ class LAFQMC(AFQMCBase):
             None,
             verbose=(verbose and comm.rank == 0),
         )
-
-    def copy_to_gpu(self):
-        comm = self.mpi_handler.comm
-        if config.get_option("use_gpu"):
-            ngpus = xp.cuda.runtime.getDeviceCount()
-            _ = xp.cuda.runtime.getDeviceProperties(0)
-            # xp.cuda.runtime.setDevice(self.shared_comm.rank % 4)
-            xp.cuda.runtime.setDevice(comm.rank % ngpus)
-            if comm.rank == 0:
-                if ngpus > comm.size:
-                    print(
-                        f"# There are unused GPUs ({comm.size} MPI tasks but {ngpus} GPUs). "
-                        " Check if this is really what you wanted."
-                    )
-            self.trial.cast_to_cupy(self.verbose and comm.rank == 0)
-            self.walkers.cast_to_cupy(self.verbose and comm.rank == 0)
-
-    def setup_estimators(
-        self, filename, additional_estimators: Optional[Dict[str, EstimatorBase]] = None, start_step=0, load_dirname=None,
-    ):
-        self.accumulators = WalkerAccumulator(
-            ["Weight", "WeightFactor", "HybridEnergy"], self.params.num_steps_per_block
-        )
-        comm = self.mpi_handler.comm
-        self.estimators = EstimatorHandler(
-            self.mpi_handler.comm,
-            None,
-            self.hamiltonian,
-            self.trial,
-            walker_state=self.accumulators,
-            verbose=(comm.rank == 0 and self.verbose),
-            filename=filename,
-        )
-        if additional_estimators is not None:
-            for k, v in additional_estimators.items():
-                self.estimators[k] = v
-        ## TODO: Move this to estimator and log uuid etc in serialization
-        #json.encoder.FLOAT_REPR = lambda o: format(o, ".6f")
-        #json_string = to_json(self)
-        #self.estimators.json_string = json_string
-
-        self.estimators.initialize(comm)
-        # Calculate estimates for initial distribution of walkers.
-        self.accumulators.update(self.walkers)
-        if start_step==0:
-            self.estimators.compute_estimators(self.system, self.hamiltonian, self.trial, self.walkers)
-            self.estimators.print_block(comm, 0, self.accumulators)
-        else:
-            #self.estimators.load(load_dirname,comm.rank)
-            self.estimate_energy(comm,start_step)
-        self.accumulators.zero()
 
     def run(
         self,
@@ -303,7 +249,6 @@ class LAFQMC(AFQMCBase):
             self.walkers.load(comm,load_dirname)
         self.setup_timers()
         eshift = 0.0
-        self.walkers.reortho(None)
 
         self.pcontrol_eq = PopController(
             self.params.num_walkers,
@@ -330,6 +275,7 @@ class LAFQMC(AFQMCBase):
 
         start = time.time()
         iprint = 1 if comm.rank==0 else 0
+        self.walkers.reortho(None)
         self.trial.build(self.hamiltonian,conjugate=(not importance_sample))
         self.walkers.build(self.hamiltonian,self.trial,importance=importance_sample)
         if comm.rank==0:
@@ -516,20 +462,6 @@ class LAFQMC(AFQMCBase):
         #print(f'term_label={kixs[0]},weight multiplier={b[0]},accumulated weight={self.walkers.weight[0]},ovlp={1./self.walkers.Sa[0,0,0]}')
         synchronize()
 
-    def propagate_walkers_bare(self):
-        nterms = self.hamiltonian.nterms
-        nw = self.walkers.nwalkers
-
-        p = xp.fabs(self.hamiltonian.a)
-        p /= p.sum()
-        b = self.hamiltonian.a / p 
-        ixs = xp.random.choice(nterms,size=nw,p=p,replace=True)
-        b = b[ixs]
-
-        self.hamiltonian.parse_samples(to_host(ixs))
-        b = self.walkers.update_walkers(self.hamiltonian,self.trial,b=b)
-        return b,ixs
-
     def propagate_walkers_bare_poisson(self, tau, rate=1.0, energy_shift=0.0):
         nterms = self.hamiltonian.nterms
         nw = self.walkers.nwalkers
@@ -566,85 +498,3 @@ class LAFQMC(AFQMCBase):
         #print('max count=',max_count,'end factor=',end_factor)
         b *= end_factor
         return b,counts
-
-    def propagate_walkers_importance(self):
-        # sample rotations 
-        nterms = self.hamiltonian.nterms
-        nw = self.walkers.nwalkers
-
-        ovlp = self.walkers.compute_ovlp_ratio(self.hamiltonian)
-        g = ovlp * self.hamiltonian.a[:,None]
-
-        gp = g.copy()
-        gp = xp.clip(gp,a_min=0.,a_max=None,out=gp)
-        bp = gp.sum(axis=0)
-        gm = g.copy()
-        gm = xp.clip(gm,a_min=None,a_max=0.,out=gm)
-        bm = -gm.sum(axis=0)
-        gsum = g.sum(axis=0)
-        assert xp.linalg.norm(bp-bm-gsum)<1e-10
-
-        ixs = xp.nonzero(bm)[0]
-        if ixs.size>0:
-            print('bm,bp=',bm[ixs],bp[ixs])
-
-        p = xp.fabs(g)
-        sign = g/p
-        b = p.sum(axis=0)
-        assert xp.linalg.norm(bp+bm-b)<1e-10
-        p = p/b[None,:] 
-
-        ixs = xp.asarray([xp.random.choice(nterms,size=1,p=p[:,i])[0] for i in range(nw)])
-        #print(ixs)
-        self.hamiltonian.parse_samples(to_host(ixs))
-        self.walkers.update_walkers(self.hamiltonian,self.trial)
-    
-        # 4.update weight
-        b *= sign[ixs,xp.arange(nw)]
-        return b,ixs
-
-    def pop_ctr(self,comm,pcontrol,pre_estimate=True):
-        if self.params.pop_control_method=='stochastic_reconfiguration':
-            if pre_estimate: 
-                self.estimators.compute_estimators(self.system, self.hamiltonian, self.trial, self.walkers)
-        log_average_weight = pcontrol.pop_control(self.walkers, comm)
-        if self.params.pop_control_method!='stochastic_reconfiguration':
-            return
-        if not pre_estimate:
-            self.estimators.compute_estimators(self.system, self.hamiltonian, self.trial, self.walkers)
-        self.estimators.post_sr(comm,self.accumulators,log_average_weight)
-
-    def estimate_energy(self,comm,block):
-        if self.params.pop_control_method=='stochastic_reconfiguration':
-            self.estimators.print_block_sr(comm,block,self.accumulators,self.max_nprod,self.max_nsum)
-        else:
-            self.estimators.compute_estimators(self.system, self.hamiltonian, self.trial, self.walkers)
-            self.estimators.print_block(comm, block, self.accumulators)
-
-    def save(self,comm,dirname='.'):
-        if dirname is None:
-            return
-        self.walkers.save(comm,dirname)
-        if self.params.pop_control_method!='stochastic_reconfiguration':
-            return
-        if comm.rank>0:
-            return
-        self.estimators.save(dirname)
-
-    def print_stats(self,comm,pcontrol):
-        if comm.rank>0:
-            return
-        ttot = self.tortho + self.tprop_update + self.tprop_barrier + self.tpopc + self.testim
-        print(f'total={ttot}, orth={self.tortho}, prop={self.tprop_update}, barrier={self.tprop_barrier}, pop ctr={self.tpopc}, estimate={self.testim}')
-        if self.params.pop_control_method!='stochastic_reconfiguration':
-            return
-        Neff = pcontrol.Neff
-        Neff = max(Neff),min(Neff)
-        pcontrol.Neff = []
-        Ndistinct = pcontrol.Ndistinct
-        Ndistinct = max(Ndistinct),min(Ndistinct)
-        pcontrol.Ndistinct = []
-        w = self.estimators.log_average_weights
-        w = max(w),min(w)
-        w = float(numpy.exp(w[0])),float(numpy.exp(w[1]))
-        print(f'wmean={w},Neff={Neff},Ndistinct={Ndistinct}')
