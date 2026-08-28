@@ -22,7 +22,7 @@ class SingleDet(TrialWavefunctionBase):
     def compute_density(self,U=None,diag=True):
         psi = self.get_psi()
         if U is not None:
-            psi = [xp.dot(U,Bi) for Bi in psi]
+            psi = [xp.dot(xp.asarray(U),Bi) for Bi in psi]
         D = [None] * 2
         for s,Bi in enumerate(psi):
             S = xp.dot(Bi.T,Bi)

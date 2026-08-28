@@ -598,7 +598,14 @@ class UHFWalkers(BaseWalkers):
         if Dab is not None:
             E2 -= xp.einsum('wp,wp->w',Dab,Dba)
         E2 *= ham.hubbard_U
-        return E1+E2,E1,E2
+        E = E1+E2
+        if ham.compute_local_magnetization is not None:
+            i,j = ham.compute_local_magnetization
+            E1 = Daa[:,i]-Dbb[:,i]
+            E2 = Daa[:,j]-Dbb[:,j]
+            E1 = E1**2
+            E2 = E2**2
+        return E,E1,E2
 
     @plum.dispatch
     def local_energy(self,ham:QCSOR,trial):
