@@ -20,7 +20,34 @@ class SingleDetGHF(SingleDet):
         nb = self.nbasis
         return [self.psi[:nb],self.psi[nb:]]
 
-    def rotate_trial(self,U):
+    def compute_density(self,s,U=None,diag=True,backend='numpy'):
+        if backend=='numpy':
+            xp_ = numpy
+        else:
+            xp_ = xp
         nb = self.nbasis
-        self.psi[:nb] = xp.dot(U.T,self.psi[:nb])
-        self.psi[nb:] = xp.dot(U.T,self.psi[nb:])
+
+        if U is None:
+            psi = self.psi
+        else:
+            psi = self.psi.copy()
+            U = xp_.asarray(U)
+            psi[:nb] = xp_.dot(U.T,psi[:nb])
+            psi[nb:] = xp_.dot(U.T,psi[nb:])
+        S = xp_.dot(psi.T,psi)
+        Sinv = xp_.linalg.inv(S)
+        D = xp_.dot(psi,Sinv)
+        if diag:
+            D = xp_.einsum('pi,pi->p',D,psi)
+            if s==0:
+                D = D[:nb]
+            else:
+                D = D[nb:]
+            print(s,D)
+        else:
+            D = xp_.dot(D,psi.T)
+            if s==0:
+                D = D[:nb,:nb]
+            else:
+                D = D[nb:,nb:]
+        return D

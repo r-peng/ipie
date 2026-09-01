@@ -19,17 +19,22 @@ class SingleDet(TrialWavefunctionBase):
     def get_psi(self):
         return self.psi 
 
-    def compute_density(self,U=None,diag=True):
-        psi = self.get_psi()
+    def compute_density(self,s,U=None,diag=True,backend='numpy'):
+        if backend=='numpy':
+            xp_ = numpy
+        else:
+            xp_ = xp
+
+        psi = self.get_psi()[s]
         if U is not None:
-            psi = [xp.dot(xp.asarray(U),Bi) for Bi in psi]
-        D = [None] * 2
-        for s,Bi in enumerate(psi):
-            S = xp.dot(Bi.T,Bi)
-            Sinv = xp.linalg.inv(S)
-            D[s] = xp.dot(xp.dot(Bi,Sinv),Bi.T)
-            if diag:
-                D[s] = xp.diag(D[s])
+            psi = xp_.dot(xp_.asarray(U).T,psi)
+        S = xp_.dot(psi.T,psi)
+        Sinv = xp_.linalg.inv(S)
+        D = xp_.dot(psi,Sinv)
+        if diag:
+            D = xp_.einsum('pi,pi->p',D,psi)
+        else:
+            D = xp_.dot(D,psi.T)
         return D
 
     def build(self,hamiltonian,conjugate=False):

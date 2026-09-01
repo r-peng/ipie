@@ -9,10 +9,11 @@ from ipie.hamiltonians.bitstring_utils import (
         get_config_from_occ,
 )
 from ipie.trial_wavefunction.lafqmc_single_det import SingleDet
+from ipie.trial_wavefunction.lafqmc_single_det_ghf import SingleDetGHF
 np.set_printoptions(suppress=True,precision=6,linewidth=100000)
 
 def get_MB_kappa(ham,ix,basis,basis_map):
-    chol_ix,spin,ps,ds = ham.get_term(ix)
+    chol_ix,spin,ps,ds,f = ham.get_term(ix)
     v = ham.chol_basis[chol_ix]
     g = np.log(1.+ds)
     kappa = [None] * 2
@@ -24,12 +25,12 @@ def get_MB_kappa(ham,ix,basis,basis_map):
         s = spin[0]
         ks = np.einsum('xr,yr,r->xy',v[:,ps],v[:,ps],g)
         kappa[s] = quadratic2MB(ks,basis,basis_map,s) 
-    return kappa
+    return kappa,f
 
 def get_MB_gf(ham,basis,basis_map):
     H = 0
     for ix,ai in enumerate(ham.a): 
-        kappa = get_MB_kappa(ham,ix,basis,basis_map)
+        kappa,f = get_MB_kappa(ham,ix,basis,basis_map)
         U = None
         for spin,k in enumerate(kappa):
             if k is None:
@@ -39,7 +40,7 @@ def get_MB_gf(ham,basis,basis_map):
                 U = Us
             else:
                 U = np.dot(U,Us)
-        H += ai*U
+        H += ai*U/f
     return H
 
 def quadratic2MB(M,basis,basis_map,spin,thresh=1e-6):
@@ -176,7 +177,7 @@ def test_hamiltonian(ham,nsite,nelecs,h1e,eri=None):
         H,basis,basis_map = hubbard2MB(h1e,ham.hubbard_U,nelecs=nelecs)
     else:
        H,basis,basis_map = chol2MB(h1e,eri=eri,symmetry='u11',nelecs=nelecs)
-    G1 = np.eye(len(basis))-H/ham.Lambda[-1]
+    G1 = np.eye(len(basis))-H/ham.denom
     G2 = get_MB_gf(ham,basis,basis_map)
     #print(G1)
     #print(G2)
@@ -191,13 +192,13 @@ def test_hamiltonian(ham,nsite,nelecs,h1e,eri=None):
     psi_det = det2MB(B,basis=basis,basis_map=basis_map,det=det)[0]
     Gpsi_det_1 = np.dot(G1,psi_det)
     Gpsi_det_2 = np.zeros(len(basis))
-    for ai,Ui in zip(ham.a,Us):
+    for ai,(Ui,f) in zip(ham.a,Us):
         UiB = B.copy()
         if Ui[0] is not None:
             UiB[:nsite] = np.dot(Ui[0],B[:nsite])
         if Ui[1] is not None:
             UiB[nsite:] = np.dot(Ui[1],B[nsite:])
-        Gpsi_det_2 += ai*det2MB(UiB,basis=basis,basis_map=basis_map,det=det)[0]
+        Gpsi_det_2 += (ai/f)*det2MB(UiB,basis=basis,basis_map=basis_map,det=det)[0]
     test_norm(Gpsi_det_1,Gpsi_det_2)
 
 if __name__=='__main__':
@@ -205,22 +206,31 @@ if __name__=='__main__':
     from ipie.utils.linalg import modified_cholesky
 
     nsite = 5 
-    nelecs = 1,1 
+    nelecs = 1,1
+    na,nb = nelecs 
+    if na>1 and nb==0:
+        decomp_type='aa_only'
+    elif na==1 and nb==1:
+        decomp_type='ab_only'
+    else:
+        decomp_type='all'
     h1e = np.random.rand(nsite,nsite)*2-1
     h1e += h1e.T
-    phi = np.random.rand(nsite,sum(nelecs))*2-1
-    trial = SingleDet(phi,nelecs,nsite)
+    #phi = np.random.rand(nsite,sum(nelecs))*2-1
+    #trial = SingleDet(phi,nelecs,nsite)
+    phi = np.random.rand(nsite*2,sum(nelecs))*2-1
+    trial = SingleDetGHF(phi,nelecs,nsite)
+    #trial = None
     
     U = 4 
     dt1 = 0.1
     dt2 = 0.05
     iprint = 1
-    for param in ['lambda','eta']:
-        print('\ncheck GF decomposition for Hubbard with...')
-        print('param=',param)
-        ham = HubbardSOR(nsite) 
-        ham.decompose_h2(U,dt2,iprint=iprint,param=param)
-        ham.decompose_h1(h1e,dt1,iprint=iprint)
+    print('\ncheck GF decomposition for Hubbard with...')
+    if decomp_type!='aa_only':
+        ham = HubbardSOR(nsite,decomp_type=decomp_type) 
+        ham.decompose_h2(U,dt2,iprint=iprint,trial=trial)
+        ham.decompose_h1(h1e,dt1,iprint=iprint,trial=trial)
         ham.parse_decomposition()
         test_hamiltonian(ham,nsite,nelecs,h1e)
 
@@ -238,26 +248,13 @@ if __name__=='__main__':
     #chol = np.zeros_like(chol)
     #eri = np.zeros_like(eri)
     
-    na,nb = nelecs 
-    if na>1 and nb==0:
-        has_aa = True
-        has_ab = False
-        has_bb = False
-    elif na==1 and nb==1:
-        has_aa = False
-        has_ab = True
-        has_bb = False
-    else:
-        has_aa = True
-        has_ab = True
-        has_bb = True
     #trial = None
     for uniform in ['coefficient','rotation']:
-        ham = QCSOR(nsite,has_aa=has_aa,has_ab=has_ab,has_bb=has_bb) 
+        ham = QCSOR(nsite,decomp_type=decomp_type) 
         ham.decompose_h2(chol,dt2,iprint=2,uniform=uniform,trial=trial)
-        ham.decompose_h1(h1e,dt1,iprint=iprint,uniform=uniform)
+        ham.decompose_h1(h1e,dt1,iprint=iprint,uniform=uniform,trial=trial)
         ham.parse_decomposition()
         test_hamiltonian(ham,nsite,nelecs,h1e,eri=eri)
         
-    print('all greens function tested')
+    print('all greens functions tested')
 

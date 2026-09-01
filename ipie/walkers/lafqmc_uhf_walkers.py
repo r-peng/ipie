@@ -258,10 +258,10 @@ class UHFWalkers(BaseWalkers):
     def compute_ovlp_ratio(self,ham):
         ovlp = xp.zeros((ham.nterms,self.nwalkers))
         self.M = dict()
-        keys = 'p','d','ix'
+        keys = 'p','d','f','ix'
         for key,dat in ham.term_dict.items():
-            p,d,ix = [dat[k] for k in keys]
-            ovlp[ix] = self.compute_M1(key,p,d)
+            p,d,f,ix = [dat[k] for k in keys]
+            ovlp[ix] = self.compute_M1(key,p,d)/f[:,None]
 
         self.E1 = xp.dot(ham.a[ham.E1_ixs],ovlp[ham.E1_ixs])
         self.E2 = xp.dot(ham.a[ham.E2_ixs],ovlp[ham.E2_ixs])
@@ -273,7 +273,7 @@ class UHFWalkers(BaseWalkers):
         self.has_E12 = False 
         for key,ixs in hamiltonian.samples.items():
             w,i = ixs['w'],ixs['i']
-            p,d,u,u2 = hamiltonian.get_batch_ud(key,i)
+            p,d,f,u,u2 = hamiltonian.get_batch_ud(key,i)
 
             uC = self.update_phi(key,w,u,d)
 
@@ -288,6 +288,7 @@ class UHFWalkers(BaseWalkers):
                    b = self.update_ovlp_2(key,w,p,d,uC,trial,b)
                else:
                    b = self.update_ovlp_1(key,w,p,d,uC,trial,b)
+               b[w] /= f 
         return b
 
     def update_phi(self,key,w,u,d):
@@ -581,10 +582,10 @@ class UHFWalkers(BaseWalkers):
     def local_energy_fast(self,ham):
         if not self.has_E12:
             self.compute_ovlp_ratio(ham)
-        Lambda1,Lambda2,Lambda = ham.Lambda
-        E1 = Lambda1 - self.E1*Lambda
-        E2 = Lambda2 - self.E2*Lambda
-        return E1+E2,E1,E2
+        E1 = ham.asum1 - self.E1*ham.denom
+        E2 = ham.asum2 - self.E2*ham.denom
+        E = ham.denom*(1.-self.E1-self.E2)
+        return E1+E2+ham.const,E1,E2
 
     @plum.dispatch
     def local_energy(self,ham:HubbardSOR,trial):
