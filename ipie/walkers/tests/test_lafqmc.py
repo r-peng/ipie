@@ -142,7 +142,7 @@ if __name__=='__main__':
     from ipie.qmc.afqmc import AFQMC
 
     nsite = 5 
-    nelecs = 2,1 
+    nelecs = 1,1 
     na,nb = nelecs 
     if na>1 and nb==0:
         decomp_type='aa_only'
@@ -176,9 +176,33 @@ if __name__=='__main__':
     phib0 = np.array(phib)
     walkers_types = 'uhf','ghf',
 
-    k = np.random.rand(nsite*2,nsite*2)
-    k -= k.T
-    phi_ghf = scipy.linalg.expm(k)[:,:sum(nelecs)]
+    def make_sector_ghf(phia, phib):
+        nbasis = phia.shape[0]
+        nup = phia.shape[1]
+        ndown = phib.shape[1]
+        psi = np.zeros((2 * nbasis, nup + ndown), dtype=phia.dtype)
+        psi[:nbasis, :nup] = phia.copy()
+        psi[nbasis:, nup:] = phib.copy()
+        return psi
+    if decomp_type=='all':
+        k = np.random.rand(nsite*2,nsite*2)
+        k -= k.T
+        phi_ghf = scipy.linalg.expm(k)[:,:sum(nelecs)]
+    else:
+        #S = np.dot(phi_ghf.T,phi_ghf)
+        #S = np.linalg.inv(S)
+        #P = np.dot(phi_ghf,np.dot(S,phi_ghf.T))
+        #print('decomp_type=',decomp_type)
+        #print('trace_a=',np.trace(P[:nsite,:nsite]))
+        #print('trace_b=',np.trace(P[nsite:,nsite:]))
+        #print('norm_ab=',np.linalg.norm(P[nsite:,:nsite]))
+        #exit()
+        if decomp_type=='aa_only':
+            phi_ghf = make_sector_ghf(phia0[0],np.zeros((nsite,0)))
+        else:
+            phi_ghf = make_sector_ghf(phia0[0],phib0[1])
+            Q, _ = np.linalg.qr(np.random.randn(sum(nelecs), sum(nelecs)))
+            phi_ghf = np.dot(phi_ghf,Q)
 
     phi_uhf = [None] * 2
     for s in (0,1):

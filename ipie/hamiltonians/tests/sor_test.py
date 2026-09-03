@@ -206,7 +206,7 @@ if __name__=='__main__':
     from ipie.utils.linalg import modified_cholesky
 
     nsite = 5 
-    nelecs = 1,1
+    nelecs = 2,1 
     na,nb = nelecs 
     if na>1 and nb==0:
         decomp_type='aa_only'

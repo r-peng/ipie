@@ -447,6 +447,7 @@ class LAFQMC(AFQMCBase):
 
         if constraint_path:
             xp.clip(b, a_min=0.0, a_max=None, out=b)  
+        #print(b)
         self.walkers.weight *= b 
         #print(f'term_label={kixs[0]},weight multiplier={b[0]},accumulated weight={self.walkers.weight[0]},ovlp={1./self.walkers.Sa[0,0,0]}')
         synchronize()

@@ -145,12 +145,12 @@ class SumOfRotationBase:
             self.term_dict[key] = {'p':p,'d':d,'ix':ixs,'f':f}
 
             if iprint>1:
-                print('key=',key)
-                print('ixs=',ixs)
-                print('a=',terms['a'])
+                #print('key=',key)
+                #print('ixs=',ixs)
+                #print('a=',terms['a'])
                 print('f=',f)
-                print('p=',p)
-                print('d=',d)
+                #print('p=',p)
+                #print('d=',d)
 
         self.E1_ixs = xp.asarray(E1_ixs)
         self.E2_ixs = xp.asarray(E2_ixs)

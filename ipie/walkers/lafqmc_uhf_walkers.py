@@ -288,7 +288,9 @@ class UHFWalkers(BaseWalkers):
                    b = self.update_ovlp_2(key,w,p,d,uC,trial,b)
                else:
                    b = self.update_ovlp_1(key,w,p,d,uC,trial,b)
-               b[w] /= f 
+               #print(b[w],f)
+               #b[w] /= f 
+               #print(b[w])
         return b
 
     def update_phi(self,key,w,u,d):
@@ -584,7 +586,6 @@ class UHFWalkers(BaseWalkers):
             self.compute_ovlp_ratio(ham)
         E1 = ham.asum1 - self.E1*ham.denom
         E2 = ham.asum2 - self.E2*ham.denom
-        E = ham.denom*(1.-self.E1-self.E2)
         return E1+E2+ham.const,E1,E2
 
     @plum.dispatch
