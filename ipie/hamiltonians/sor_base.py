@@ -156,7 +156,10 @@ class SumOfRotationBase:
         self.E2_ixs = xp.asarray(E2_ixs)
         self.a = xp.asarray(self.a)
         self.asum1 = self.a[self.E1_ixs].sum()
-        self.asum2 = self.a[self.E2_ixs].sum()
+        if self.E2_ixs.size==0:
+            self.asum2 = 0.
+        else:
+            self.asum2 = self.a[self.E2_ixs].sum()
         self.asum = self.asum1+self.asum2
         self.denom = self.asum+self.const
         self.a /= self.denom

@@ -289,7 +289,7 @@ class UHFWalkers(BaseWalkers):
                else:
                    b = self.update_ovlp_1(key,w,p,d,uC,trial,b)
                #print(b[w],f)
-               #b[w] /= f 
+               b[w] /= f 
                #print(b[w])
         return b
 

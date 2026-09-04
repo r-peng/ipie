@@ -72,6 +72,8 @@ except ImportError:  # CPU fallback for testing outside ipie
     def to_host(x):
         return np.asarray(x)
 
+def _sine_weight(t, h):
+    return t * xp.sinc(t * h / xp.pi) / xp.sinc(h / xp.pi)
 
 def _as_orbital(v, name: str):
     """Return a real length-2 orbital vector from shape (2,) or (2,1)."""
@@ -297,7 +299,7 @@ class UHFH2GivensGridLAFQMC:
         Ua = []
         Ub = []
         for ix in range(int(ham.nterms)):
-            blocks = ham.get_rotation_matrix(ix)
+            blocks,_ = ham.get_rotation_matrix(ix)
             if not isinstance(blocks, (tuple, list)) or len(blocks) != 2:
                 raise ValueError(
                     "ham.get_rotation_matrix(ix) must return [U_alpha,U_beta] for "
@@ -391,7 +393,7 @@ class UHFH2GivensGridLAFQMC:
                 out[s0:s1] += xp.einsum("a,as->s", coeff, ova * ovb, optimize=True)
 
         self.trial_GD = out
-        Lambda = self.ham.Lambda[-1]
+        Lambda = self.ham.denom
         self.local_energy = Lambda * (1.0 - self.trial_GD / self.trial_overlap)
 
     def mat_vec(
@@ -455,6 +457,10 @@ class UHFH2GivensGridLAFQMC:
 
                 lo_a, frac_a = self._target_cell_1d(theta_a)
                 lo_b, frac_b = self._target_cell_1d(theta_b)
+                wa_left  = _sine_weight(1.0 - frac_a,self.dtheta)
+                wa_right = _sine_weight(frac_a,self.dtheta) 
+                wb_left  = _sine_weight(1.0 - frac_b,self.dtheta) 
+                wb_right = _sine_weight(frac_b,self.dtheta)
 
                 if self.constraint_path:
                     new_ova = xp.einsum(
@@ -504,8 +510,11 @@ class UHFH2GivensGridLAFQMC:
                 for icorner, (ba, bb) in enumerate(corners):
                     pa = lo_a + ba
                     pb = lo_b + bb
-                    wa = frac_a if ba else (1.0 - frac_a)
-                    wb = frac_b if bb else (1.0 - frac_b)
+                    #wa = frac_a if ba else (1.0 - frac_a)
+                    #wb = frac_b if bb else (1.0 - frac_b)
+                    wa = wa_right if ba else wa_left
+                    wb = wb_right if bb else wb_left
+
                     interp = wa * wb
 
                     if self.constraint_path and self.cp_boundary == "absorbing":
@@ -627,6 +636,11 @@ class UHFH2GivensGridLAFQMC:
         lo_a, frac_a = self._target_cell_1d(theta_a)
         lo_b, frac_b = self._target_cell_1d(theta_b)
 
+        wa_left  = _sine_weight(1.0 - frac_a,self.dtheta)
+        wa_right = _sine_weight(frac_a,self.dtheta) 
+        wb_left  = _sine_weight(1.0 - frac_b,self.dtheta) 
+        wb_right = _sine_weight(frac_b,self.dtheta)
+
         psi = xp.zeros(self.Nh, dtype=self.mos_a.dtype)
         retained_weight = xp.asarray(0.0, dtype=self.mos_a.dtype)
 
@@ -638,8 +652,10 @@ class UHFH2GivensGridLAFQMC:
         for ba, bb in itertools.product((0, 1), repeat=2):
             pa = lo_a + ba
             pb = lo_b + bb
-            wa = frac_a if ba else (1.0 - frac_a)
-            wb = frac_b if bb else (1.0 - frac_b)
+            #wa = frac_a if ba else (1.0 - frac_a)
+            #wb = frac_b if bb else (1.0 - frac_b)
+            wa = wa_right if ba else wa_left
+            wb = wb_right if bb else wb_left
             interp = wa * wb
 
             if self.constraint_path and self.cp_boundary == "absorbing":
@@ -701,7 +717,7 @@ class UHFH2GivensGridLAFQMC:
         bare = weight / self.trial_overlap if self.importance else weight
         denom = xp.dot(bare, self.trial_overlap)
         num = xp.dot(bare, self.trial_GD)
-        E = self.ham.Lambda[-1] * (1.0 - num / denom)
+        E = self.ham.denom * (1.0 - num / denom)
         return E, denom
 
     def exact_G_on_many_body(self, C):
@@ -801,6 +817,7 @@ class UHFH2GivensGridLAFQMC:
         source_chunk: int = 65536,
         corner_batch: int = 4,
         normalize_mode: str = "auto",
+        fname = None,
     ):
         for istep in range(start, stop):
             Gpsi = self.mat_vec(
@@ -812,6 +829,8 @@ class UHFH2GivensGridLAFQMC:
             psi = Gpsi
             if normalize_every > 0 and (istep + 1) % normalize_every == 0:
                 psi = self.normalize(psi, mode=normalize_mode)
+                if fname is not None:
+                    np.save(fname,to_host(psi))
             if print_every > 0 and (istep + 1) % print_every == 0:
                 self.diagnostics(istep + 1, psi)
         return psi
