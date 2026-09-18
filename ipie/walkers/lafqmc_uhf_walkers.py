@@ -616,7 +616,10 @@ class UHFWalkers(BaseWalkers):
 
         SC = self.compute_SC(trial)
         E1 = self.compute_E1(trial,SC)
-        E2 = self.compute_chol(trial,SC)
+        if ham.chol is None:
+            E2 = xp.zeros_like(E1)
+        else:
+            E2 = self.compute_chol(trial,SC)
         return E1+E2,E1,E2
 
     def _measure_sign(self,hamiltonian,trial):

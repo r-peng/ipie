@@ -244,7 +244,7 @@ class UHFH2GivensGridLAFQMC:
         Ua = []
         Ub = []
         for ix in range(int(ham.nterms)):
-            blocks = ham.get_rotation_matrix(ix)
+            blocks,_ = ham.get_rotation_matrix(ix)
             if not isinstance(blocks, (tuple, list)) or len(blocks) != 2:
                 raise ValueError(
                     "ham.get_rotation_matrix(ix) must return [U_alpha,U_beta]."
@@ -332,7 +332,7 @@ class UHFH2GivensGridLAFQMC:
                 out[s0:s1] += xp.einsum("a,as->s", coeff, ova * ovb, optimize=True)
 
         self.trial_GD = out
-        Lambda = self.ham.Lambda[-1]
+        Lambda = self.ham.denom
         self.local_energy = Lambda * (1.0 - self.trial_GD / self.trial_overlap)
 
     def mat_vec(
@@ -756,6 +756,7 @@ class UHFH2GivensGridLAFQMC:
         source_chunk: int = 65536,
         corner_batch: int = 4,
         normalize_mode: str = "population",
+        fname = None,
     ):
         for istep in range(start, stop):
             psi = self.mat_vec(
@@ -766,6 +767,8 @@ class UHFH2GivensGridLAFQMC:
             )
             if normalize_every > 0 and (istep + 1) % normalize_every == 0:
                 psi = self.normalize(psi, mode=normalize_mode)
+                if fname is not None:
+                    np.save(fname,to_host(psi))
             if print_every > 0 and (istep + 1) % print_every == 0:
                 self.diagnostics(istep + 1, psi)
         return psi
