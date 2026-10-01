@@ -1,8 +1,15 @@
 import numpy as np
+import pickle
 from ipie.utils.backend import arraylib as xp
+from ipie.hamiltonians.chol_utils import build_commuting_groups
 
-def _get_coeffs(a,e,uniform):
-    ep,eq = e 
+def _get_coeffs(a,g,uniform):
+    sqrt_g = np.sqrt(np.fabs(g))
+    if g>0.:
+        ep, eq = sqrt_g, sqrt_g 
+    else:
+        ep, eq = sqrt_g, -sqrt_g 
+
     if uniform=='coefficient':
         ap,aq = a,a
     else:
@@ -90,20 +97,19 @@ class SumOfRotationBase:
         f = [1.+d[i]*rho[i] for i in (0,1)]
         self.add_term(chol_ix,s,a,f[0]*f[1],p,d)
 
-    def _add_2body_hubbard(self,chol_ix,s,a,pq,e,rho,uniform='coefficient'):
-        coeff,delta_p,delta_q = _get_coeffs(a,e,uniform)
+    def _add_2body_hubbard(self,chol_ix,s,a,g,pq,rho,uniform='coefficient'):
+        coeff,delta_p,delta_q = _get_coeffs(a,g,uniform)
         coeff /= 2.
         self.add_2body_term(chol_ix,s,coeff,pq,[delta_p,delta_q],rho)
         self.add_2body_term(chol_ix,s,coeff,pq,[-delta_p,-delta_q],rho)
 
-    def _compute_v0_hubbard(self,ek,rho):
+    def _compute_v0_hubbard(self,gpp,rho):
         v0 = np.zeros((2,self.nbasis))
         if self.decomp_type=='aa_only':
             return v0
-        eksq = ek**2
         for s in (0,1):
-            v0[s] = eksq*rho[:,1-s]
-        self.const -= (eksq*rho[:,0]*rho[:,1]).sum()
+            v0[s] = gpp*rho[:,1-s]
+        self.const -= (gpp*rho[:,0]*rho[:,1]).sum()
         return v0
 
     def parse_decomposition(self,iprint=0):
@@ -244,7 +250,6 @@ class HubbardSOR(SumOfRotationBase):
         chol_ix = len(self.chol_basis)-1
 
         a = 1./np.sqrt(dt)
-        e = np.sqrt(U),np.sqrt(U)
         if iprint>0:
             print('Hubbard 2-body decomposition: ')
             print('coefficient =',a)
@@ -253,11 +258,11 @@ class HubbardSOR(SumOfRotationBase):
         if trial is not None:
             rho[:,0] = trial.compute_density(0)
             rho[:,1] = trial.compute_density(1)
-        v0 = self._compute_v0_hubbard(e[0],rho)
+        v0 = self._compute_v0_hubbard(U,rho)
         self.v0[0] = np.diag(v0[0])
         self.v0[1] = np.diag(v0[1])
         for i in range(self.nbasis): 
-            self._add_2body_hubbard(chol_ix,(0,1),a,[i,i],e,rho[i])
+            self._add_2body_hubbard(chol_ix,(0,1),a,U,[i,i],rho[i])
 
 class QCSOR(SumOfRotationBase):
 
@@ -265,60 +270,68 @@ class QCSOR(SumOfRotationBase):
         assert uniform in ['coefficient','rotation']
         if iprint>0:
             print('2-body decomposition: ')
+        if isinstance(chol,str):
+            with open(chol+".pkl", "rb") as f:
+                data = pickle.load(f)
+            grouped = data["grouped"]
+            C = data["commutator_matrix"]
+            chol = data['chol']
+        else:
+            grouped, C = build_commuting_groups(chol,comm_tol=1e-10,basis_tol=1e-10)
 
         a = 1./np.sqrt(dt)
-        for i,L in enumerate(chol):
-            ek,vk = np.linalg.eigh(L) 
-            self.chol_basis.append(vk)
+        for i,result in enumerate(grouped):
+            U = result['U']
+            K = result['K']
+
+            self.chol_basis.append(U)
             chol_ix = len(self.chol_basis)-1
             rho = np.zeros((self.nbasis,2))
             if trial is not None:
-                rho[:,0] = trial.compute_density(0,U=vk)
-                rho[:,1] = trial.compute_density(1,U=vk)
+                rho[:,0] = trial.compute_density(0,U=U)
+                rho[:,1] = trial.compute_density(1,U=U)
                 if iprint>1:
                     print('density up=',rho[:,0])
                     print('density down=',rho[:,1])
             if iprint>0:
                 print('nchol idx=',chol_ix)
-                print('bands=',ek)
 
-            v0 = self._compute_v0_hubbard(ek,rho)
-            for p,ep in enumerate(ek):
-                if np.fabs(ep)<self.thresh:
-                    continue
+            v0 = self._compute_v0_hubbard(np.diag(K),rho)
+            for p in range(self.nbasis):
                 if self.decomp_type!='aa_only':
-                    self._add_2body_hubbard(chol_ix,(0,1),a,[p,p],(ep,ep),rho[p])
+                    Kpp = K[p,p]
+                    if np.fabs(Kpp)>self.thresh:
+                        self._add_2body_hubbard(chol_ix,(0,1),a,Kpp,[p,p],rho[p])
                 for q in range(p+1,self.nbasis):
-                    eq = ek[q]
-                    if np.fabs(eq)<self.thresh:
+                    Kpq = K[p,q]
+                    if np.fabs(Kpq)<self.thresh:
                         continue
-                    epq = ep*eq
                     if self.decomp_type=='aa_only':
-                        self._add_2body_hubbard(chol_ix,(0,0),a,[p,q],[ep,eq],[rho[p,0],rho[q,0]])
+                        self._add_2body_hubbard(chol_ix,(0,0),a,Kpq,[p,q],[rho[p,0],rho[q,0]])
 
-                        v0[0,p] += epq*rho[q,0]
-                        v0[0,q] += epq*rho[p,0]
-                        self.const -= epq*rho[p,0]*rho[q,0]
+                        v0[0,p] += Kpq*rho[q,0]
+                        v0[0,q] += Kpq*rho[p,0]
+                        self.const -= Kpq*rho[p,0]*rho[q,0]
                     elif self.decomp_type=='ab_only':
-                        self._add_2body_hubbard(chol_ix,(0,1),a,[p,q],[ep,eq],[rho[p,0],rho[q,1]])
-                        self._add_2body_hubbard(chol_ix,(0,1),a,[q,p],[eq,ep],[rho[q,0],rho[p,1]])
+                        self._add_2body_hubbard(chol_ix,(0,1),a,Kpq,[p,q],[rho[p,0],rho[q,1]])
+                        self._add_2body_hubbard(chol_ix,(0,1),a,Kpq,[q,p],[rho[q,0],rho[p,1]])
 
-                        v0[0,p] += epq*rho[q,1]
-                        v0[1,p] += epq*rho[q,0]
-                        v0[0,q] += epq*rho[p,1]
-                        v0[1,q] += epq*rho[p,0]
-                        self.const -= epq*(rho[p,0]*rho[q,1]+rho[p,1]*rho[q,0])
+                        v0[0,p] += Kpq*rho[q,1]
+                        v0[1,p] += Kpq*rho[q,0]
+                        v0[0,q] += Kpq*rho[p,1]
+                        v0[1,q] += Kpq*rho[p,0]
+                        self.const -= Kpq*(rho[p,0]*rho[q,1]+rho[p,1]*rho[q,0])
                     else:
-                        coeff,delta_p,delta_q = _get_coeffs(a,[ep,eq],uniform)
+                        coeff,delta_p,delta_q = _get_coeffs(a,Kpq,uniform)
                         self.add_2body_term(chol_ix,(0,0),coeff,[p,q],[delta_p,delta_q],[rho[p,0],rho[q,0]])
                         self.add_2body_term(chol_ix,(0,1),coeff,[p,q],[-delta_p,-delta_q],[rho[p,0],rho[q,1]])
                         self.add_2body_term(chol_ix,(0,1),coeff,[q,p],[-delta_q,-delta_p],[rho[q,0],rho[p,1]])
                         self.add_2body_term(chol_ix,(1,1),coeff,[p,q],[delta_p,delta_q],[rho[p,1],rho[q,1]])
 
-                        v0[:,p] += epq*rho[q].sum()
-                        v0[:,q] += epq*rho[p].sum()
-                        self.const -= epq*np.outer(rho[p],rho[q]).sum()
-            self.v0 += np.einsum('sp,xp,yp->sxy',v0,vk,vk) 
+                        v0[:,p] += Kpq*rho[q].sum()
+                        v0[:,q] += Kpq*rho[p].sum()
+                        self.const -= Kpq*np.outer(rho[p],rho[q]).sum()
+            self.v0 += np.einsum('sp,xp,yp->sxy',v0,U,U) 
 
         self.chol = xp.asarray(chol)
         self.run_2body_first = True

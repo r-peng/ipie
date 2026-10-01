@@ -54,7 +54,7 @@ to ghost bins is discarded rather than wrapped across the trial node.
 Thus the two modes are deliberately:
 
     constraint_path=False : signed walkers + projective wrapping
-    constraint_path=True  : positive walkers + branch rejection + absorbing node
+    constraint_path=True  : positive walkers + branch rejection + projective wrapping 
 
 There is no ``deposition='wavefunction'`` option anywhere in this file.
 """
@@ -356,9 +356,11 @@ class UHFH2GivensGridLAFQMC:
 
         CP mode
         -------
-        Keep only gbar > cp_tol.  With nonnegative input weights all output
-        weights remain nonnegative.  Ghost interpolation bins are absorbed.
         """
+# CP is imposed entirely through gbar > cp_tol.
+# After an accepted branch is canonicalized, ghost interpolation
+# bins are wrapped projectively.  No sign is applied to the
+# importance-sampled weight f=<T|D>c.
         if self.ham is None:
             raise RuntimeError("Call build() before mat_vec().")
 
@@ -456,27 +458,29 @@ class UHFH2GivensGridLAFQMC:
                     wb = frac_b if bb else (1.0 - frac_b)
                     interp = wa * wb
 
-                    if self.constraint_path:
-                        # Absorbing CP node: discard any ghost-bin interpolation
-                        # weight.  No negative walker weights are generated.
-                        valid = (
-                            (pa >= 0) & (pa < self.Ng)
-                            & (pb >= 0) & (pb < self.Ng)
-                        )
-                        pa_safe = xp.clip(pa, 0, self.Ng - 1)
-                        pb_safe = xp.clip(pb, 0, self.Ng - 1)
-                        dest = self.flatten_idx(pa_safe, pb_safe)
-                        vals = xp.where(
-                            valid,
-                            base * interp,
-                            xp.zeros((), dtype=psi.dtype),
-                        )
-                    else:
-                        # Free walkers live on the projective determinant manifold.
-                        # Wrap ghost bins, but DO NOT multiply by a projective sign:
-                        # f=<T|D>c is invariant under D -> -D.
-                        dest = self._wrap_projective_boundary(pa, pb)
-                        vals = base * interp
+                    #if self.constraint_path:
+                    #    # Absorbing CP node: discard any ghost-bin interpolation
+                    #    # weight.  No negative walker weights are generated.
+                    #    valid = (
+                    #        (pa >= 0) & (pa < self.Ng)
+                    #        & (pb >= 0) & (pb < self.Ng)
+                    #    )
+                    #    pa_safe = xp.clip(pa, 0, self.Ng - 1)
+                    #    pb_safe = xp.clip(pb, 0, self.Ng - 1)
+                    #    dest = self.flatten_idx(pa_safe, pb_safe)
+                    #    vals = xp.where(
+                    #        valid,
+                    #        base * interp,
+                    #        xp.zeros((), dtype=psi.dtype),
+                    #    )
+                    #else:
+                    #    # Free walkers live on the projective determinant manifold.
+                    #    # Wrap ghost bins, but DO NOT multiply by a projective sign:
+                    #    # f=<T|D>c is invariant under D -> -D.
+                    #    dest = self._wrap_projective_boundary(pa, pb)
+                    #    vals = base * interp
+                    dest = self._wrap_projective_boundary(pa, pb)
+                    vals = base * interp
 
                     dest_batch.append(dest.ravel())
                     vals_batch.append(vals.ravel())
@@ -596,18 +600,20 @@ class UHFH2GivensGridLAFQMC:
             wb = frac_b if bb else (1.0 - frac_b)
             interp = wa * wb
 
-            if self.constraint_path:
-                valid = (
-                    (pa >= 0) & (pa < self.Ng)
-                    & (pb >= 0) & (pb < self.Ng)
-                )
-                if not bool(to_host(valid)):
-                    continue
-                dest = self.flatten_idx(pa, pb)
-                val = base * interp
-            else:
-                dest = self._wrap_projective_boundary(pa, pb)
-                val = base * interp
+            #if self.constraint_path:
+            #    valid = (
+            #        (pa >= 0) & (pa < self.Ng)
+            #        & (pb >= 0) & (pb < self.Ng)
+            #    )
+            #    if not bool(to_host(valid)):
+            #        continue
+            #    dest = self.flatten_idx(pa, pb)
+            #    val = base * interp
+            #else:
+            #    dest = self._wrap_projective_boundary(pa, pb)
+            #    val = base * interp
+            dest = self._wrap_projective_boundary(pa, pb)
+            val = base * interp
 
             psi[dest] += val
             retained += interp
