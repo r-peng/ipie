@@ -118,8 +118,7 @@ def common_eigenbasis(chol,group,seed=7,ntry=10):
     residual, U, eps = best
     return U, eps, residual
 
-def build_commuting_groups(chol,comm_tol=1e-10,basis_tol=1e-10,seed=7,fname=None):
-    print('buiding commuting groups...')
+def build_commuting_groups(chol,comm_tol=1e-10,basis_tol=1e-10,seed=7):
     groups, C = group_commuting_cholesky(chol,tol=comm_tol)
     result = []
     for ig, group in enumerate(groups):
@@ -137,25 +136,22 @@ def build_commuting_groups(chol,comm_tol=1e-10,basis_tol=1e-10,seed=7,fname=None
                 f"residual {residual:.3e}"
             )
 
-        K = eps.T @ eps
+        W = eps.T @ eps
         print('group=',group)
         print('eps=',eps)
         print('res=',residual)
-        print('K:')
+        print('X:')
         print(K)
-        print('U:')
+        print('X:')
         print(U)
 
         result.append({
             'indices': group,
-            'U': U,
+            'X': U,
             'eps': eps,
-            'K': K,
+            'W': W,
             'residual': residual,
+            'isometry':True,
         })
-
-    if fname is None:
-        return result, C
-    with open(fname+".pkl", "wb") as f:
-        pickle.dump({"grouped": result,"commutator_matrix": C, 'chol':chol},f,protocol=pickle.HIGHEST_PROTOCOL)
+    return result, C
 

@@ -19,15 +19,15 @@ class SingleDet(TrialWavefunctionBase):
     def get_psi(self):
         return self.psi 
 
-    def compute_density(self,s,U=None,diag=True,backend='numpy'):
+    def compute_density(self,s,X=None,diag=True,backend='numpy'):
         if backend=='numpy':
             xp_ = numpy
         else:
             xp_ = xp
 
         psi = self.get_psi()[s]
-        if U is not None:
-            psi = xp_.dot(xp_.asarray(U).T,psi)
+        if X is not None:
+            psi = xp_.dot(xp_.asarray(X).T,psi)
         S = xp_.dot(psi.T,psi)
         Sinv = xp_.linalg.inv(S)
         D = xp_.dot(psi,Sinv)
@@ -39,13 +39,13 @@ class SingleDet(TrialWavefunctionBase):
 
     def build(self,hamiltonian,conjugate=False):
         psi = self.get_psi()
-        U = hamiltonian.chol_basis
-        self.UB = [xp.einsum('dxp,xi->dpi',U,Bi) for Bi in psi]
-        if not conjugate:
-            return
-        self.hB = [xp.einsum('xy,yi->xi',hamiltonian.h1e,Bi) for Bi in psi]
-        if hamiltonian.chol is not None:
-            self.LB = [xp.einsum('dxy,yi->dxi',hamiltonian.chol,Bi) for Bi in psi]
+        self.BX = dict()
+        for key,sg in hamiltonian.size_groups.items():
+            self.BX[key] = [xp.einsum('xi,dxp,xi->dip',Bi,sg.basis) for Bi in psi]
+
+    def get_Bv(self,size_key,bix,s,p):
+        Bv = trial.BX[size_key][s][bix][:,p] 
+        return Bv.transpose(1,0,2)
 
     def calc_force_bias(self, hamiltonian, walkers, mpi_handler):
         pass

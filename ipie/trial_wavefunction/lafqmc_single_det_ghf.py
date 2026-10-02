@@ -20,20 +20,20 @@ class SingleDetGHF(SingleDet):
         nb = self.nbasis
         return [self.psi[:nb],self.psi[nb:]]
 
-    def compute_density(self,s,U=None,diag=True,backend='numpy'):
+    def compute_density(self,s,X=None,diag=True,backend='numpy'):
         if backend=='numpy':
             xp_ = numpy
         else:
             xp_ = xp
         nb = self.nbasis
 
-        if U is None:
+        if X is None:
             psi = self.psi
         else:
             psi = self.psi.copy()
-            U = xp_.asarray(U)
-            psi[:nb] = xp_.dot(U.T,psi[:nb])
-            psi[nb:] = xp_.dot(U.T,psi[nb:])
+            X = xp_.asarray(U)
+            psi[:nb] = xp_.dot(X.T,psi[:nb])
+            psi[nb:] = xp_.dot(X.T,psi[nb:])
         S = xp_.dot(psi.T,psi)
         Sinv = xp_.linalg.inv(S)
         D = xp_.dot(psi,Sinv)

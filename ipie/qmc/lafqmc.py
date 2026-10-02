@@ -243,7 +243,7 @@ class LAFQMC(AFQMCBase):
         discard_weights_aftereq=False,
         additional_estimators: Optional[Dict[str, EstimatorBase]] = None,
         constraint_path=True,
-        importance_sample=True,
+        #importance_sample=True,
         eps_sq=None,
         max_nprod=20,
         max_nsum=500,
@@ -311,8 +311,8 @@ class LAFQMC(AFQMCBase):
         start = time.time()
         iprint = 1 if comm.rank==0 else 0
         self.walkers.reortho(None)
-        self.trial.build(self.hamiltonian,conjugate=(not importance_sample))
-        self.walkers.build(self.hamiltonian,self.trial,importance=importance_sample)
+        self.trial.build(self.hamiltonian)
+        self.walkers.build(self.trial)
         if comm.rank==0:
             print('preprocess time=',time.time()-start)
 
@@ -338,7 +338,7 @@ class LAFQMC(AFQMCBase):
                     self.tortho += time.time() - start
 
             start = time.time()
-            self.propagate_walkers(constraint_path=constraint_path,importance_sample=importance_sample)
+            self.propagate_walkers(constraint_path=constraint_path)
             self.tprop_update += time.time() - start 
 
             #start_clip = time.time()
@@ -428,11 +428,8 @@ class LAFQMC(AFQMCBase):
             #synchronize()
             #self.tstep += time.time() - start_step
 
-    def propagate_walkers(self, constraint_path=True, importance_sample=True):
-        if importance_sample:
-            b,ixs = self.propagate_walkers_importance()
-        else:
-            b,ixs = self.propagate_walkers_bare()
+    def propagate_walkers(self, constraint_path=True):
+        b,ixs = self.propagate_walkers_bare()
         synchronize()
 
         #bminus = xp.nonzero(b<0.)[0] 
