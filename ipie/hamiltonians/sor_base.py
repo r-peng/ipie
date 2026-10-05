@@ -48,7 +48,7 @@ class SizeGroup:
         self.integrals.append(W)
         assert tag in self._integral_tags
         self.integral_tags.append(tag)
-        S = None if isometry else np.dot(X.T,X)
+        S = None if isometry else np.dot(X.conj().T,X)
         self.overlaps.append(S)
 
     def get_basis_index(self):
@@ -105,7 +105,7 @@ class SizeGroup:
         self.add_2body_term(bix,s,coeff,pq,[-delta_p,-delta_q],rho)
 
     def basis2cupy(self):
-        self.num_basis = self.basis.shape[0]
+        self.num_basis = len(self.basis)
         assert len(self.integrals)==self.num_basis
         assert len(self.overlaps)==self.num_basis
 
@@ -118,7 +118,7 @@ class SizeGroup:
         Wdiag = W if len(W.shape)==1 else np.diag(W)
         v0,const = _compute_v0_hubbard(Wdiag,rho)
         a = 1./np.sqrt(dt)
-        for i,Wi in enumerate(W): 
+        for i,Wi in enumerate(Wdiag):
             if np.fabs(Wi)<thresh:
                 continue
             self.add_2body_hubbard(bix,(0,1),a,Wi,[i,i],rho[i])
@@ -221,9 +221,9 @@ class SumOfRotationBase:
 
         if self.nbasis not in self.size_groups:
             self.size_groups[self.nbasis] = SizeGroup()
-        sg = self.size_group[self.nbasis]
+        sg = self.size_groups[self.nbasis]
 
-        if np.linalg.norms(self.v0[0]-self.v0[1])<self.thresh:
+        if np.linalg.norm(self.v0[0]-self.v0[1])<self.thresh:
             ek,vk = np.linalg.eigh(h1+self.v0[0]) 
             if iprint>0:
                 print(f'bands for both spin:',ek)
@@ -270,7 +270,8 @@ class SumOfRotationBase:
                 start = len(self.a)
                 stop = start + nterms 
 
-                self.a += terms.pop('a')
+                a = terms['a']
+                self.a += a
                 self.ix2key += [(size_key,term_key,i) for i in range(nterms)]
                 ixs = list(range(start,stop))
                 if len(spin)==1:
@@ -280,14 +281,14 @@ class SumOfRotationBase:
                 ixs = xp.asarray(ixs) 
                 p = xp.asarray(terms['p'])
                 d = xp.asarray(terms['d'])
-                sg.term_info[key] = {'p':p,'d':d,'ix':ixs}
+                sg.term_info[term_key] = {'p':p,'d':d,'ix':ixs}
                 # at this point not sure what saved ixs is for 
                 # might not need if we never compute all overlap ratios
 
                 if iprint>1:
-                    print('key=',key)
+                    print('key=',term_key)
                     print('ixs=',ixs)
-                    print('a=',terms['a'])
+                    print('a=',a)
                     print('p=',p)
                     print('d=',d)
             self.size_groups[size_key] = sg
@@ -339,39 +340,44 @@ class SumOfRotationBase:
 
         bix,spin = term_key
         v = sg.basis[bix][:,p]
-        S = sg.overlap[bix]
-        xx = None if S is None else S[:,p][:,:,p]
+        S = sg.overlaps[bix]
         if spin in [(0,0),(1,1)]:
-            d_ = xp.zeros_like(M)
+            d_ = xp.zeros((d.shape[0],2,2),dtype=d.dtype)
             d_[:,0,1] = d[:,1]
             d_[:,1,0] = d[:,0]
-            if xx is not None:
-                d_[:,1,1] = d[:,0]*d[:,1]*xx[:,0,1]
+            if S is not None:
+                d_[:,1,1] = d[:,0]*d[:,1]*S[p[:,0],p[:,1]]
         else:
             d_ = d
         return p,d_,v.transpose(1,0,2)
 
     def get_term(self,ix):
-        key,i = self.ix2key[ix]
-        chol_ix,spin = key
-        dat = self.term_dict[key]
+        size_key,term_key,i = self.ix2key[ix]
+        sg = self.size_groups[size_key]
+        dat = sg.term_info[term_key]
         p,d = dat['p'][i],dat['d'][i]
-        return chol_ix,spin,p,d
+        return size_key,term_key,p,d
 
     def get_rotation_matrix(self,ix):
-        chol_ix,spin,ps,ds = self.get_term(ix)
-        v = self.chol_basis[chol_ix]
+        size_key,term_key,ps,ds = self.get_term(ix)
+        bix,spin = term_key
+        sg = self.size_groups[size_key]
+        v = sg.basis[bix]
         U = [None] * 2
+
+        def rank1_matrix(p,d):
+            vp = v[:,p]
+            return xp.eye(v.shape[0]) + d*xp.outer(vp,vp.conj())
+
         if spin==(0,1):
             for s,p in enumerate(ps):
-                diag = xp.ones(v.shape[0])
-                diag[p] += ds[s]
-                U[s] = xp.einsum('xp,yp,p->xy',v,v,diag)
+                U[s] = rank1_matrix(p,ds[s])
+        elif len(spin)==1:
+            s = spin[0]
+            U[s] = rank1_matrix(ps[0],ds[0])
         else:
             s = spin[0]
-            diag = xp.ones(v.shape[0])
-            diag[ps] += ds
-            U[s] = xp.einsum('xp,yp,p->xy',v,v,diag)
+            U[s] = xp.dot(rank1_matrix(ps[0],ds[0]),rank1_matrix(ps[1],ds[1]))
         return U
 
 class HubbardSOR(SumOfRotationBase):
@@ -383,11 +389,12 @@ class HubbardSOR(SumOfRotationBase):
 
         if self.nbasis not in self.size_groups:
             self.size_groups[self.nbasis] = SizeGroup()
-        sg = self.size_group[self.nbasis]
+        sg = self.size_groups[self.nbasis]
         sg.add_basis(np.eye(self.nbasis),np.ones(self.nbasis)*U,'hubbard')
         bix = sg.get_basis_index()
 
         if iprint>0:
+            a = 1./np.sqrt(dt)
             print('Hubbard 2-body decomposition: ')
             print('coefficient =',a)
             print('rotation =',np.sqrt(U*dt))
@@ -411,31 +418,43 @@ class QCSOR(SumOfRotationBase):
         M = eri.reshape((self.nbasis**2, self.nbasis**2))
         if cmax is None:
             cmax = self.nbasis**2
-        chol = modified_cholesky(M, cmax=cmax).reshape(-1, self.basis, self.nbasis)
+        chol = modified_cholesky(M, cmax=cmax).reshape(-1, self.nbasis, self.nbasis)
         print('buiding commuting groups...')
-        result,C = build_commuting_groups(chol,comm_tol=comm_tol,basis_tol=basis_tol,fname=fname)
-    if fname is None:
-        return result
-    with open(fname+".pkl", "wb") as f:
-        pickle.dump({"grouped": result,"commutator_matrix": C, 'chol':chol},f,protocol=pickle.HIGHEST_PROTOCOL)
+        result,C = build_commuting_groups(chol,comm_tol=comm_tol,basis_tol=basis_tol)
+        if fname is None:
+            return result
+        with open(fname+".pkl", "wb") as f:
+            pickle.dump({"grouped": result,"commutator_matrix": C, 'chol':chol},f,protocol=pickle.HIGHEST_PROTOCOL)
 
     def decompose_h2(self,fname,dt,iprint=0,uniform='coefficient',trial=None):
         assert uniform in ['coefficient','rotation']
         if iprint>0:
             print('2-body decomposition: ')
-        with open(fname+".pkl", "rb") as f:
-            data = pickle.load(f)
-        grouped = data["grouped"]
+        if isinstance(fname,str):
+            with open(fname+".pkl", "rb") as f:
+                data = pickle.load(f)
+            grouped = data["grouped"]
+        elif isinstance(fname,dict):
+            grouped = fname["grouped"] if "grouped" in fname else [fname]
+        else:
+            grouped = fname
+            if isinstance(grouped,np.ndarray):
+                assert grouped.ndim==3
+                grouped_ = []
+                for L in grouped:
+                    eps,X = np.linalg.eigh(L)
+                    grouped_.append({"X":X,"W":np.outer(eps,eps),"isometry":True})
+                grouped = grouped_
 
         a = 1./np.sqrt(dt)
         for i,result in enumerate(grouped):
             X = result['X']
             W = result['W']
-            isometry = result['isometry']
+            isometry = result.get('isometry',False)
             nbasis = X.shape[1]
             if nbasis not in self.size_groups:
                 self.size_groups[nbasis] = SizeGroup()
-            sg = self.size_group[nbasis]
+            sg = self.size_groups[nbasis]
             sg.add_basis(X,W,'thc',isometry=isometry)
             bix = sg.get_basis_index()
             if iprint>0:
@@ -444,7 +463,7 @@ class QCSOR(SumOfRotationBase):
             v0 = .5*np.diag(W)
             if not isometry:
                 v0 *= np.diag(sg.overlaps[-1])
-            v0 = v0[None,:]
+            v0 = np.tile(v0[None,:],(2,1))
 
             rho = np.zeros((nbasis,2))
             if trial is not None:
@@ -468,5 +487,5 @@ class QCSOR(SumOfRotationBase):
             v0 += v0_
             self.const += const
 
-            self.v0 += np.einsum('sp,xp,yp->sxy',v0,X,X) 
+            self.v0 += np.einsum('sp,xp,yp->sxy',v0,X,X.conj()) 
         self.run_2body_first = True

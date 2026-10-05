@@ -3,32 +3,22 @@ import scipy,itertools,plum
 from ipie.walkers.lafqmc_uhf_walkers import UHFWalkers 
 from ipie.walkers.lafqmc_ghf_walkers import GHFWalkers 
 
-importance_sample = True 
-
 def get_data(walkers):
     data = [walkers.phi.copy()]
-    if importance_sample:
-        data.append(walkers.SCU.copy())
-        data.append(walkers.UDU.copy())
+    if 'S' in walkers.buff_names:
+        data.append(walkers.S.copy())
     else:
-        if 'S' in walkers.buff_names:
-            data.append(walkers.S.copy())
-        else:
-            data.append(walkers.Sa.copy())
-            data.append(walkers.Sb.copy())
+        data.append(walkers.Sa.copy())
+        data.append(walkers.Sb.copy())
     return data
 
 def set_data(walkers,data):
     walkers.phi = data[0].copy()
-    if importance_sample:
-        walkers.SCU = data[1].copy()
-        walkers.UDU = data[2].copy()
+    if len(data)==2:
+        walkers.S = data[1]
     else:
-        if len(data)==2:
-            walkers.S = data[1]
-        else:
-            walkers.Sa = data[1]
-            walkers.Sb = data[2]
+        walkers.Sa = data[1]
+        walkers.Sb = data[2]
 
 def compute_scalar_ovlp(walkers,trial):
     S = walkers.compute_S(trial) 
@@ -53,7 +43,7 @@ def compute_ovlp_ratio_single(ham,ix,walkers,trial):
 def _update_walkers_single(ham,ix,walkers:UHFWalkers):
     nu,nd = walkers.nup,walkers.ndown
     phi = [walkers.phi[:,:,:nu],walkers.phi[:,:,nu:]]
-    Us,f = ham.get_rotation_matrix(ix)
+    Us = ham.get_rotation_matrix(ix)
     for s in (0,1):
         if phi[s] is None:
             continue
@@ -62,24 +52,24 @@ def _update_walkers_single(ham,ix,walkers:UHFWalkers):
         phi[s] = np.einsum('xy,wyi->wxi',Us[s],phi[s])
     walkers.phi[:,:,:nu] = phi[0]
     walkers.phi[:,:,nu:] = phi[1]
-    return f
+    return 1.
 
 @plum.dispatch
 def _update_walkers_single(ham,ix,walkers:GHFWalkers):
     nb = walkers.nbasis
-    Us,f = ham.get_rotation_matrix(ix)
+    Us = ham.get_rotation_matrix(ix)
     if Us[0] is not None:
         walkers.phi[:,:nb] = np.einsum('xy,wyi->wxi',Us[0],walkers.phi[:,:nb])
     if Us[1] is not None:
         walkers.phi[:,nb:] = np.einsum('xy,wyi->wxi',Us[1],walkers.phi[:,nb:])
-    return f
+    return 1.
 
 def update_walkers_slow(ham,ixs,walkers,trial):
     old_data = get_data(walkers)
     denom = compute_scalar_ovlp(walkers,trial)
 
     f = _update_walkers_slow(ham,ixs,walkers)
-    walkers.build(ham,trial,importance=importance_sample)
+    walkers.build(ham,trial)
     num = compute_scalar_ovlp(walkers,trial)
     new_data = get_data(walkers)
 
@@ -90,9 +80,9 @@ def update_walkers_slow(ham,ixs,walkers,trial):
 def _update_walkers_slow(ham,ixs,walkers:UHFWalkers):
     nu,nd = walkers.nup,walkers.ndown
     phi = [walkers.phi[:,:,:nu],walkers.phi[:,:,nu:]]
-    f = np.zeros(walkers.nwalkers)
+    f = np.ones(walkers.nwalkers)
     for w,ix in enumerate(ixs):
-        Us,f[w] = ham.get_rotation_matrix(ix)
+        Us = ham.get_rotation_matrix(ix)
         for s,Ui in enumerate(Us):
             if phi[s] is None:
                 continue
@@ -106,9 +96,9 @@ def _update_walkers_slow(ham,ixs,walkers:UHFWalkers):
 @plum.dispatch
 def _update_walkers_slow(ham,ixs,walkers:GHFWalkers):
     nb = walkers.nbasis
-    f = np.zeros(walkers.nwalkers)
+    f = np.ones(walkers.nwalkers)
     for w,ix in enumerate(ixs):
-        Us,f[w] = ham.get_rotation_matrix(ix)
+        Us = ham.get_rotation_matrix(ix)
         if Us[0] is not None:
             walkers.phi[w,:nb] = np.dot(Us[0],walkers.phi[w,:nb])
         if Us[1] is not None:
@@ -122,12 +112,10 @@ def test_norm(D1,D2,thresh=1e-10):
     dnorm = np.linalg.norm(D1-D2) 
     if norm<thresh:
         if dnorm>thresh:
-            print(dnorm)
-            exit()
+            raise AssertionError(f"norm mismatch: {dnorm}")
     else:
         if dnorm/norm>thresh:
-            print(dnorm,norm)
-            exit()
+            raise AssertionError(f"relative norm mismatch: {dnorm/norm} ({dnorm} / {norm})")
 
 if __name__=='__main__':
     from ipie.hamiltonians.sor_base import HubbardSOR,QCSOR
@@ -219,7 +207,7 @@ if __name__=='__main__':
         print(f'walkers_type={walkers_type},trial_type={trial_type}')
         if walkers_type=='uhf':
             walkers = UHFWalkers(initial_walker,nelecs[0],nelecs[1],nsite,nwalker,mpi_handler)
-            walkers.weights = np.random.rand(nwalker)
+            walkers.weight = np.random.rand(nwalker)
             walkers.phi = np.concatenate([phia0,phib],axis=2)
 
             walkers_ = UHFWalkers_(initial_walker,nelecs[0],nelecs[1],nsite,nwalker,mpi_handler)
@@ -227,12 +215,12 @@ if __name__=='__main__':
             walkers_.phib = phib.copy()
         else:
             walkers = GHFWalkers(initial_walker,nelecs[0],nelecs[1],nsite,nwalker,mpi_handler)
-            walkers.weights = np.random.rand(nwalker)
+            walkers.weight = np.random.rand(nwalker)
             walkers.phi = phi0.copy() 
 
             walkers_ = GHFWalkers_(initial_walker,nelecs[0],nelecs[1],nsite,nwalker,mpi_handler)
             walkers_.phi = phi0.copy() 
-        walkers_.weights = walkers.weight.copy()
+        walkers_.weight = walkers.weight.copy()
         
         if trial_type=='uhf':
             trial = SingleDet(phi_uhf,nelecs,nsite)
@@ -264,6 +252,7 @@ if __name__=='__main__':
         chol += chol.transpose(0,2,1)
         chol /= 2
         eri = np.einsum('npr,nqs->prqs',chol,chol) 
+        h1e_eff = h1e - .5*np.einsum('prrs->ps',eri)
         cmax = nsite**2
         M = eri.reshape((nsite**2,)*2)
         print('eri symmetry=',np.linalg.norm(M-M.T))
@@ -271,9 +260,9 @@ if __name__=='__main__':
         chol = chol.reshape(chol.shape[0],nsite,nsite)
         hams[1] = QCSOR(nsite,decomp_type=decomp_type) 
         hams[1].decompose_h2(chol,dt,iprint=iprint,trial=trial)
-        hams[1].decompose_h1(h1e,dt,iprint=iprint,trial=trial)
+        hams[1].decompose_h1(h1e_eff,dt,iprint=iprint,trial=trial)
         hams[1].parse_decomposition()
-        chol = chol.reshape(nchol,nsite**2)
+        chol = chol.reshape(chol.shape[0],nsite**2)
         generic_real_chols[1] = GenericRealChol(np.array([h1e,h1e]),chol.T,0)
         for ham,generic_real_chol in zip(hams,generic_real_chols):
             if ham is None:
@@ -287,33 +276,13 @@ if __name__=='__main__':
                 afqmc.setup_estimators(None,None)
             
             trial.build(ham,conjugate=True)
-            walkers.build(ham,trial,importance=False)
+            walkers.build(ham,trial)
             if walkers_type==trial_type:
                 eloc,e1,e2 = walkers.local_energy(ham,trial)
                 E = np.dot(eloc,walkers.weight)/sum(walkers.weight)
                 e1 = np.dot(e1,walkers.weight)/sum(walkers.weight)
                 e2 = np.dot(e2,walkers.weight)/sum(walkers.weight)
                 print('E,E1,E2=',E,e1,e2)
-
-            walkers.build(ham,trial,importance=importance_sample)
-            walkers.has_E12 = False
-            if walkers_type==trial_type:
-                eloc,e1,e2 = walkers.local_energy(ham,trial)
-                E = np.dot(eloc,walkers.weight)/sum(walkers.weight)
-                e1 = np.dot(e1,walkers.weight)/sum(walkers.weight)
-                e2 = np.dot(e2,walkers.weight)/sum(walkers.weight)
-                print('E,E1,E2=',E,e1,e2)
-            #continue
-
-            if importance_sample:
-                ovlp_ratio1 = np.zeros((ham.nterms,walkers.nwalkers))
-                for ix in range(ham.nterms):
-                    ovlp_ratio1[ix] = compute_ovlp_ratio_single(ham,ix,walkers,trial)
-                ovlp_ratio2 = walkers.compute_ovlp_ratio(ham)
-                #print('ovlp ratio')
-                #print(ovlp_ratio1.T)
-                #print(ovlp_ratio2.T)
-                test_norm(ovlp_ratio1,ovlp_ratio2)
 
             niter = ham.nterms // walkers.nwalkers + 1
             start = 0
@@ -327,7 +296,7 @@ if __name__=='__main__':
 
                 data_old = get_data(walkers)
                 ham.parse_samples(ixs)
-                b2 = None if importance_sample else np.ones(walkers.nwalkers)
+                b2 = np.ones(walkers.nwalkers)
                 b2 = walkers.update_walkers(ham,trial,b=b2)
                 if b2 is not None:
                     #print(b1)

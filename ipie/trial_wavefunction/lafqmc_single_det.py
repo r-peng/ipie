@@ -41,10 +41,10 @@ class SingleDet(TrialWavefunctionBase):
         psi = self.get_psi()
         self.BX = dict()
         for key,sg in hamiltonian.size_groups.items():
-            self.BX[key] = [xp.einsum('xi,dxp,xi->dip',Bi,sg.basis) for Bi in psi]
+            self.BX[key] = [xp.einsum('xi,dxp->dip',Bi,sg.basis) for Bi in psi]
 
     def get_Bv(self,size_key,bix,s,p):
-        Bv = trial.BX[size_key][s][bix][:,p] 
+        Bv = self.BX[size_key][s][bix][:,p]
         return Bv.transpose(1,0,2)
 
     def calc_force_bias(self, hamiltonian, walkers, mpi_handler):

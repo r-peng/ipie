@@ -24,7 +24,7 @@ def update_phi(C,v,d):
         dvC = d[:,:,None]*vC
     else:
         dvC = xp.einsum('wrs,wsi->wri',d,vC)
-    C += xp.einsum('xwr,wri->wxi',v[:,:,::-1],dvC)
+    C += xp.einsum('wxr,wri->wxi',v[:,:,::-1],dvC)
     return C,dvC
 
 class UHFWalkers(BaseWalkers):
@@ -113,19 +113,18 @@ class UHFWalkers(BaseWalkers):
             p,d,v = hamiltonian.get_batch_info(key,i)
 
             size_key,(bix,spin) = key
-            dvC = self.update_phi(spin,w,x,d)
+            dvC = self.update_phi(spin,w,v,d)
 
             if spin==(0,1):
                 b = self.update_ovlp_2(key,w,p,dvC,trial,b)
             else:
                 b = self.update_ovlp_1(key,w,p,dvC,trial,b)
             #print(b[w],f)
-            b[w] /= f 
+            #b[w] /= f 
             #print(b[w])
         return b
 
-    def update_phi(self,spin,w,x,d):
-        _,spin = key
+    def update_phi(self,spin,w,v,d):
         phi = self.get_phi()
         if spin==(0,1):
             d = [d[:,:1],d[:,1:]]
@@ -144,13 +143,14 @@ class UHFWalkers(BaseWalkers):
         size_key,(bix,spin) = key
         s = spin[0]
 
-        Bw = trial.get_Bw(size_key,bix,s,p[:,::-1])
+        Bw = trial.get_Bv(size_key,bix,s,p[:,::-1])
         S = [self.Sa,self.Sb][s]
         SBw = xp.einsum('wij,wjr->wir',S[w],Bw)
         dvCS = xp.einsum('wri,wij->wrj',dvC,S[w])
 
         M = xp.eye(p.shape[1])[None,:,:] + xp.einsum('wri,wis->wrs',dvC,SBw)
-        b[w] *= xp.linalg.det(M)
+        if b is not None:
+            b[w] *= xp.linalg.det(M)
 
         M = xp.linalg.inv(M)
         right = xp.einsum('wrs,wsj->wrj',M,dvCS)
@@ -165,8 +165,8 @@ class UHFWalkers(BaseWalkers):
     def update_ovlp_1(self,key,w,p,dvC,trial:SingleDetGHF,b):
         size_key,(bix,spin) = key
         s = spin[0]
-        Bw = trial.get_Bw(size_key,bix,s,p[:,::-1])
-        SBw = xp.einsum('wij,wjr->wir',self.S[w],Bx)
+        Bw = trial.get_Bv(size_key,bix,s,p[:,::-1])
+        SBw = xp.einsum('wij,wjr->wir',self.S[w],Bw)
         if s==0:
             dvCS = xp.einsum('wri,wij->wrj',dvC,self.S[w,:self.nup])
         else:
@@ -177,7 +177,8 @@ class UHFWalkers(BaseWalkers):
         else:
             M = xp.einsum('wri,wis->wrs',dvC,SBw[:,self.nup:])
         M = xp.eye(p.shape[1])[None,:,:] + M
-        b[w] *= xp.linalg.det(M)
+        if b is not None:
+            b[w] *= xp.linalg.det(M)
 
         M = xp.linalg.inv(M)
         right = xp.einsum('wrs,wsj->wrj',M,dvCS)
@@ -188,14 +189,15 @@ class UHFWalkers(BaseWalkers):
     def update_ovlp_2(self,key,w,p,dvC,trial:SingleDet,b):
         size_key,(bix,spin) = key
         p = [p[:,:1],p[:,1:]]
-        Bw = [trial.get_Bw(size_key,bix,s,p[s]) for s in (0,1)]
+        Bw = [trial.get_Bv(size_key,bix,s,p[s]) for s in (0,1)]
         S = [self.Sa,self.Sb]
         for s in (0,1):
-            SBw = xp.einsum('wij,wj->wi',S[s][w],Bw[s][:,0])
+            SBw = xp.einsum('wij,wj->wi',S[s][w],Bw[s][:,:,0])
             dvCS = xp.einsum('wi,wij->wj',dvC[s][:,0],S[s][w])
 
             M = 1. + xp.einsum('wi,wi->w',dvC[s][:,0],SBw)
-            b[w] *= M
+            if b is not None:
+                b[w] *= M
 
             right = (1./M)[:,None]*dvCS
             S[s][w] -= xp.einsum('wi,wj->wij',SBw,right)
@@ -207,7 +209,8 @@ class UHFWalkers(BaseWalkers):
     def update_ovlp_2(self,key,w,p,dvC,trial:SingleDetGHF,b):
         size_key,(bix,spin) = key
         p = [p[:,:1],p[:,1:]]
-        Bw = [trial.get_Bw(size_key,bix,s,p[s]) for s in (0,1)]
+        Bw = [trial.get_Bv(size_key,bix,s,p[s]) for s in (0,1)]
+        Bw = xp.concatenate(Bw,axis=2)
         SBw = xp.einsum('wij,wjr->wir',self.S[w],Bw)
         dvCS = [None] * 2
         dvCS[0] = xp.einsum('wri,wij->wrj',dvC[0],self.S[w,:self.nup])
@@ -218,7 +221,8 @@ class UHFWalkers(BaseWalkers):
         M[0] = xp.einsum('wri,wis->wrs',dvC[0],SBw[:,:self.nup])
         M[1] = xp.einsum('wri,wis->wrs',dvC[1],SBw[:,self.nup:])
         M = xp.eye(2)[None,:,:] + xp.concatenate(M,axis=1)
-        b[w] *= xp.linalg.det(M)
+        if b is not None:
+            b[w] *= xp.linalg.det(M)
 
         M = xp.linalg.inv(M)
         right = xp.einsum('wrs,wsj->wrj',M,dvCS)
@@ -290,14 +294,11 @@ class UHFWalkers(BaseWalkers):
             return [Sa,Sb]
 
     def local_energy(self,ham,trial):
-        CS = self.compute_SC(trial)
+        CS = self.compute_CS(trial)
         E1 = 0.
         E2 = 0.
         spin_pairs = [(s1,s2) for s1 in (0,1) for s2 in (0,1)]
-        if isinstance(self.S,list):
-            cross = False
-        else:
-            cross = True
+        cross = 'S' in self.buff_names
         for size_key,sg in ham.size_groups.items():
             BX = trial.BX[size_key]
             XCS = [xp.einsum('dxp,wxi->dwpi',sg.basis,CSi) for CSi in CS]

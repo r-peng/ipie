@@ -31,7 +31,7 @@ class SingleDetGHF(SingleDet):
             psi = self.psi
         else:
             psi = self.psi.copy()
-            X = xp_.asarray(U)
+            X = xp_.asarray(X)
             psi[:nb] = xp_.dot(X.T,psi[:nb])
             psi[nb:] = xp_.dot(X.T,psi[nb:])
         S = xp_.dot(psi.T,psi)

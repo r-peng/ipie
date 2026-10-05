@@ -1,46 +1,51 @@
 import numpy as np
-import itertools,scipy
+import itertools
 from ipie.hamiltonians.bitstring_utils import (
         get_all_configs_u11,
         get_all_configs_u1,
         string_act,
         count_double_occupancy,
         apply_a_dag_dense_sign,
-        get_config_from_occ,
 )
-from ipie.trial_wavefunction.lafqmc_single_det import SingleDet
-from ipie.trial_wavefunction.lafqmc_single_det_ghf import SingleDetGHF
 np.set_printoptions(suppress=True,precision=6,linewidth=100000)
 
-def get_MB_kappa(ham,ix,basis,basis_map):
-    chol_ix,spin,ps,ds,f = ham.get_term(ix)
-    v = ham.chol_basis[chol_ix]
-    g = np.log(1.+ds)
-    kappa = [None] * 2
-    if spin==(0,1):
-        for s,p in enumerate(ps):
-            ks = np.outer(v[:,p],v[:,p]*g[s])
-            kappa[s] = quadratic2MB(ks,basis,basis_map,s) 
-    else:
-        s = spin[0]
-        ks = np.einsum('xr,yr,r->xy',v[:,ps],v[:,ps],g)
-        kappa[s] = quadratic2MB(ks,basis,basis_map,s) 
-    return kappa,f
+def get_occupied_orbitals(cf,norb):
+    return [i for i in range(norb) if (cf >> i) & 1]
 
-def get_MB_gf(ham,basis,basis_map):
+def embed_spin_rotation(U,nsite):
+    U_full = np.eye(2*nsite)
+    for spin,Us in enumerate(U):
+        if Us is None:
+            continue
+        Us = np.asarray(Us)
+        for p,q in itertools.product(range(nsite),repeat=2):
+            U_full[2*p+spin,2*q+spin] = Us[p,q]
+    return U_full
+
+def rotation2MB(U,basis,basis_map,nsite):
+    norb = 2*nsite
+    U_full = embed_spin_rotation(U,nsite)
+    H = np.zeros((len(basis),)*2)
+    occs = [get_occupied_orbitals(cf,norb) for cf in basis]
+    for ix1,occ1 in enumerate(occs):
+        for ix2,occ2 in enumerate(occs):
+            H[ix2,ix1] = np.linalg.det(U_full[np.ix_(occ2,occ1)])
+    return H
+
+def slater2MB(B,basis):
+    norb,nocc = B.shape
+    psi = np.zeros(len(basis))
+    for ix,cf in enumerate(basis):
+        occ = get_occupied_orbitals(cf,norb)
+        if len(occ)==nocc:
+            psi[ix] = np.linalg.det(B[occ,:])
+    return psi
+
+def get_MB_gf(ham,basis,basis_map,nsite):
     H = 0
     for ix,ai in enumerate(ham.a): 
-        kappa,f = get_MB_kappa(ham,ix,basis,basis_map)
-        U = None
-        for spin,k in enumerate(kappa):
-            if k is None:
-                continue
-            Us = scipy.linalg.expm(k)
-            if U is None:
-                U = Us
-            else:
-                U = np.dot(U,Us)
-        H += ai*U/f
+        U = ham.get_rotation_matrix(ix)
+        H += ai*rotation2MB(U,basis,basis_map,nsite)
     return H
 
 def quadratic2MB(M,basis,basis_map,spin,thresh=1e-6):
@@ -142,7 +147,7 @@ def chol2MB(h1e,chol=None,eri=None,symmetry='u11',nelecs=None,basis=None,basis_m
 
     v0 = 0.
     if chol is not None:
-        v0 = .5*xp.einsum('npr,nrs->ps',chol,chol) 
+        v0 = .5*np.einsum('npr,nrs->ps',chol,chol) 
 
     H = quadratic2MB(h1e-v0,basis,basis_map,0,thresh=thresh)
     H += quadratic2MB(h1e-v0,basis,basis_map,1,thresh=thresh)
@@ -165,20 +170,18 @@ def test_norm(D1,D2,thresh=1e-6):
     dnorm = np.linalg.norm(D1-D2) 
     if norm<thresh:
         if dnorm>thresh:
-            print(dnorm)
-            exit()
+            raise AssertionError(f"norm mismatch: {dnorm}")
     else:
         if dnorm/norm>thresh:
-            print(dnorm,norm)
-            exit()
+            raise AssertionError(f"relative norm mismatch: {dnorm/norm} ({dnorm} / {norm})")
 
-def test_hamiltonian(ham,nsite,nelecs,h1e,eri=None):
+def test_hamiltonian(ham,nsite,nelecs,h1e,hubbard_U=None,eri=None):
     if eri is None:
-        H,basis,basis_map = hubbard2MB(h1e,ham.hubbard_U,nelecs=nelecs)
+        H,basis,basis_map = hubbard2MB(h1e,hubbard_U,nelecs=nelecs)
     else:
        H,basis,basis_map = chol2MB(h1e,eri=eri,symmetry='u11',nelecs=nelecs)
     G1 = np.eye(len(basis))-H/ham.denom
-    G2 = get_MB_gf(ham,basis,basis_map)
+    G2 = get_MB_gf(ham,basis,basis_map,nsite)
     #print(G1)
     #print(G2)
     test_norm(G1,G2)
@@ -186,19 +189,14 @@ def test_hamiltonian(ham,nsite,nelecs,h1e,eri=None):
 
     Us = [ham.get_rotation_matrix(ix) for ix in range(ham.nterms)] 
 
-    occ = [2*i for i in range(nelecs[0])] + [2*i+1 for i in range(nelecs[1])]
-    det = get_config_from_occ(occ,nsite*2)
     B = np.random.rand(nsite*2,sum(nelecs))
-    psi_det = det2MB(B,basis=basis,basis_map=basis_map,det=det)[0]
+    psi_det = slater2MB(B,basis)
     Gpsi_det_1 = np.dot(G1,psi_det)
     Gpsi_det_2 = np.zeros(len(basis))
-    for ai,(Ui,f) in zip(ham.a,Us):
-        UiB = B.copy()
-        if Ui[0] is not None:
-            UiB[:nsite] = np.dot(Ui[0],B[:nsite])
-        if Ui[1] is not None:
-            UiB[nsite:] = np.dot(Ui[1],B[nsite:])
-        Gpsi_det_2 += (ai/f)*det2MB(UiB,basis=basis,basis_map=basis_map,det=det)[0]
+    for ai,Ui in zip(ham.a,Us):
+        U_full = embed_spin_rotation(Ui,nsite)
+        UiB = np.dot(U_full,B)
+        Gpsi_det_2 += ai*slater2MB(UiB,basis)
     test_norm(Gpsi_det_1,Gpsi_det_2)
 
 if __name__=='__main__':
@@ -216,11 +214,7 @@ if __name__=='__main__':
         decomp_type='all'
     h1e = np.random.rand(nsite,nsite)*2-1
     h1e += h1e.T
-    #phi = np.random.rand(nsite,sum(nelecs))*2-1
-    #trial = SingleDet(phi,nelecs,nsite)
-    phi = np.random.rand(nsite*2,sum(nelecs))*2-1
-    trial = SingleDetGHF(phi,nelecs,nsite)
-    #trial = None
+    trial = None
     
     U = 4 
     dt1 = 0.1
@@ -232,7 +226,7 @@ if __name__=='__main__':
         ham.decompose_h2(U,dt2,iprint=iprint,trial=trial)
         ham.decompose_h1(h1e,dt1,iprint=iprint,trial=trial)
         ham.parse_decomposition()
-        test_hamiltonian(ham,nsite,nelecs,h1e)
+        test_hamiltonian(ham,nsite,nelecs,h1e,hubbard_U=U)
 
     print('\ncheck GF decomposition for QC...')
     nchol = 3
@@ -240,6 +234,7 @@ if __name__=='__main__':
     chol += chol.transpose(0,2,1)
     chol /= 5 
     eri = np.einsum('npr,nqs->prqs',chol,chol) 
+    h1e_eff = h1e - .5*np.einsum('prrs->ps',eri)
     cmax = nsite**2
     M = eri.reshape((nsite**2,)*2)
     print('eri symmetry=',np.linalg.norm(M-M.T))
@@ -252,9 +247,8 @@ if __name__=='__main__':
     for uniform in ['coefficient','rotation']:
         ham = QCSOR(nsite,decomp_type=decomp_type) 
         ham.decompose_h2(chol,dt2,iprint=2,uniform=uniform,trial=trial)
-        ham.decompose_h1(h1e,dt1,iprint=iprint,uniform=uniform,trial=trial)
+        ham.decompose_h1(h1e_eff,dt1,iprint=iprint,uniform=uniform,trial=trial)
         ham.parse_decomposition()
         test_hamiltonian(ham,nsite,nelecs,h1e,eri=eri)
         
     print('all greens functions tested')
-
