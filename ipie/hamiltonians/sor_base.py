@@ -39,7 +39,7 @@ class SizeGroup:
         self.overlaps = []
         self.term_info = dict()
 
-        self._integral_tags = 'h1','h1a','h1b','hubbard','thc'
+        self._integral_tags = 'h1','hubbard','thc'
 
     def add_basis(self,X,W,tag,isometry=True):
         if len(self.basis)>0:
@@ -218,6 +218,7 @@ class SumOfRotationBase:
         if not self.run_2body_first:
             raise ValueError('Run 2-body decomposition first!')
         assert uniform in ['coefficient','rotation']
+        self.h1 = xp.asarray(h1)
 
         if self.nbasis not in self.size_groups:
             self.size_groups[self.nbasis] = SizeGroup()
@@ -241,8 +242,7 @@ class SumOfRotationBase:
             ek,vk = np.linalg.eigh(h1+v0) 
             if iprint>0:
                 print(f'spin={s} bands:',ek)
-            tag = ['h1a','h1b'][s]
-            sg.add_basis(vk,ek,tag)
+            sg.add_basis(vk,ek,'h1')
             bix = sg.get_basis_index()
             self.const += sg.decompose_1body(bix,s,dt,uniform=uniform,trial=trial,thresh=self.thresh)
         self.size_groups[self.nbasis] = sg

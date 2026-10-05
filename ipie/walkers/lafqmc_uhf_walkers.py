@@ -281,7 +281,7 @@ class UHFWalkers(BaseWalkers):
     def reortho_batched(self):
         pass
 
-    def compute_CS(self,trial):
+    def compute_CS(self):
         phi = self.get_phi()
         S = self.S if 'S' in self.buff_names else [self.Sa,self.Sb]
         if isinstance(S,list):
@@ -294,8 +294,10 @@ class UHFWalkers(BaseWalkers):
             return [Sa,Sb]
 
     def local_energy(self,ham,trial):
-        CS = self.compute_CS(trial)
-        E1 = 0.
+        CS = self.compute_CS()
+        E1 = [xp.einsum('wxi,ix->w',CSi,Bi) for CSi,Bi in zip(CS,trial.Bh1)]
+        E1 = E1[0]+E1[1]
+
         E2 = 0.
         spin_pairs = [(s1,s2) for s1 in (0,1) for s2 in (0,1)]
         cross = 'S' in self.buff_names
@@ -303,40 +305,35 @@ class UHFWalkers(BaseWalkers):
             BX = trial.BX[size_key]
             XCS = [xp.einsum('dxp,wxi->dwpi',sg.basis,CSi) for CSi in CS]
             for bix,tag in enumerate(sg.integral_tags):
+                if tag=='h1':
+                    continue
                 W = sg.integrals[bix]
                 rho_a = xp.einsum('wpi,ip->wp',XCS[0][bix],BX[0][bix])
                 rho_b = xp.einsum('wpi,ip->wp',XCS[1][bix],BX[1][bix])
-                if tag[:2]=='h1':
-                    if tag=='h1a':
-                        rho_ = rho_a
-                    elif tag=='h1b':
-                        rho_ = rho_b
-                    elif tag=='h1':
-                        rho_ = rho_a + rho_b
-                    else:
-                        raise NotImplementedError
-                    E1 += (W[None,:]*rho_).sum(axis=1)
-
-                elif tag=='hubbard':
+                if tag=='hubbard':
                     E2 += (W[None,:]*rho_a*rho_b).sum(axis=1)
                     if cross:
                         rho_ab = xp.einsum('wpi,ip->wp',XCS[0][bix],BX[1][bix])
                         rho_ba = xp.einsum('wpi,ip->wp',XCS[1][bix],BX[0][bix])
                         E2 -= (W[None,:]*rho_ab*rho_ba).sum(axis=1)
-
-                else:
-                    E2 += .5*xp.einsum('ab,wa,wb->w',W,rho_a,rho_b)
+                if tag=='thc':
+                    rho_ = rho_a + rho_b
+                    E2 += .5*xp.einsum('ab,wa,wb->w',W,rho_,rho_)
 
                     S = sg.overlaps[bix]
-                    WS = W if S is None else W*S
                     Da = xp.einsum('wpi,iq->wpq',XCS[0][bix],BX[0][bix])
                     Db = xp.einsum('wpi,iq->wpq',XCS[1][bix],BX[1][bix])
-                    E1 += .5*xp.einsum('ab,wab->w',WS,Da+Db)
-                    E2 -= .5*xp.einsum('ab,wab->w',W,Da*Db)
+                    if S is None:
+                        E1 += .5*xp.einsum('a,waa->w',xp.diag(W),Da+Db)
+                    else:
+                        E1 += .5*xp.einsum('ab,wab->w',W*S,Da+Db)
+                    E2 -= .5*xp.einsum('ab,wab,wba->w',W,Da,Da)
+                    E2 -= .5*xp.einsum('ab,wab,wba->w',W,Db,Db)
                     if cross:
                         Dab = xp.einsum('wpi,iq->wpq',XCS[0][bix],BX[1][bix])
                         Dba = xp.einsum('wpi,iq->wpq',XCS[1][bix],BX[0][bix])
-                        E2 -= .5*xp.einsum('ab,wab->w',W,Dab*Dba)
+                        E2 -= .5*xp.einsum('ab,wab,wba->w',W,Dab,Dba)
+                        E2 -= .5*xp.einsum('ab,wab,wba->w',W,Dba,Dab)
         return E1+E2,E1,E2
 
     def _measure_sign(self,hamiltonian,trial):

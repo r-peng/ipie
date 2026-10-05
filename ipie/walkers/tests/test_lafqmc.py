@@ -69,7 +69,7 @@ def update_walkers_slow(ham,ixs,walkers,trial):
     denom = compute_scalar_ovlp(walkers,trial)
 
     f = _update_walkers_slow(ham,ixs,walkers)
-    walkers.build(ham,trial)
+    walkers.build(trial)
     num = compute_scalar_ovlp(walkers,trial)
     new_data = get_data(walkers)
 
@@ -130,7 +130,7 @@ if __name__=='__main__':
     from ipie.qmc.afqmc import AFQMC
 
     nsite = 5 
-    nelecs = 1,1 
+    nelecs = 1,0 
     na,nb = nelecs 
     if na>1 and nb==0:
         decomp_type='aa_only'
@@ -235,10 +235,11 @@ if __name__=='__main__':
 
         U = 4 
         dt = 0.05
+        trial_decomp = trial 
         if nelecs[1]>0:
             hams[0] = HubbardSOR(nsite,decomp_type=decomp_type) 
-            hams[0].decompose_h2(U,dt,iprint=iprint,trial=trial)
-            hams[0].decompose_h1(h1e,dt,iprint=iprint,trial=trial)
+            hams[0].decompose_h2(U,dt,iprint=iprint,trial=trial_decomp)
+            hams[0].decompose_h1(h1e,dt,iprint=iprint,trial=trial_decomp)
             hams[0].parse_decomposition()
             eri = np.zeros((nsite,)*4)
             for i in range(nsite):
@@ -259,8 +260,8 @@ if __name__=='__main__':
         chol = modified_cholesky(M,cmax=cmax) 
         chol = chol.reshape(chol.shape[0],nsite,nsite)
         hams[1] = QCSOR(nsite,decomp_type=decomp_type) 
-        hams[1].decompose_h2(chol,dt,iprint=iprint,trial=trial)
-        hams[1].decompose_h1(h1e_eff,dt,iprint=iprint,trial=trial)
+        hams[1].decompose_h2(chol,dt,iprint=iprint,trial=trial_decomp)
+        hams[1].decompose_h1(h1e_eff,dt,iprint=iprint,trial=trial_decomp)
         hams[1].parse_decomposition()
         chol = chol.reshape(chol.shape[0],nsite**2)
         generic_real_chols[1] = GenericRealChol(np.array([h1e,h1e]),chol.T,0)
@@ -275,8 +276,8 @@ if __name__=='__main__':
                 afqmc = AFQMC.build(nelecs,generic_real_chol,trial_,walkers=walkers_,num_walkers=nwalker,num_steps_per_block=1,num_blocks=1,timestep=0.001)
                 afqmc.setup_estimators(None,None)
             
-            trial.build(ham,conjugate=True)
-            walkers.build(ham,trial)
+            trial.build(ham)
+            walkers.build(trial)
             if walkers_type==trial_type:
                 eloc,e1,e2 = walkers.local_energy(ham,trial)
                 E = np.dot(eloc,walkers.weight)/sum(walkers.weight)

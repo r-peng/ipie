@@ -37,8 +37,9 @@ class SingleDet(TrialWavefunctionBase):
             D = xp_.dot(D,psi.T)
         return D
 
-    def build(self,hamiltonian,conjugate=False):
+    def build(self,hamiltonian):
         psi = self.get_psi()
+        self.Bh1 = [xp.einsum('xi,xy->iy',Bi,hamiltonian.h1) for Bi in psi]
         self.BX = dict()
         for key,sg in hamiltonian.size_groups.items():
             self.BX[key] = [xp.einsum('xi,dxp->dip',Bi,sg.basis) for Bi in psi]

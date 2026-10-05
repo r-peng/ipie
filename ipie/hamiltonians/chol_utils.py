@@ -141,9 +141,9 @@ def build_commuting_groups(chol,comm_tol=1e-10,basis_tol=1e-10,seed=7):
         print('eps=',eps)
         print('res=',residual)
         print('X:')
-        print(K)
-        print('X:')
         print(U)
+        print('K:')
+        print(W)
 
         result.append({
             'indices': group,

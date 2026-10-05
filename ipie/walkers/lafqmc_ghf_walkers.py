@@ -81,12 +81,7 @@ class GHFWalkers(UHFWalkers):
         if 'S' in self.buff_names:
             self.compute_S(trial)
 
-    @plum.dispatch
-    def compute_CS(self,trial:SingleDet):
-        raise NotImplementedError
-
-    @plum.dispatch
-    def compute_CS(self,trial:SingleDetGHF):
+    def compute_CS(self):
         phi = self.get_phi()
         return [xp.einsum('wxi,wij->wxj',Ci,self.S) for Ci in phi]
 
