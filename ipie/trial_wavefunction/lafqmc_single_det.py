@@ -25,16 +25,18 @@ class SingleDet(TrialWavefunctionBase):
         else:
             xp_ = xp
 
-        psi = self.get_psi()[s]
-        if X is not None:
-            psi = xp_.dot(xp_.asarray(X).T,psi)
-        S = xp_.dot(psi.T,psi)
-        Sinv = xp_.linalg.inv(S)
-        D = xp_.dot(psi,Sinv)
-        if diag:
-            D = xp_.einsum('pi,pi->p',D,psi)
+        B = self.get_psi()[s]
+        if X is None:
+            XB = B
         else:
-            D = xp_.dot(D,psi.T)
+            XB = xp_.dot(xp_.asarray(X).T,B)
+        S = xp_.dot(XB.T,XB)
+        Sinv = xp_.linalg.inv(S)
+        D = xp_.dot(XB,Sinv)
+        if diag:
+            D = xp_.einsum('pi,pi->p',D,XB)
+        else:
+            D = xp_.dot(D,XB.T)
         return D
 
     def build(self,hamiltonian):

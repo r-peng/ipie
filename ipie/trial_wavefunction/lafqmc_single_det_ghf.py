@@ -25,29 +25,31 @@ class SingleDetGHF(SingleDet):
             xp_ = numpy
         else:
             xp_ = xp
-        nb = self.nbasis
+        nb1 = self.nbasis
 
         if X is None:
-            psi = self.psi
+            XB = self.psi
+            nb2 = nb1
         else:
-            psi = self.psi.copy()
             X = xp_.asarray(X)
-            psi[:nb] = xp_.dot(X.T,psi[:nb])
-            psi[nb:] = xp_.dot(X.T,psi[nb:])
-        S = xp_.dot(psi.T,psi)
+            nb2 = X.shape[1]
+            XB = xp.zeros((nb2*2,self.psi.shape[1]))
+            XB[:nb2] = xp_.dot(X.T,self.psi[:nb1])
+            XB[nb2:] = xp_.dot(X.T,self.psi[nb1:])
+        S = xp_.dot(XB.T,XB)
         Sinv = xp_.linalg.inv(S)
-        D = xp_.dot(psi,Sinv)
+        D = xp_.dot(XB,Sinv)
         if diag:
-            D = xp_.einsum('pi,pi->p',D,psi)
+            D = xp_.einsum('pi,pi->p',D,XB)
             if s==0:
-                D = D[:nb]
+                D = D[:nb2]
             else:
-                D = D[nb:]
+                D = D[nb2:]
             print(s,D)
         else:
-            D = xp_.dot(D,psi.T)
+            D = xp_.dot(D,XB.T)
             if s==0:
-                D = D[:nb,:nb]
+                D = D[:nb2,:nb2]
             else:
-                D = D[nb:,nb:]
+                D = D[nb2:,nb2:]
         return D

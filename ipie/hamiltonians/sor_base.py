@@ -2,7 +2,8 @@ import numpy as np
 import pickle
 from ipie.utils.backend import arraylib as xp
 from ipie.utils.linalg import modified_cholesky
-from ipie.hamiltonians.chol_utils import build_commuting_groups
+from ipie.hamiltonians.sor_chol import build_commuting_groups
+from ipie.hamiltonians.sor_thc import fit_thc_from_eri
 
 def _get_coeffs(a,g,uniform):
     sqrt_g = np.sqrt(np.fabs(g))
@@ -48,7 +49,7 @@ class SizeGroup:
         self.integrals.append(W)
         assert tag in self._integral_tags
         self.integral_tags.append(tag)
-        S = None if isometry else np.dot(X.conj().T,X)
+        S = None if isometry else np.dot(X.T,X)
         self.overlaps.append(S)
 
     def get_basis_index(self):
@@ -367,7 +368,7 @@ class SumOfRotationBase:
 
         def rank1_matrix(p,d):
             vp = v[:,p]
-            return xp.eye(v.shape[0]) + d*xp.outer(vp,vp.conj())
+            return xp.eye(v.shape[0]) + d*xp.outer(vp,vp)
 
         if spin==(0,1):
             for s,p in enumerate(ps):
@@ -413,7 +414,7 @@ class HubbardSOR(SumOfRotationBase):
 
 class QCSOR(SumOfRotationBase):
 
-    def build_commuting_groups(self,eri,cmax=None,comm_tol=1e-10,basis_tol=1e-10,fname=None):
+    def from_cholesky(self,eri,cmax=None,comm_tol=1e-10,basis_tol=1e-10,fname=None):
         # set comm_tol to negative to not do regrouping
         M = eri.reshape((self.nbasis**2, self.nbasis**2))
         if cmax is None:
@@ -425,6 +426,16 @@ class QCSOR(SumOfRotationBase):
             return result
         with open(fname+".pkl", "wb") as f:
             pickle.dump({"grouped": result,"commutator_matrix": C, 'chol':chol},f,protocol=pickle.HIGHEST_PROTOCOL)
+        return result
+
+    def from_thc(self,eri,rank,nstarts=4,maxiter=1000,rcond=1e-6,fname=None): 
+        fit = fit_thc_from_eri(eri,rank,n_starts=nstarts,maxiter=maxiter,rcond=rcond)
+        result = [{'X':fit.X,'W':fit.W,'isometry':False}]
+        if fname is None:
+            return result 
+        with open(fname+".pkl", "wb") as f:
+            pickle.dump({"grouped": result,'eri':eri},f,protocol=pickle.HIGHEST_PROTOCOL)
+        return fit
 
     def decompose_h2(self,fname,dt,iprint=0,uniform='coefficient',trial=None):
         assert uniform in ['coefficient','rotation']
@@ -460,10 +471,15 @@ class QCSOR(SumOfRotationBase):
             if iprint>0:
                 print('basis index=',bix)
 
-            v0 = .5*np.diag(W)
-            if not isometry:
-                v0 *= np.diag(sg.overlaps[-1])
-            v0 = np.tile(v0[None,:],(2,1))
+            S = np.eye(nbasis) if isometry else sg.overlaps[-1]
+            if self.decomp_type=='ab_only':
+                self.v0 += .5*(np.dot(X,np.dot(W*S,X.T)))[None,:,:]
+                v0 = np.zeros((2,nbasis))
+            else:
+                v0 = .5*np.diag(W)
+                if not isometry:
+                    v0 *= np.diag(sg.overlaps[-1])
+                v0 = np.tile(v0[None,:],(2,1))
 
             rho = np.zeros((nbasis,2))
             if trial is not None:
@@ -487,5 +503,5 @@ class QCSOR(SumOfRotationBase):
             v0 += v0_
             self.const += const
 
-            self.v0 += np.einsum('sp,xp,yp->sxy',v0,X,X.conj()) 
+            self.v0 += np.einsum('sp,xp,yp->sxy',v0,X,X) 
         self.run_2body_first = True

@@ -201,10 +201,40 @@ def test_hamiltonian(ham,nsite,nelecs,h1e,hubbard_U=None,eri=None):
 
 if __name__=='__main__':
     from ipie.hamiltonians.sor_base import HubbardSOR,QCSOR
-    from ipie.utils.linalg import modified_cholesky
 
-    nsite = 5 
-    nelecs = 2,1 
+    typ = 'chol'
+    typ = 'thc'
+
+    if typ=='chol':
+        from ipie.utils.linalg import modified_cholesky
+        nsite = 5 
+        nelecs = 2,1 
+        nchol = 3
+        chol = np.random.rand(nchol,nsite,nsite)*2-1
+        chol += chol.transpose(0,2,1)
+        chol /= 5 
+        eri = np.einsum('npr,nqs->prqs',chol,chol) 
+        cmax = nsite**2
+        M = eri.reshape((nsite**2,)*2)
+        print('eri symmetry=',np.linalg.norm(M-M.T))
+        chol = modified_cholesky(M,cmax=cmax) 
+        chol = chol.reshape(chol.shape[0],nsite,nsite)
+        fname = chol
+    else:
+        import pickle
+        with open("thc.pkl", "rb") as f:
+            data = pickle.load(f)
+        grouped = data["grouped"][0]
+        X = grouped['X']
+        W = grouped['W']
+        eri = data['eri']
+        assert np.amax(np.fabs(np.einsum('ab,pa,ra,qb,sb->prqs',W,X,X,X,X)-eri))<1e-6
+        nsite = eri.shape[0]
+        nelecs = 1,0 
+        assert nelecs[0]<=nsite
+        assert nelecs[1]<=nsite
+        fname = 'thc'
+        
     na,nb = nelecs 
     if na>1 and nb==0:
         decomp_type='aa_only'
@@ -229,24 +259,10 @@ if __name__=='__main__':
         test_hamiltonian(ham,nsite,nelecs,h1e,hubbard_U=U)
 
     print('\ncheck GF decomposition for QC...')
-    nchol = 3
-    chol = np.random.rand(nchol,nsite,nsite)*2-1
-    chol += chol.transpose(0,2,1)
-    chol /= 5 
-    eri = np.einsum('npr,nqs->prqs',chol,chol) 
     h1e_eff = h1e - .5*np.einsum('prrs->ps',eri)
-    cmax = nsite**2
-    M = eri.reshape((nsite**2,)*2)
-    print('eri symmetry=',np.linalg.norm(M-M.T))
-    chol = modified_cholesky(M,cmax=cmax) 
-    chol = chol.reshape(chol.shape[0],nsite,nsite)
-    #chol = np.zeros_like(chol)
-    #eri = np.zeros_like(eri)
-    
-    #trial = None
     for uniform in ['coefficient','rotation']:
         ham = QCSOR(nsite,decomp_type=decomp_type) 
-        ham.decompose_h2(chol,dt2,iprint=2,uniform=uniform,trial=trial)
+        ham.decompose_h2(fname,dt2,iprint=2,uniform=uniform,trial=trial)
         ham.decompose_h1(h1e_eff,dt1,iprint=iprint,uniform=uniform,trial=trial)
         ham.parse_decomposition()
         test_hamiltonian(ham,nsite,nelecs,h1e,eri=eri)

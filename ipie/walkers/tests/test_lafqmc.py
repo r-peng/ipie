@@ -120,7 +120,6 @@ def test_norm(D1,D2,thresh=1e-10):
 if __name__=='__main__':
     from ipie.hamiltonians.sor_base import HubbardSOR,QCSOR
     from ipie.hamiltonians.generic import GenericRealChol 
-    from ipie.utils.linalg import modified_cholesky
     from ipie.walkers.uhf_walkers import UHFWalkers as UHFWalkers_ 
     from ipie.walkers.ghf_walkers import GHFWalkers as GHFWalkers_ 
     from ipie.trial_wavefunction.lafqmc_single_det import SingleDet
@@ -128,9 +127,43 @@ if __name__=='__main__':
     from ipie.trial_wavefunction.lafqmc_single_det_ghf import SingleDetGHF
     from ipie.trial_wavefunction.single_det_ghf import SingleDetGHF as SingleDetGHF_
     from ipie.qmc.afqmc import AFQMC
+    from ipie.utils.linalg import modified_cholesky
 
-    nsite = 5 
-    nelecs = 1,0 
+    typ = 'chol'
+    typ = 'thc'
+    if typ=='chol':
+        nsite = 5 
+        nchol = 3
+        chol = np.random.rand(nchol,nsite,nsite)*2-1
+        chol += chol.transpose(0,2,1)
+        chol /= 2
+        eri = np.einsum('npr,nqs->prqs',chol,chol) 
+        M = eri.reshape((nsite**2,)*2)
+        cmax = nsite**2
+        chol = modified_cholesky(M,cmax=cmax) 
+        chol = chol.reshape(chol.shape[0],nsite,nsite)
+        print('eri symmetry=',np.linalg.norm(M-M.T))
+        fname = chol
+        nelecs = 1,0 
+    else:
+        import pickle
+        with open("thc.pkl", "rb") as f:
+            data = pickle.load(f)
+        grouped = data["grouped"][0]
+        X = grouped['X']
+        W = grouped['W']
+        eri = data['eri']
+        assert np.amax(np.fabs(np.einsum('ab,pa,ra,qb,sb->prqs',W,X,X,X,X)-eri))<1e-6
+        nsite = eri.shape[0]
+        nelecs = 2,1 
+        assert nelecs[0]<=nsite
+        assert nelecs[1]<=nsite
+        fname = 'thc'
+        M = eri.reshape((nsite**2,)*2)
+        cmax = nsite**2
+        chol = modified_cholesky(M,cmax=cmax) 
+        chol = chol.reshape(chol.shape[0],nsite**2)
+
     na,nb = nelecs 
     if na>1 and nb==0:
         decomp_type='aa_only'
@@ -236,6 +269,7 @@ if __name__=='__main__':
         U = 4 
         dt = 0.05
         trial_decomp = trial 
+        trial_decomp = None
         if nelecs[1]>0:
             hams[0] = HubbardSOR(nsite,decomp_type=decomp_type) 
             hams[0].decompose_h2(U,dt,iprint=iprint,trial=trial_decomp)
@@ -248,22 +282,11 @@ if __name__=='__main__':
             chol = modified_cholesky(eri.reshape((nsite**2,)*2),verbose=verbose,cmax=nsite) 
             generic_real_chols[0] = GenericRealChol(np.array([h1e,h1e]),chol.T,0)
 
-        nchol = 3
-        chol = np.random.rand(nchol,nsite,nsite)*2-1
-        chol += chol.transpose(0,2,1)
-        chol /= 2
-        eri = np.einsum('npr,nqs->prqs',chol,chol) 
         h1e_eff = h1e - .5*np.einsum('prrs->ps',eri)
-        cmax = nsite**2
-        M = eri.reshape((nsite**2,)*2)
-        print('eri symmetry=',np.linalg.norm(M-M.T))
-        chol = modified_cholesky(M,cmax=cmax) 
-        chol = chol.reshape(chol.shape[0],nsite,nsite)
         hams[1] = QCSOR(nsite,decomp_type=decomp_type) 
-        hams[1].decompose_h2(chol,dt,iprint=iprint,trial=trial_decomp)
+        hams[1].decompose_h2(fname,dt,iprint=iprint,trial=trial_decomp)
         hams[1].decompose_h1(h1e_eff,dt,iprint=iprint,trial=trial_decomp)
         hams[1].parse_decomposition()
-        chol = chol.reshape(chol.shape[0],nsite**2)
         generic_real_chols[1] = GenericRealChol(np.array([h1e,h1e]),chol.T,0)
         for ham,generic_real_chol in zip(hams,generic_real_chols):
             if ham is None:
