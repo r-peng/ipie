@@ -303,7 +303,7 @@ def _fit_diagnostics(X: np.ndarray, W: np.ndarray):
     return gram_X, gram_Z, gram_Z_eigs, gram_Z_condition, W_fro, W_max
 
 
-def fit_thc_from_eri_stage2(
+def fit_thc_from_eri(
     eri: np.ndarray,
     rank: int,
     *,
@@ -311,7 +311,7 @@ def fit_thc_from_eri_stage2(
     maxiter: int = 500,
     outer_iters: int = 8,
     outer_tol: float = 1.0e-4,
-    activity_mix: float = 1.0,
+    activity_mix: float = .5, #1.0,
     activity_floor: float = 0.0,
     seed: int = 7,
     rcond: float = 1.0e-10,
@@ -594,11 +594,6 @@ def fit_thc_from_eri_stage2(
         W_fro=W_fro,
         W_max=W_max,
     )
-
-
-# Backward-friendly alias.
-def fit_thc_from_eri(*args, **kwargs):
-    return fit_thc_from_eri_stage2(*args, **kwargs)
 
 
 def load_eri(path: str, key: str = "eri") -> np.ndarray:

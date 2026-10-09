@@ -5,7 +5,8 @@ from ipie.utils.linalg import modified_cholesky
 from ipie.hamiltonians.sor_chol import build_commuting_groups
 #from ipie.hamiltonians.sor_thc import fit_thc_from_eri
 #from ipie.hamiltonians.sor_thc_stage1_comm import fit_thc_from_eri
-from ipie.hamiltonians.sor_thc_stage1_regularized import fit_thc_from_eri
+#from ipie.hamiltonians.sor_thc_stage1_regularized import fit_thc_from_eri
+from ipie.hamiltonians.sor_thc_stage2_weighted import fit_thc_from_eri
 
 def _get_coeffs(a,g,uniform):
     sqrt_g = np.sqrt(np.fabs(g))
