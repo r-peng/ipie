@@ -3,7 +3,9 @@ import pickle
 from ipie.utils.backend import arraylib as xp
 from ipie.utils.linalg import modified_cholesky
 from ipie.hamiltonians.sor_chol import build_commuting_groups
-from ipie.hamiltonians.sor_thc import fit_thc_from_eri
+#from ipie.hamiltonians.sor_thc import fit_thc_from_eri
+#from ipie.hamiltonians.sor_thc_stage1_comm import fit_thc_from_eri
+from ipie.hamiltonians.sor_thc_stage1_regularized import fit_thc_from_eri
 
 def _get_coeffs(a,g,uniform):
     sqrt_g = np.sqrt(np.fabs(g))
@@ -452,8 +454,8 @@ class QCSOR(SumOfRotationBase):
                 pickle.dump({"grouped": result,"commutator_matrix": C, 'chol':chol},f,protocol=pickle.HIGHEST_PROTOCOL)
         return result
 
-    def from_thc(self,eri,rank,nstarts=4,maxiter=1000,rcond=1e-6,fname=None): 
-        fit = fit_thc_from_eri(eri,rank,n_starts=nstarts,maxiter=maxiter,rcond=rcond)
+    def from_thc(self,eri,rank,comm_lambda=1.,nstarts=4,maxiter=1000,rcond=1e-6,fname=None): 
+        fit = fit_thc_from_eri(eri,rank,comm_lambda=comm_lambda,n_starts=nstarts,maxiter=maxiter,rcond=rcond)
         result = [{'X':fit.X,'W':fit.W,'isometry':False}]
         if fname is not None:
             with open(fname+".pkl", "wb") as f:
