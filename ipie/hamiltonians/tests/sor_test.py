@@ -208,7 +208,7 @@ if __name__=='__main__':
     if typ=='chol':
         from ipie.utils.linalg import modified_cholesky
         nsite = 5 
-        nelecs = 2,1 
+        nelecs = 1,0 
         nchol = 3
         chol = np.random.rand(nchol,nsite,nsite)*2-1
         chol += chol.transpose(0,2,1)

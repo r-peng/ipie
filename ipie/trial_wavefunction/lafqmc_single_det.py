@@ -3,6 +3,11 @@ from ipie.trial_wavefunction.wavefunction_base import TrialWavefunctionBase
 from ipie.utils.backend import arraylib as xp
 from ipie.utils.mpi import MPIHandler
 
+def compute_density(B,xp_):
+    S = xp_.dot(B.T,B)
+    Sinv = xp_.linalg.inv(S)
+    return xp_.dot(xp_.dot(B,Sinv),B.T)
+
 # class for UHF trial
 class SingleDet(TrialWavefunctionBase):
 
@@ -15,6 +20,7 @@ class SingleDet(TrialWavefunctionBase):
 
         self.psi = [wavefunction[:, : self.nalpha],wavefunction[:, self.nalpha :]]
         self.handler = handler
+        self.density = [None,None]
 
     def get_psi(self):
         return self.psi 
@@ -25,19 +31,20 @@ class SingleDet(TrialWavefunctionBase):
         else:
             xp_ = xp
 
-        B = self.get_psi()[s]
+        D = self.density[s]
+        if D is None:
+            B = self.get_psi()[s]
+            D = compute_density(B,xp_)
+            self.density[s] = D
         if X is None:
-            XB = B
+            rho = D
         else:
-            XB = xp_.dot(xp_.asarray(X).T,B)
-        S = xp_.dot(XB.T,XB)
-        Sinv = xp_.linalg.inv(S)
-        D = xp_.dot(XB,Sinv)
+            X = xp_.asarray(X)
+            D = xp_.dot(X.T,D)
+            rho = xp_.dot(D,X)
         if diag:
-            D = xp_.einsum('pi,pi->p',D,XB)
-        else:
-            D = xp_.dot(D,XB.T)
-        return D
+            rho = xp_.diag(rho)
+        return rho 
 
     def build(self,hamiltonian):
         psi = self.get_psi()

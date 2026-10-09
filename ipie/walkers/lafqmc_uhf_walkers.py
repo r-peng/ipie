@@ -24,7 +24,7 @@ def update_phi(C,v,d):
         dvC = d[:,:,None]*vC
     else:
         dvC = xp.einsum('wrs,wsi->wri',d,vC)
-    C += xp.einsum('wxr,wri->wxi',v[:,:,::-1],dvC)
+    C += xp.einsum('wxr,wri->wxi',v,dvC)
     return C,dvC
 
 class UHFWalkers(BaseWalkers):
@@ -143,18 +143,18 @@ class UHFWalkers(BaseWalkers):
         size_key,(bix,spin) = key
         s = spin[0]
 
-        Bw = trial.get_Bv(size_key,bix,s,p[:,::-1])
+        Bv = trial.get_Bv(size_key,bix,s,p)
         S = [self.Sa,self.Sb][s]
-        SBw = xp.einsum('wij,wjr->wir',S[w],Bw)
+        SBv = xp.einsum('wij,wjr->wir',S[w],Bv)
         dvCS = xp.einsum('wri,wij->wrj',dvC,S[w])
 
-        M = xp.eye(p.shape[1])[None,:,:] + xp.einsum('wri,wis->wrs',dvC,SBw)
+        M = xp.eye(p.shape[1])[None,:,:] + xp.einsum('wri,wis->wrs',dvC,SBv)
         if b is not None:
             b[w] *= xp.linalg.det(M)
 
         M = xp.linalg.inv(M)
         right = xp.einsum('wrs,wsj->wrj',M,dvCS)
-        S[w] -= xp.einsum('wir,wrj->wij',SBw,right)
+        S[w] -= xp.einsum('wir,wrj->wij',SBv,right)
         if s==0:
             self.Sa = S
         else:
@@ -165,42 +165,42 @@ class UHFWalkers(BaseWalkers):
     def update_ovlp_1(self,key,w,p,dvC,trial:SingleDetGHF,b):
         size_key,(bix,spin) = key
         s = spin[0]
-        Bw = trial.get_Bv(size_key,bix,s,p[:,::-1])
-        SBw = xp.einsum('wij,wjr->wir',self.S[w],Bw)
+        Bv = trial.get_Bv(size_key,bix,s,p)
+        SBv = xp.einsum('wij,wjr->wir',self.S[w],Bv)
         if s==0:
             dvCS = xp.einsum('wri,wij->wrj',dvC,self.S[w,:self.nup])
         else:
             dvCS = xp.einsum('wri,wij->wrj',dvC,self.S[w,self.nup:])
 
         if s==0:
-            M = xp.einsum('wri,wis->wrs',dvC,SBw[:,:self.nup])
+            M = xp.einsum('wri,wis->wrs',dvC,SBv[:,:self.nup])
         else:
-            M = xp.einsum('wri,wis->wrs',dvC,SBw[:,self.nup:])
+            M = xp.einsum('wri,wis->wrs',dvC,SBv[:,self.nup:])
         M = xp.eye(p.shape[1])[None,:,:] + M
         if b is not None:
             b[w] *= xp.linalg.det(M)
 
         M = xp.linalg.inv(M)
         right = xp.einsum('wrs,wsj->wrj',M,dvCS)
-        self.S[w] -= xp.einsum('wir,wrj->wij',SBw,right)
+        self.S[w] -= xp.einsum('wir,wrj->wij',SBv,right)
         return b 
 
     @plum.dispatch
     def update_ovlp_2(self,key,w,p,dvC,trial:SingleDet,b):
         size_key,(bix,spin) = key
         p = [p[:,:1],p[:,1:]]
-        Bw = [trial.get_Bv(size_key,bix,s,p[s]) for s in (0,1)]
+        Bv = [trial.get_Bv(size_key,bix,s,p[s]) for s in (0,1)]
         S = [self.Sa,self.Sb]
         for s in (0,1):
-            SBw = xp.einsum('wij,wj->wi',S[s][w],Bw[s][:,:,0])
+            SBv = xp.einsum('wij,wj->wi',S[s][w],Bv[s][:,:,0])
             dvCS = xp.einsum('wi,wij->wj',dvC[s][:,0],S[s][w])
 
-            M = 1. + xp.einsum('wi,wi->w',dvC[s][:,0],SBw)
+            M = 1. + xp.einsum('wi,wi->w',dvC[s][:,0],SBv)
             if b is not None:
                 b[w] *= M
 
             right = (1./M)[:,None]*dvCS
-            S[s][w] -= xp.einsum('wi,wj->wij',SBw,right)
+            S[s][w] -= xp.einsum('wi,wj->wij',SBv,right)
 
         self.Sa,self.Sb = S
         return b 
@@ -209,24 +209,24 @@ class UHFWalkers(BaseWalkers):
     def update_ovlp_2(self,key,w,p,dvC,trial:SingleDetGHF,b):
         size_key,(bix,spin) = key
         p = [p[:,:1],p[:,1:]]
-        Bw = [trial.get_Bv(size_key,bix,s,p[s]) for s in (0,1)]
-        Bw = xp.concatenate(Bw,axis=2)
-        SBw = xp.einsum('wij,wjr->wir',self.S[w],Bw)
+        Bv = [trial.get_Bv(size_key,bix,s,p[s]) for s in (0,1)]
+        Bv = xp.concatenate(Bv,axis=2)
+        SBv = xp.einsum('wij,wjr->wir',self.S[w],Bv)
         dvCS = [None] * 2
         dvCS[0] = xp.einsum('wri,wij->wrj',dvC[0],self.S[w,:self.nup])
         dvCS[1] = xp.einsum('wri,wij->wrj',dvC[1],self.S[w,self.nup:])
         dvCS = xp.concatenate(dvCS,axis=1)
 
         M = [None] * 2 
-        M[0] = xp.einsum('wri,wis->wrs',dvC[0],SBw[:,:self.nup])
-        M[1] = xp.einsum('wri,wis->wrs',dvC[1],SBw[:,self.nup:])
+        M[0] = xp.einsum('wri,wis->wrs',dvC[0],SBv[:,:self.nup])
+        M[1] = xp.einsum('wri,wis->wrs',dvC[1],SBv[:,self.nup:])
         M = xp.eye(2)[None,:,:] + xp.concatenate(M,axis=1)
         if b is not None:
             b[w] *= xp.linalg.det(M)
 
         M = xp.linalg.inv(M)
         right = xp.einsum('wrs,wsj->wrj',M,dvCS)
-        self.S[w] -= xp.einsum('wir,wrj->wij',SBw,right)
+        self.S[w] -= xp.einsum('wir,wrj->wij',SBv,right)
         return b 
 
     def reortho(self,trial):

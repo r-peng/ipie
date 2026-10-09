@@ -141,9 +141,8 @@ if __name__=='__main__':
         M = eri.reshape((nsite**2,)*2)
         cmax = nsite**2
         chol = modified_cholesky(M,cmax=cmax) 
-        chol = chol.reshape(chol.shape[0],nsite,nsite)
+        fname = chol.reshape(chol.shape[0],nsite,nsite)
         print('eri symmetry=',np.linalg.norm(M-M.T))
-        fname = chol
         nelecs = 1,0 
     else:
         import pickle
@@ -155,14 +154,13 @@ if __name__=='__main__':
         eri = data['eri']
         assert np.amax(np.fabs(np.einsum('ab,pa,ra,qb,sb->prqs',W,X,X,X,X)-eri))<1e-6
         nsite = eri.shape[0]
-        nelecs = 2,1 
+        nelecs = 1,0 
         assert nelecs[0]<=nsite
         assert nelecs[1]<=nsite
         fname = 'thc'
         M = eri.reshape((nsite**2,)*2)
         cmax = nsite**2
         chol = modified_cholesky(M,cmax=cmax) 
-        chol = chol.reshape(chol.shape[0],nsite**2)
 
     na,nb = nelecs 
     if na>1 and nb==0:
@@ -269,18 +267,18 @@ if __name__=='__main__':
         U = 4 
         dt = 0.05
         trial_decomp = trial 
-        trial_decomp = None
+        #trial_decomp = None
         if nelecs[1]>0:
             hams[0] = HubbardSOR(nsite,decomp_type=decomp_type) 
             hams[0].decompose_h2(U,dt,iprint=iprint,trial=trial_decomp)
             hams[0].decompose_h1(h1e,dt,iprint=iprint,trial=trial_decomp)
             hams[0].parse_decomposition()
-            eri = np.zeros((nsite,)*4)
+            eri_ = np.zeros((nsite,)*4)
             for i in range(nsite):
-                eri[i, i, i, i] = U
+                eri_[i, i, i, i] = U
             verbose = True 
-            chol = modified_cholesky(eri.reshape((nsite**2,)*2),verbose=verbose,cmax=nsite) 
-            generic_real_chols[0] = GenericRealChol(np.array([h1e,h1e]),chol.T,0)
+            chol_ = modified_cholesky(eri_.reshape((nsite**2,)*2),verbose=verbose,cmax=nsite) 
+            generic_real_chols[0] = GenericRealChol(np.array([h1e,h1e]),chol_.T,0)
 
         h1e_eff = h1e - .5*np.einsum('prrs->ps',eri)
         hams[1] = QCSOR(nsite,decomp_type=decomp_type) 

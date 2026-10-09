@@ -1,5 +1,5 @@
 import numpy
-from ipie.trial_wavefunction.lafqmc_single_det import SingleDet
+from ipie.trial_wavefunction.lafqmc_single_det import SingleDet,compute_density
 from ipie.utils.backend import arraylib as xp
 from ipie.utils.mpi import MPIHandler
 
@@ -15,6 +15,7 @@ class SingleDetGHF(SingleDet):
 
         self.psi = wavefunction
         self.handler = handler
+        self.density = None
 
     def get_psi(self):
         nb = self.nbasis
@@ -27,29 +28,33 @@ class SingleDetGHF(SingleDet):
             xp_ = xp
         nb1 = self.nbasis
 
+        if self.density is None:
+            self.density = compute_density(self.psi,xp_)
+
         if X is None:
-            XB = self.psi
-            nb2 = nb1
+            if diag:
+                if s==0:
+                    return xp_.diag(self.density)[:nb1]
+                else:
+                    return xp_.diag(self.density)[nb1:]
+            else:
+                if s==0:
+                    return self.density[:nb1,:nb1]
+                else:
+                    return self.density[nb1:,nb1:]
+
+        X = xp_.asarray(X)
+        nb2 = X.shape[1]
+        XD = xp.zeros((nb2*2,nb1*2))
+        XD[:nb2] = xp_.dot(X.T,self.density[:nb1])
+        XD[nb2:] = xp_.dot(X.T,self.density[nb1:])
+        XDX = xp.zeros((nb2*2,nb2*2))
+        XDX[:,:nb2] = xp_.dot(XD[:,:nb1],X)
+        XDX[:,nb2:] = xp_.dot(XD[:,nb1:],X)
+        if s==0:
+            rho = XDX[:nb2,:nb2]
         else:
-            X = xp_.asarray(X)
-            nb2 = X.shape[1]
-            XB = xp.zeros((nb2*2,self.psi.shape[1]))
-            XB[:nb2] = xp_.dot(X.T,self.psi[:nb1])
-            XB[nb2:] = xp_.dot(X.T,self.psi[nb1:])
-        S = xp_.dot(XB.T,XB)
-        Sinv = xp_.linalg.inv(S)
-        D = xp_.dot(XB,Sinv)
+            rho = XDX[nb2:,nb2:]
         if diag:
-            D = xp_.einsum('pi,pi->p',D,XB)
-            if s==0:
-                D = D[:nb2]
-            else:
-                D = D[nb2:]
-            print(s,D)
-        else:
-            D = xp_.dot(D,XB.T)
-            if s==0:
-                D = D[:nb2,:nb2]
-            else:
-                D = D[nb2:,nb2:]
-        return D
+            rho = xp_.diag(rho)
+        return rho 

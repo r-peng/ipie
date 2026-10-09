@@ -41,7 +41,7 @@ class GHFWalkers(UHFWalkers):
         size_key,(bix,spin) = key
         s = spin[0]
 
-        Bv = trial.get_Bv(size_key,bix,s,p[:,::-1])
+        Bv = trial.get_Bv(size_key,bix,s,p)
         SBv = xp.einsum('wij,wjr->wir',self.S[w],Bv)
         dvCS = xp.einsum('wri,wij->wrj',dvC,self.S[w])
 

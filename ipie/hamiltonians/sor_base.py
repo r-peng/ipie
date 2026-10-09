@@ -32,6 +32,30 @@ def _compute_v0_hubbard(W,rho):
     const -= (W*rho[:,0]*rho[:,1]).sum()
     return v0,const
 
+def compute_total_commutativity(ham):
+    Us = [ham.get_rotation_matrix(ix) for ix in range(ham.nterms)]
+    comm2 = 0.0
+    weighted_comm2 = 0.0
+    weight = 0.0
+    for i in range(ham.nterms):
+        for j in range(i + 1, ham.nterms):
+            pair_comm2 = 0.0
+            for Uis, Ujs in zip(Us[i], Us[j]):
+                # If None means identity/no action in this spin block,
+                # the commutator contribution from this block is zero.
+                if Uis is None or Ujs is None:
+                    continue
+                Cij = np.dot(Uis,Ujs)-np.dot(Ujs,Uis)
+                pair_comm2 += np.linalg.norm(Cij, 'fro')**2
+            wij = ham.a[i] * ham.a[j]
+            comm2 += pair_comm2
+            weighted_comm2 += wij * pair_comm2
+            weight += wij
+    print('comm2=',comm2)
+    print('weighted_comm2=',weighted_comm2)
+    print('weight=',weight)
+    print('weighted_comm2/weight=',weighted_comm2/weight)
+
 class SizeGroup:
     def __init__(self):
         self.basis = []
@@ -344,10 +368,10 @@ class SumOfRotationBase:
         S = sg.overlaps[bix]
         if spin in [(0,0),(1,1)]:
             d_ = xp.zeros((d.shape[0],2,2),dtype=d.dtype)
-            d_[:,0,1] = d[:,1]
-            d_[:,1,0] = d[:,0]
+            d_[:,0,0] = d[:,0]
+            d_[:,1,1] = d[:,1]
             if S is not None:
-                d_[:,1,1] = d[:,0]*d[:,1]*S[p[:,0],p[:,1]]
+                d_[:,0,1] = d[:,0]*d[:,1]*S[p[:,0],p[:,1]]
         else:
             d_ = d
         return p,d_,v.transpose(1,0,2)
@@ -414,28 +438,27 @@ class HubbardSOR(SumOfRotationBase):
 
 class QCSOR(SumOfRotationBase):
 
-    def from_cholesky(self,eri,cmax=None,comm_tol=1e-10,basis_tol=1e-10,fname=None):
+    def from_cholesky(self,chol=None,eri=None,cmax=None,comm_tol=1e-10,basis_tol=1e-10,fname=None):
         # set comm_tol to negative to not do regrouping
-        M = eri.reshape((self.nbasis**2, self.nbasis**2))
-        if cmax is None:
-            cmax = self.nbasis**2
-        chol = modified_cholesky(M, cmax=cmax).reshape(-1, self.nbasis, self.nbasis)
+        if chol is None:
+            M = eri.reshape((self.nbasis**2, self.nbasis**2))
+            if cmax is None:
+                cmax = self.nbasis**2
+            chol = modified_cholesky(M, cmax=cmax).reshape(-1, self.nbasis, self.nbasis)
         print('buiding commuting groups...')
         result,C = build_commuting_groups(chol,comm_tol=comm_tol,basis_tol=basis_tol)
-        if fname is None:
-            return result
-        with open(fname+".pkl", "wb") as f:
-            pickle.dump({"grouped": result,"commutator_matrix": C, 'chol':chol},f,protocol=pickle.HIGHEST_PROTOCOL)
+        if fname is not None:
+            with open(fname+".pkl", "wb") as f:
+                pickle.dump({"grouped": result,"commutator_matrix": C, 'chol':chol},f,protocol=pickle.HIGHEST_PROTOCOL)
         return result
 
     def from_thc(self,eri,rank,nstarts=4,maxiter=1000,rcond=1e-6,fname=None): 
         fit = fit_thc_from_eri(eri,rank,n_starts=nstarts,maxiter=maxiter,rcond=rcond)
         result = [{'X':fit.X,'W':fit.W,'isometry':False}]
-        if fname is None:
-            return result 
-        with open(fname+".pkl", "wb") as f:
-            pickle.dump({"grouped": result,'eri':eri},f,protocol=pickle.HIGHEST_PROTOCOL)
-        return fit
+        if fname is not None:
+            with open(fname+".pkl", "wb") as f:
+                pickle.dump({"grouped": result,'eri':eri},f,protocol=pickle.HIGHEST_PROTOCOL)
+        return result,fit
 
     def decompose_h2(self,fname,dt,iprint=0,uniform='coefficient',trial=None):
         assert uniform in ['coefficient','rotation']
