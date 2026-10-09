@@ -2,7 +2,8 @@ import numpy as np
 import pickle
 from ipie.utils.backend import arraylib as xp
 from ipie.utils.linalg import modified_cholesky
-from ipie.hamiltonians.sor_chol import build_commuting_groups
+from ipie.hamiltonians.sor_chol import build_commuting_groups,pack_cholesky
+from ipie.hamiltonians.sor_chol_opt import optimize_cholesky_gauge 
 #from ipie.hamiltonians.sor_thc import fit_thc_from_eri
 #from ipie.hamiltonians.sor_thc_stage1_comm import fit_thc_from_eri
 #from ipie.hamiltonians.sor_thc_stage1_regularized import fit_thc_from_eri
@@ -448,8 +449,16 @@ class QCSOR(SumOfRotationBase):
             if cmax is None:
                 cmax = self.nbasis**2
             chol = modified_cholesky(M, cmax=cmax).reshape(-1, self.nbasis, self.nbasis)
-        print('buiding commuting groups...')
-        result,C = build_commuting_groups(chol,comm_tol=comm_tol,basis_tol=basis_tol)
+
+        fit = optimize_cholesky_gauge(chol)
+        chol = fit.chol
+
+        if comm_tol<0.:
+            result = pack_cholesky(chol)
+            C = None
+        else:
+            print('buiding commuting groups...')
+            result,C = build_commuting_groups(chol,comm_tol=comm_tol,basis_tol=basis_tol)
         if fname is not None:
             with open(fname+".pkl", "wb") as f:
                 pickle.dump({"grouped": result,"commutator_matrix": C, 'chol':chol},f,protocol=pickle.HIGHEST_PROTOCOL)
@@ -475,13 +484,8 @@ class QCSOR(SumOfRotationBase):
             grouped = fname["grouped"] if "grouped" in fname else [fname]
         else:
             grouped = fname
-            if isinstance(grouped,np.ndarray):
-                assert grouped.ndim==3
-                grouped_ = []
-                for L in grouped:
-                    eps,X = np.linalg.eigh(L)
-                    grouped_.append({"X":X,"W":np.outer(eps,eps),"isometry":True})
-                grouped = grouped_
+            if isinstance(fname,np.ndarray):
+                grouped = pack_cholesky(fname)
 
         a = 1./np.sqrt(dt)
         for i,result in enumerate(grouped):

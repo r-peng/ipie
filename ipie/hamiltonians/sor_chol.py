@@ -155,3 +155,10 @@ def build_commuting_groups(chol,comm_tol=1e-10,basis_tol=1e-10,seed=7):
         })
     return result, C
 
+def pack_cholesky(chol):
+    assert chol.ndim==3
+    grouped = []
+    for L in chol:
+        eps,X = np.linalg.eigh(L)
+        grouped.append({"X":X,"W":np.outer(eps,eps),"isometry":True})
+    return grouped
