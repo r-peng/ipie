@@ -355,8 +355,8 @@ def optimize_U_manifold(V: np.ndarray, U: np.ndarray, Z: np.ndarray,
 
 def optimize_df_commutator(eri: np.ndarray, nt: int, *,
                            chol: Optional[np.ndarray] = None,
-                           comm_lambda: float = 0.0,
-                           rho_z: float = 1e-10,
+                           comm_lambda: float = 1.0,
+                           rho_z: float = 0.1,
                            outer_iters: int = 12,
                            u_maxiter: int = 100,
                            u_grad_tol: float = 1e-8,
@@ -479,7 +479,7 @@ def save_result(path: str, result: DFResult, comm_lambda: float, rho_z: float) -
     )
 
 
-def save_grouped_pickle(path: str, U: np.ndarray, Z: np.ndarray) -> None:
+def save_grouped(U: np.ndarray, Z: np.ndarray) -> None:
     """Save leaves in the format consumed by QCSOR.decompose_h2."""
     grouped = [
         {"X": np.array(U[t], copy=True),
@@ -487,9 +487,7 @@ def save_grouped_pickle(path: str, U: np.ndarray, Z: np.ndarray) -> None:
          "isometry": True}
         for t in range(U.shape[0])
     ]
-    with open(path, "wb") as fh:
-        pickle.dump({"grouped": grouped}, fh, protocol=pickle.HIGHEST_PROTOCOL)
-
+    return grouped
 
 def _random_orthogonal(rng: np.random.Generator, m: int) -> np.ndarray:
     Q, R = np.linalg.qr(rng.standard_normal((m, m)))

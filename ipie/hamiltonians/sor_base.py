@@ -8,6 +8,7 @@ from ipie.hamiltonians.sor_chol_opt import optimize_cholesky_gauge
 #from ipie.hamiltonians.sor_thc_stage1_comm import fit_thc_from_eri
 #from ipie.hamiltonians.sor_thc_stage1_regularized import fit_thc_from_eri
 from ipie.hamiltonians.sor_thc_stage2_weighted import fit_thc_from_eri
+from ipie.hamiltonians.sor_df import optimize_df_commutator,save_grouped 
 
 def _get_coeffs(a,g,uniform):
     sqrt_g = np.sqrt(np.fabs(g))
@@ -442,13 +443,16 @@ class HubbardSOR(SumOfRotationBase):
 
 class QCSOR(SumOfRotationBase):
 
+    def initialize_cholesky(self,eri,cmax=None):
+        M = eri.reshape((self.nbasis**2, self.nbasis**2))
+        if cmax is None:
+            cmax = self.nbasis**2
+        return modified_cholesky(M, cmax=cmax).reshape(-1, self.nbasis, self.nbasis)
+
     def from_cholesky(self,chol=None,eri=None,cmax=None,comm_tol=1e-10,basis_tol=1e-10,fname=None):
         # set comm_tol to negative to not do regrouping
         if chol is None:
-            M = eri.reshape((self.nbasis**2, self.nbasis**2))
-            if cmax is None:
-                cmax = self.nbasis**2
-            chol = modified_cholesky(M, cmax=cmax).reshape(-1, self.nbasis, self.nbasis)
+            chol = self.initialize_cholesky(eri,cmax=cmax)
 
         fit = optimize_cholesky_gauge(chol)
         chol = fit.chol
@@ -462,11 +466,21 @@ class QCSOR(SumOfRotationBase):
         if fname is not None:
             with open(fname+".pkl", "wb") as f:
                 pickle.dump({"grouped": result,"commutator_matrix": C, 'chol':chol},f,protocol=pickle.HIGHEST_PROTOCOL)
-        return result
+        return result,fit
 
     def from_thc(self,eri,rank,comm_lambda=1.,nstarts=4,maxiter=1000,rcond=1e-6,fname=None): 
         fit = fit_thc_from_eri(eri,rank,comm_lambda=comm_lambda,n_starts=nstarts,maxiter=maxiter,rcond=rcond)
         result = [{'X':fit.X,'W':fit.W,'isometry':False}]
+        if fname is not None:
+            with open(fname+".pkl", "wb") as f:
+                pickle.dump({"grouped": result,'eri':eri},f,protocol=pickle.HIGHEST_PROTOCOL)
+        return result,fit
+
+    def from_df(self,eri,nt,chol=None,comm_lambda=1.,fname=None,cmax=None):
+        if chol is None:
+            chol = self.initialize_cholesky(eri,cmax=cmax)
+        fit = optimize_df_commutator(eri,nt,chol=chol,comm_lambda=comm_lambda)
+        result = save_grouped(fit.U,fit.Z)
         if fname is not None:
             with open(fname+".pkl", "wb") as f:
                 pickle.dump({"grouped": result,'eri':eri},f,protocol=pickle.HIGHEST_PROTOCOL)
