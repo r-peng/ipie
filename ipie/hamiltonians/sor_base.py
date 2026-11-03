@@ -26,17 +26,6 @@ def _get_coeffs(a,g,uniform):
     dp,dq = -ep/ap,eq/aq
     return coeff,dp,dq
 
-def _delta2d(delta,rho=0):
-    return delta/(1.-delta*rho)
-
-def _compute_v0_hubbard(W,rho):
-    v0 = np.zeros_like(rho).T
-    const = 0.
-    for s in (0,1):
-        v0[s] = W*rho[:,1-s]
-    const -= (W*rho[:,0]*rho[:,1]).sum()
-    return v0,const
-
 def compute_total_commutativity(ham):
     Us = [ham.get_rotation_matrix(ix) for ix in range(ham.nterms)]
     comm2 = 0.0
@@ -98,13 +87,8 @@ class SizeGroup:
         term_info['d'].append(d)
         self.term_info[key] = term_info 
 
-    def decompose_1body(self,bix,s,dt,uniform='coefficient',trial=None,thresh=1e-6):
+    def decompose_1body(self,bix,s,dt,uniform='coefficient',thresh=1e-6):
         nb1,nb2 = self.basis[bix].shape
-        rho = np.zeros(nb2)
-        if trial is not None:
-            X = self.basis[bix]
-            rho = trial.compute_density(s,X=X)
-        const = 0.
         for p,ep in enumerate(self.integrals[bix]):
             if np.fabs(ep)<thresh:
                 continue
@@ -113,26 +97,20 @@ class SizeGroup:
                 ap = 1./dt
             else:
                 ap = np.fabs(ep/dt)
-            delta_p = -ep/ap
-            dp = _delta2d(delta_p,rho=rho[p])
+            dp = -ep/ap
             assert np.fabs(dp)<1.
-            fp = 1.+dp*rho[p]
-            const += ep*rho[p]
-            self.add_term(bix,[s],ap/fp,[p],[dp])
-        return const
+            self.add_term(bix,[s],ap,[p],[dp])
 
-    def add_2body_term(self,bix,s,a,p,delta,rho):
-        d = [_delta2d(delta[i],rho=rho[i]) for i in (0,1)]
+    def add_2body_term(self,bix,s,a,p,d):
         assert np.fabs(d[0])<1.
         assert np.fabs(d[1])<1.
-        f = [1.+d[i]*rho[i] for i in (0,1)]
-        self.add_term(bix,s,a/(f[0]*f[1]),p,d)
+        self.add_term(bix,s,a,p,d)
 
-    def add_2body_hubbard(self,bix,s,a,g,pq,rho,uniform='coefficient'):
-        coeff,delta_p,delta_q = _get_coeffs(a,g,uniform)
+    def add_2body_hubbard(self,bix,s,a,g,pq,uniform='coefficient'):
+        coeff,dp,dq = _get_coeffs(a,g,uniform)
         coeff /= 2.
-        self.add_2body_term(bix,s,coeff,pq,[delta_p,delta_q],rho)
-        self.add_2body_term(bix,s,coeff,pq,[-delta_p,-delta_q],rho)
+        self.add_2body_term(bix,s,coeff,pq,[dp,dq])
+        self.add_2body_term(bix,s,coeff,pq,[-dp,-dq])
 
     def basis2cupy(self):
         self.num_basis = len(self.basis)
@@ -143,44 +121,31 @@ class SizeGroup:
         self.integrals = [xp.asarray(X) for X in self.integrals]
         self.overlaps = [None if X is None else xp.asarray(X) for X in self.overlaps] 
 
-    def decompose_hubbard(self,bix,dt,rho,uniform='coefficient',thresh=1e-6):
+    def decompose_hubbard(self,bix,dt,uniform='coefficient',thresh=1e-6):
         W = self.integrals[bix]
         Wdiag = W if len(W.shape)==1 else np.diag(W)
-        v0,const = _compute_v0_hubbard(Wdiag,rho)
         a = 1./np.sqrt(dt)
         for i,Wi in enumerate(Wdiag):
             if np.fabs(Wi)<thresh:
                 continue
-            self.add_2body_hubbard(bix,(0,1),a,Wi,[i,i],rho[i])
-        return v0,const
+            self.add_2body_hubbard(bix,(0,1),a,Wi,[i,i],uniform=uniform)
 
-    def decompose_ab_only(self,bix,dt,rho,uniform='coefficient',thresh=1e-6):
+    def decompose_ab_only(self,bix,dt,uniform='coefficient',thresh=1e-6):
         W = self.integrals[bix]
         a = 1./np.sqrt(dt)
-        v0 = np.zeros_like(rho).T
-        const = 0.
         nbasis = W.shape[0]
         pairs = [(p,q) for p in range(nbasis) for q in range(p+1,nbasis)]
         for (p,q) in pairs:
             Wpq = W[p,q]
             if np.fabs(Wpq)<thresh:
                 continue
-            self.add_2body_hubbard(bix,(0,1),a,Wpq,[p,q],[rho[p,0],rho[q,1]])
-            self.add_2body_hubbard(bix,(0,1),a,Wpq,[q,p],[rho[q,0],rho[p,1]])
+            self.add_2body_hubbard(bix,(0,1),a,Wpq,[p,q],uniform=uniform)
+            self.add_2body_hubbard(bix,(0,1),a,Wpq,[q,p],uniform=uniform)
 
-            v0[0,p] += Wpq*rho[q,1]
-            v0[1,p] += Wpq*rho[q,0]
-            v0[0,q] += Wpq*rho[p,1]
-            v0[1,q] += Wpq*rho[p,0]
-            const -= Wpq*(rho[p,0]*rho[q,1]+rho[p,1]*rho[q,0])
-        return v0,const
-
-    def decompose_aa_only(self,bix,dt,rho,uniform='coefficient',thresh=1e-6):
+    def decompose_aa_only(self,bix,dt,uniform='coefficient',thresh=1e-6):
         W = self.integrals[bix]
         S = self.overlaps[bix]
         a = 1./np.sqrt(dt)
-        v0 = np.zeros_like(rho).T
-        const = 0.
         nbasis = W.shape[0]
         pairs = [(p,q) for p in range(nbasis) for q in range(p+1,nbasis)]
         for (p,q) in pairs:
@@ -188,44 +153,32 @@ class SizeGroup:
             if np.fabs(Wpq)<thresh:
                 continue
             if S is None:
-                self.add_2body_hubbard(bix,(0,0),a,Wpq,[p,q],[rho[p,0],rho[q,0]])
+                self.add_2body_hubbard(bix,(0,0),a,Wpq,[p,q])
             else:
-                self.add_2body_hubbard(bix,(0,0),.5*a,Wpq,[p,q],[rho[p,0],rho[q,0]])
-                self.add_2body_hubbard(bix,(0,0),.5*a,Wpq,[q,p],[rho[q,0],rho[p,0]])
+                self.add_2body_hubbard(bix,(0,0),.5*a,Wpq,[p,q])
+                self.add_2body_hubbard(bix,(0,0),.5*a,Wpq,[q,p])
 
-            v0[0,p] += Wpq*rho[q,0]
-            v0[0,q] += Wpq*rho[p,0]
-            const -= Wpq*rho[p,0]*rho[q,0]
-        return v0,const
-
-    def decompose_full_2body(self,bix,dt,rho,uniform='coefficient',thresh=1e-6):
+    def decompose_full_2body(self,bix,dt,niform='coefficient',thresh=1e-6):
         W = self.integrals[bix]
         S = self.overlaps[bix]
         a = 1./np.sqrt(dt)
-        v0 = np.zeros_like(rho).T
-        const = 0.
         nbasis = W.shape[0]
         pairs = [(p,q) for p in range(nbasis) for q in range(p+1,nbasis)]
         for (p,q) in pairs:
             Wpq = W[p,q]
             if np.fabs(Wpq)<thresh:
                 continue
-            coeff,delta_p,delta_q = _get_coeffs(a,Wpq,uniform)
-            self.add_2body_term(bix,(0,1),coeff,[p,q],[-delta_p,-delta_q],[rho[p,0],rho[q,1]])
-            self.add_2body_term(bix,(0,1),coeff,[q,p],[-delta_q,-delta_p],[rho[q,0],rho[p,1]])
+            coeff,dp,dq = _get_coeffs(a,Wpq,uniform)
+            self.add_2body_term(bix,(0,1),coeff,[p,q],[-dp,-dq])
+            self.add_2body_term(bix,(0,1),coeff,[q,p],[-dq,-dp])
             if S is None:
-                self.add_2body_term(bix,(0,0),coeff,[p,q],[delta_p,delta_q],[rho[p,0],rho[q,0]])
-                self.add_2body_term(bix,(1,1),coeff,[p,q],[delta_p,delta_q],[rho[p,1],rho[q,1]])
+                self.add_2body_term(bix,(0,0),coeff,[p,q],[dp,dq])
+                self.add_2body_term(bix,(1,1),coeff,[p,q],[dp,dq])
             else:
-                self.add_2body_term(bix,(0,0),.5*coeff,[p,q],[delta_p,delta_q],[rho[p,0],rho[q,0]])
-                self.add_2body_term(bix,(0,0),.5*coeff,[q,p],[delta_q,delta_p],[rho[q,0],rho[p,0]])
-                self.add_2body_term(bix,(1,1),.5*coeff,[p,q],[delta_p,delta_q],[rho[p,1],rho[q,1]])
-                self.add_2body_term(bix,(1,1),.5*coeff,[q,p],[delta_q,delta_p],[rho[q,1],rho[p,1]])
-
-            v0[:,p] += Wpq*rho[q].sum()
-            v0[:,q] += Wpq*rho[p].sum()
-            const -= Wpq*np.outer(rho[p],rho[q]).sum()
-        return v0,const
+                self.add_2body_term(bix,(0,0),.5*coeff,[p,q],[dp,dq])
+                self.add_2body_term(bix,(0,0),.5*coeff,[q,p],[dq,dp])
+                self.add_2body_term(bix,(1,1),.5*coeff,[p,q],[dp,dq])
+                self.add_2body_term(bix,(1,1),.5*coeff,[q,p],[dq,dp])
 
 class SumOfRotationBase:
 
@@ -234,19 +187,19 @@ class SumOfRotationBase:
         self.thresh = thresh
         assert decomp_type in ['all','aa_only','ab_only']
         self.decomp_type = decomp_type
+        self.v0 = np.zeros((2,self.nbasis,self.nbasis))
 
         self.size_groups = dict() 
+        # for cholesky & double factorization:
+        # should have only one size group with key=self.nbasis
+        # for thc: should have two size groups
+        # one with key=self.nbasis
+        # one with key=number of auxiliary modes
 
-        self.run_2body_first = False
-        self.v0 = np.zeros((2,self.nbasis,self.nbasis)) 
-        self.const = 0.
-
-    def decompose_h1(self,h1,dt,uniform='coefficient',iprint=0,trial=None):
+    def decompose_h1(self,h1,dt,uniform='coefficient',iprint=0):
         if iprint>0:
             print('1-body decomposition: ')
             print('a=',1./dt)
-        if not self.run_2body_first:
-            raise ValueError('Run 2-body decomposition first!')
         assert uniform in ['coefficient','rotation']
         self.h1 = xp.asarray(h1)
 
@@ -261,7 +214,7 @@ class SumOfRotationBase:
             sg.add_basis(vk,ek,'h1')
             bix = sg.get_basis_index()
             for s in (0,1):
-                self.const += sg.decompose_1body(bix,s,dt,uniform=uniform,trial=trial,thresh=self.thresh)
+                sg.decompose_1body(bix,s,dt,uniform=uniform,thresh=self.thresh)
             self.size_groups[self.nbasis] = sg
             return
 
@@ -274,7 +227,7 @@ class SumOfRotationBase:
                 print(f'spin={s} bands:',ek)
             sg.add_basis(vk,ek,'h1')
             bix = sg.get_basis_index()
-            self.const += sg.decompose_1body(bix,s,dt,uniform=uniform,trial=trial,thresh=self.thresh)
+            sg.decompose_1body(bix,s,dt,uniform=uniform,hresh=self.thresh)
         self.size_groups[self.nbasis] = sg
 
     def parse_decomposition(self,iprint=0):
@@ -332,7 +285,7 @@ class SumOfRotationBase:
         else:
             self.asum2 = self.a[self.E2_ixs].sum()
         self.asum = self.asum1+self.asum2
-        self.denom = self.asum+self.const
+        self.denom = self.asum
         self.a /= self.denom
         self.nterms = self.a.size
         if iprint>0:
@@ -412,8 +365,7 @@ class SumOfRotationBase:
 
 class HubbardSOR(SumOfRotationBase):
 
-    def decompose_h2(self,U,dt,iprint=0,trial=None):
-        self.run_2body_first = True
+    def decompose_h2(self,U,dt,iprint=0):
         if self.decomp_type=='aa_only':
             raise NotImplementedError
 
@@ -428,17 +380,7 @@ class HubbardSOR(SumOfRotationBase):
             print('Hubbard 2-body decomposition: ')
             print('coefficient =',a)
             print('rotation =',np.sqrt(U*dt))
-        rho = np.zeros((self.nbasis,2))
-        if trial is not None:
-            rho[:,0] = trial.compute_density(0)
-            rho[:,1] = trial.compute_density(1)
-            if iprint>1:
-                print('density up=',rho[:,0])
-                print('density down=',rho[:,1])
-        v0,const = sg.decompose_hubbard(bix,dt,rho)
-        self.const += const
-        self.v0[0] = np.diag(v0[0])
-        self.v0[1] = np.diag(v0[1])
+        sg.decompose_hubbard(bix,dt,rho)
         self.size_groups[self.nbasis] = sg
 
 class QCSOR(SumOfRotationBase):
@@ -486,7 +428,7 @@ class QCSOR(SumOfRotationBase):
                 pickle.dump({"grouped": result,'eri':eri},f,protocol=pickle.HIGHEST_PROTOCOL)
         return result,fit
 
-    def decompose_h2(self,fname,dt,iprint=0,uniform='coefficient',trial=None):
+    def decompose_h2(self,fname,dt,iprint=0,uniform='coefficient'):
         assert uniform in ['coefficient','rotation']
         if iprint>0:
             print('2-body decomposition: ')
@@ -525,27 +467,13 @@ class QCSOR(SumOfRotationBase):
                     v0 *= np.diag(sg.overlaps[-1])
                 v0 = np.tile(v0[None,:],(2,1))
 
-            rho = np.zeros((nbasis,2))
-            if trial is not None:
-                rho[:,0] = trial.compute_density(0,X=X)
-                rho[:,1] = trial.compute_density(1,X=X)
-                if iprint>1:
-                    print('density up=',rho[:,0])
-                    print('density down=',rho[:,1])
-
             if self.decomp_type!='aa_only':
-                v0_,const = sg.decompose_hubbard(bix,dt,rho,uniform=uniform,thresh=self.thresh)
-                v0 += v0_
-                self.const += const
+                sg.decompose_hubbard(bix,dt,uniform=uniform,thresh=self.thresh)
 
             if self.decomp_type=='aa_only':
-                v0_,const = sg.decompose_aa_only(bix,dt,rho,uniform=uniform,thresh=self.thresh)
+                sg.decompose_aa_only(bix,dt,uniform=uniform,thresh=self.thresh)
             elif self.decomp_type=='ab_only':
-                v0_,const = sg.decompose_ab_only(bix,dt,rho,uniform=uniform,thresh=self.thresh)
+                sg.decompose_ab_only(bix,dt,uniform=uniform,thresh=self.thresh)
             else:
-                v0_,const = sg.decompose_full_2body(bix,dt,rho,uniform=uniform,thresh=self.thresh)
-            v0 += v0_
-            self.const += const
-
+                sg.decompose_full_2body(bix,dt,uniform=uniform,thresh=self.thresh)
             self.v0 += np.einsum('sp,xp,yp->sxy',v0,X,X) 
-        self.run_2body_first = True
