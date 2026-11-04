@@ -1,6 +1,7 @@
 """Data contracts for real, zero-shift Cholesky gauge optimization."""
 
 from dataclasses import asdict, dataclass
+import math
 from numbers import Integral, Real
 from typing import Optional, Tuple
 
@@ -267,6 +268,122 @@ class CommutatorLoss:
 
     def as_dict(self):
         return asdict(self)
+
+
+def _scaled_exponential(value, exponent):
+    """Scale a nonnegative coefficient without forming an overflowing exp."""
+    if value == 0:
+        return 0.0
+    try:
+        result = math.exp(math.log(value) + exponent)
+    except OverflowError as exc:
+        raise FloatingPointError("Partition coefficient/profile overflow") from exc
+    if not math.isfinite(result):
+        raise FloatingPointError("Nonfinite partition coefficient/profile")
+    return result
+
+
+@dataclass(frozen=True)
+class PartitionCoefficients:
+    """One exact coordinate profile, with all OTHER partitions held fixed.
+
+    L(s)=C+A*exp(2*s)+B*exp(-2*s). For numerical stability the stored
+    nonnegative terms are left_term=A*exp(2*t), right_term=B*exp(-2*t)
+    at the reference coordinate t. A and B are properties, not fitted data.
+    C includes every unaffected pair and can be negative. The centered
+    terms allow optimization even if A or B itself is not representable.
+    """
+
+    source_index: int
+    t: float
+    C: float
+    left_term: float
+    right_term: float
+
+    def __post_init__(self):
+        if isinstance(self.source_index, (bool, np.bool_)) or not isinstance(self.source_index, Integral) or self.source_index < 0:
+            raise ValueError("source_index must be a nonnegative integer")
+        for name in ("t", "C", "left_term", "right_term"):
+            value = getattr(self, name)
+            if isinstance(value, (bool, np.bool_)) or not isinstance(value, Real) or not np.isfinite(value):
+                raise ValueError(f"{name} must be a finite real scalar")
+        if self.left_term < 0 or self.right_term < 0:
+            raise ValueError("left_term and right_term must be nonnegative")
+
+    @property
+    def A(self):
+        return _scaled_exponential(self.left_term, -2.0*self.t)
+
+    @property
+    def B(self):
+        return _scaled_exponential(self.right_term, 2.0*self.t)
+
+    @property
+    def gradient(self):
+        return 2.0*(self.left_term-self.right_term)
+
+    def terms(self, t):
+        if isinstance(t, (bool, np.bool_)) or not isinstance(t, Real) or not np.isfinite(t):
+            raise ValueError("t must be a finite real scalar")
+        delta = float(t)-self.t
+        return (_scaled_exponential(self.left_term, 2.0*delta),
+                _scaled_exponential(self.right_term, -2.0*delta))
+
+    def value(self, t):
+        left, right = self.terms(t)
+        return math.fsum((self.C, left, right))
+
+    def derivative(self, t):
+        left, right = self.terms(t)
+        return 2.0*(left-right)
+
+
+@dataclass(frozen=True)
+class PartitionSweep:
+    """Diagnostics after a full sequential sweep; sweep=0 is the input."""
+
+    sweep: int
+    loss: float
+    projected_gradient_norm: float
+    loss_decrease: float
+    max_step: float
+    updates: int
+
+
+@dataclass(frozen=True)
+class PartitionOptimizationResult:
+    """Fixed-gauge inner solve; arrays are owned read-only snapshots.
+
+    Convergence means the infinity norm of the projected t-gradient meets
+    gradient_threshold on the stored closed bounds. It does not certify a
+    global minimum of the joint partition problem. The final decomposition
+    can be passed straight to the step-3 loss functions.
+    """
+
+    decomposition: FixedDecomposition
+    initial_loss: float
+    loss: float
+    bounds: np.ndarray
+    coefficients: Tuple[PartitionCoefficients, ...]
+    gradient: np.ndarray
+    projected_gradient: np.ndarray
+    gradient_threshold: float
+    history: Tuple[PartitionSweep, ...]
+    converged: bool
+    status: str
+
+    @property
+    def t(self):
+        return self.decomposition.two_body.t
+
+    @property
+    def sweeps(self):
+        return self.history[-1].sweep
+
+    @property
+    def projected_gradient_norm(self):
+        return self.history[-1].projected_gradient_norm
+
 
 
 

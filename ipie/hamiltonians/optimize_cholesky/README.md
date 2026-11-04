@@ -1,4 +1,4 @@
-# Cholesky optimization: steps 1 through 3
+# Cholesky optimization: steps 1 through 4
 
 This package implements input models, HDF5 loading, orthogonal Cholesky gauges,
 factor diagonalization, deterministic identity checks, and fixed-partition
@@ -420,8 +420,8 @@ Create a new evaluator when the gauge, amplitudes, or channel list changes.
 The reference evaluator still visits O(N_channels**2) unordered pairs. Its
 lazy basis-overlap cache can grow to O(r**2*n**2) storage; it does not promise
 cheap full objectives merely because individual blocks have low rank.
-There is no autodifferentiation, stochastic pair sampling, or partition
-optimization at this stage.
+There is no autodifferentiation or stochastic pair sampling. Step 4 below
+adds partition optimization using the same overlap kernel.
 
 ### Run the step-3 comparisons
 
@@ -445,6 +445,180 @@ cases, raw/normalized weights, coefficient rescaling, invalid overlaps, and
 negative-roundoff handling. The overlap path is also tested with dense channel
 construction disabled. The stale step-1 test import has been updated from
 the removed gauge module to your merged prepare module.
+
+## Step 4: fixed-gauge partition optimization
+
+`partitions.py` optimizes the unweighted squared `L_raw`, at fixed `tau1`,
+`tau2`, Cholesky gauge/eigenpairs and one-body channels. The source ordering
+and `t` coordinates are exactly those from step 2. One two-branch source
+shares its coordinate across both signs; one spin quartet shares it across
+all four spin products. Channel counts, positive unnormalized `a_i` values
+and the leg product `d_left*d_right = -W_i*tau2` are preserved.
+
+```python
+from ipie.hamiltonians.optimize_cholesky import (
+    partition_coefficients, optimize_partitions, raw_loss,
+)
+
+# decomposition is the existing output of build_fixed_decomposition(...).
+coefficients = partition_coefficients(decomposition)
+if coefficients:
+    c = coefficients[0]
+    print(c.A, c.B, c.C, c.gradient)
+    print(c.value(c.t))  # current complete L_raw, not a single-pair loss
+
+result = optimize_partitions(
+    decomposition,
+    max_sweeps=200,
+    gradient_atol=1e-10,
+    gradient_rtol=1e-8,
+)
+optimized = result.decomposition
+print(result.status, result.sweeps, result.loss)
+print(result.projected_gradient_norm, result.gradient_threshold)
+assert abs(raw_loss(optimized) - result.loss) < 1e-12
+```
+
+The returned frozen `PartitionOptimizationResult` contains the updated
+`FixedDecomposition`, final coefficients/gradient, bounds, convergence status
+and a `PartitionSweep` history. Sweep 0 describes the input. Output arrays
+are owned read-only snapshots; the input is unchanged. The output can be
+warm-started with another `optimize_partitions(result.decomposition, ...)`.
+This does not add a `sor_base` adapter or an outer gauge optimizer.
+
+### Coordinate coefficients
+
+For source i, hold every other coordinate fixed. Each affected single-particle
+rotation has the form
+
+```
+u_c(s) = I + exp(s)*P_c + exp(-s)*Q_c,     c in S_i,
+M_cj = [P_c, u_j],  N_cj = [Q_c, u_j],   j not in S_i.
+```
+
+`P_c`, `Q_c` contain the signed t=0 leg amplitudes and their actual spin
+embeddings. The two legs are distinct orthogonal spin-orbital modes in one
+Cholesky basis, so no quadratic single-particle increment survives. Internal
+source commutators vanish. With Frobenius products summed over both spins,
+
+```
+A_i = sum_{c in S_i, j not in S_i} ||M_cj||_F**2 >= 0
+B_i = sum_{c in S_i, j not in S_i} ||N_cj||_F**2 >= 0
+C_i = L_unaffected + 2*sum <M_cj,N_cj>
+L_raw(s) = C_i + A_i*exp(2*s) + B_i*exp(-2*s)
+g_i = 2*A_i*exp(2*t_i) - 2*B_i*exp(-2*t_i).
+```
+
+Each affected/external unordered pair occurs once; there is no extra factor
+1/2. `C_i` includes all unaffected pairs and can be negative. These are global
+source coefficients, not coefficients obtained by optimizing individual
+commutator pairs. The channel coefficients `a_i` do not multiply `L_raw`.
+
+`PartitionCoefficients` stores `left_term=A_i*exp(2*t_i)` and
+`right_term=B_i*exp(-2*t_i)` at its reference `t`, with properties `A`, `B`,
+and `gradient`, plus `value(s)` and `derivative(s)`. Centered evaluation and
+updates avoid forming extreme unscaled coefficients. Accessing `A` or `B`
+raises `FloatingPointError` if it overflows; optimization can still use the
+centered terms. `C_i` is evaluated as the full current loss minus those two
+terms, with the usual cancellation limits of float64 arithmetic.
+
+`partition_coefficients(decomposition)` returns the tuple for every source;
+`partition_coefficients(decomposition, source_index)` returns one. Both
+validate the source map once and use cached basis overlaps. The inner solver
+reuses its workspace/cache and updates only the affected small spin blocks.
+It performs no ERI reconstruction, eigendecomposition or dense rotation
+construction. It still sums external channels for each source, and refreshes
+the full pair sum once per sweep: it is a deterministic reference solver,
+not a linear-scaling implementation.
+
+### Feasible closed bounds
+
+The step-2 decoder requires `abs(d) < amplitude_bound <= 1`. A finite
+coordinate minimum need not exist on that open domain. The inner solver
+instead uses a closed limit `rho=amplitude_limit < amplitude_bound`, default
+`rho=(1-1e-8)*amplitude_bound`, and finite `max_abs_t=30`. For each source,
+
+```
+lower_i = max(-max_abs_t, log(abs(d_right(0))/rho))
+upper_i = min( max_abs_t, log(rho/abs(d_left(0))))
+```
+
+A zero left/right leg contributes no corresponding amplitude bound. These
+formulas cover both `balanced_log` and `anchored_log`; the former has symmetric
+amplitude bounds for nonzero W. `partition_bounds(...)` returns the actual
+read-only `(n_sources,2)` bounds used by the solver. The input t must already
+lie in them, otherwise the solver raises a descriptive error. Infeasible
+scales/bounds are errors; amplitudes are never individually clipped.
+
+`max_abs_t` is an explicit numerical restriction, especially relevant for
+`anchored_log` at W=0. A surviving leg may lower the loss by tending to zero
+only as t tends to positive/negative infinity. The finite box makes this
+case well-defined and keeps the existing anchored family intact. Convergence
+at that wall certifies the stored bounded problem. Increasing `max_abs_t`
+can lower its solution further. `balanced_log` has both legs zero at W=0,
+so that source is flat and keeps its current t.
+
+### Sequential updates and inner stopping
+
+`analytic_partition_update(c, bounds_i)` gives the exact coordinate minimum:
+
+```
+A_i,B_i > 0 : clip(log(B_i/A_i)/4, lower_i, upper_i)
+A_i=0, B_i>0: upper_i
+A_i>0, B_i=0: lower_i
+A_i=B_i=0  : retain the current feasible coordinate.
+```
+
+The implementation uses logarithms of the centered terms. During each sweep,
+sources are visited in their fixed step-2 order, coefficients are recomputed
+after every previous accepted update, and the branches change together.
+Simultaneously assigning all old coordinate minima is a different procedure
+and need not decrease the loss. A roundoff guard rejects tiny predicted
+increases and raises on a material increase; a complete overlap-loss refresh
+checks sweep descent and prevents drift from repeated subtractions.
+
+After each sweep the solver recomputes every gradient at the final state of
+that sweep. For `g=gradient_t`, the projected KKT residual is
+
+```
+r_i = g_i           in the interior
+r_i = min(g_i,0)    at the lower bound
+r_i = max(g_i,0)    at the upper bound
+r_i = 0            if lower_i == upper_i.
+```
+
+It stops when
+
+```
+max(abs(r)) <= gradient_atol + gradient_rtol*initial_max_abs_r.
+```
+
+An active bound can therefore converge with a nonzero unconstrained gradient.
+This criterion is in t coordinates; it is not a gradient in rescaled bounded
+coordinates. A small loss decrease alone never triggers convergence.
+`max_sweeps=0` evaluates the input without updates. Exhausting the limit
+returns `converged=False, status="max_sweeps"` with the current residual.
+Coordinate stationarity does not certify a global minimum of the general
+joint partition problem. Weakly conditioned problems can require more than
+the default 100 sweeps; inspect the status before an outer gauge update.
+
+### Step-4 verification
+
+```sh
+python -m unittest ipie.hamiltonians.optimize_cholesky.tests.test_partitions -v
+python -m unittest discover -s ipie/hamiltonians/optimize_cholesky/tests -v
+```
+
+Tests compare `A_i,B_i,C_i` with an independent dense isolated-leg commutator
+oracle, profile values with the complete dense loss, gradients with finite
+differences, and analytic minima with a scalar numerical minimizer. They
+also verify sequential rather than simultaneous updates, descent, both
+partition maps, all three policies, fresh stopping gradients, active bounds,
+zero couplings, unchanged input/weights/gauge, full Hamiltonian reconstruction
+and agreement with the actual `compute_total_commutativity` function after
+optimization. The inner path is exercised with dense rotation construction,
+eigendecomposition and ERI validation disabled.
+
 
 
 

@@ -1,10 +1,11 @@
-"""Cholesky gauges and exact, fixed-partition density-channel construction."""
+"""Cholesky gauges, density channels, commutator loss and partition updates."""
 
 from .models import (
     Channel, ErrorMetric, GaugeState, PreparedProblem, TensorData,
     ValidationError, ValidationOptions, ValidationReport,
     DensitySource, FixedDecomposition, OneBodyChannel, OneBodyDecomposition,
-    TwoBodyDecomposition, CommutatorLoss,
+    TwoBodyDecomposition, CommutatorLoss, PartitionCoefficients,
+    PartitionSweep, PartitionOptimizationResult,
 )
 from .prepare import (
     load_problem, prepare_problem, select_sector_policy,
@@ -22,6 +23,10 @@ from .objective import (
     OverlapEvaluator, commutator_norm2, dense_commutator_loss,
     overlap_commutator_loss, commutator_loss, raw_loss,
 )
+from .partitions import (
+    analytic_partition_update, optimize_partitions, partition_bounds,
+    partition_coefficients, projected_partition_gradient, with_partitions,
+)
 
 __all__ = [
     "Channel", "ErrorMetric", "GaugeState", "PreparedProblem", "TensorData",
@@ -35,6 +40,10 @@ __all__ = [
     "two_body_rotation_matrix", "one_body_rotation_matrix", "get_rotation_matrix",
     "CommutatorLoss", "OverlapEvaluator", "commutator_norm2", "dense_commutator_loss",
     "overlap_commutator_loss", "commutator_loss", "raw_loss",
+    "PartitionCoefficients", "PartitionSweep", "PartitionOptimizationResult",
+    "analytic_partition_update", "optimize_partitions", "partition_bounds",
+    "partition_coefficients", "projected_partition_gradient", "with_partitions",
 ]
+
 
 
