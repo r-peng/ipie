@@ -1,4 +1,4 @@
-"""Data contracts for real, zero-shift Cholesky gauge optimization (step 1)."""
+"""Data contracts for real, zero-shift Cholesky gauge optimization."""
 
 from dataclasses import asdict, dataclass
 from numbers import Integral, Real
@@ -113,12 +113,12 @@ class GaugeState:
 
 @dataclass(frozen=True)
 class Channel:
-    """Future two-body channel schema, using the requested sor_base fields.
+    """Two-body channel schema, using the requested sor_base fields.
 
     bix indexes the FINAL Cholesky eigenbasis; spin 0=up, 1=down.
     a_i is an UNNORMALIZED positive coefficient in Lambda*I-H, not an H
     coefficient or sampling probability. d contains the actual branch signs.
-    Step 1 defines this contract but does not generate channel lists.
+    Basis and mode upper bounds are checked by the channel builders.
     """
 
     bix: int
@@ -150,4 +150,101 @@ class Channel:
             raise ValueError("a_i must be finite and strictly positive")
         if any(not isinstance(d, Real) or not np.isfinite(d) for d in self.d):
             raise ValueError("d must contain two finite real amplitudes")
+
+
+@dataclass(frozen=True)
+class DensitySource:
+    """One partition coordinate: an "two_branch" density product or "spin_quartet".
+
+    The source index is its position in TwoBodyDecomposition.sources. No
+    coupling is stored here: W changes with the gauge, whereas topology does
+    not. Quartet sources have spins=None; two-branch sources have two spins.
+    """
+
+    bix: int
+    modes: Tuple[int, int]
+    kind: str
+    spins: Optional[Tuple[int, int]]
+
+
+@dataclass(frozen=True)
+class OneBodyChannel:
+    """A single leg in the joint h eigenbasis, kept separate from Channel.
+
+    h is the original physical one-body matrix. Its basis has no Cholesky bix.
+    As for two-body channels, a_i is a positive unnormalized Green weight.
+    """
+
+    spin: int
+    a_i: float
+    mode: int
+    d: float
+
+
+@dataclass(frozen=True)
+class TwoBodyDecomposition:
+    """Fixed-gauge, fixed-partition two-body channels and their source map.
+
+    source_slices[i]=(start,stop) refers to channels[start:stop]. This map
+    preserves the branch sharing required by each source identity. Arrays
+    produced by builders are owned, read-only snapshots.
+    """
+
+    gauge: GaugeState
+    policy: str
+    nelec: Optional[Tuple[int, int]]
+    tau2: float
+    partition: str
+    amplitude_bound: float
+    sources: Tuple[DensitySource, ...]
+    t: np.ndarray
+    amplitudes: np.ndarray
+    source_slices: Tuple[Tuple[int, int], ...]
+    channels: Tuple[Channel, ...]
+
+    @property
+    def weight_sum(self):
+        return sum((channel.a_i for channel in self.channels), 0.0)
+
+
+@dataclass(frozen=True)
+class OneBodyDecomposition:
+    """One-body channels and the jointly diagonalized original h."""
+
+    X: np.ndarray
+    eigenvalues: np.ndarray
+    tau1: float
+    channels: Tuple[OneBodyChannel, ...]
+
+    @property
+    def weight_sum(self):
+        return sum((channel.a_i for channel in self.channels), 0.0)
+
+
+@dataclass(frozen=True)
+class FixedDecomposition:
+    """Reference step-2 representation, with one-body and two-body lists.
+
+    Iteration order is one-body channels followed by two-body channels.
+    coefficients are UNNORMALIZED; denom=sum(coefficients). For E0=0,
+    H=sum_i a_i*(I-U_i), G=denom*I-H=sum_i a_i*U_i on the stated sector.
+    This is not yet an optimization result or a sor_base adapter.
+    """
+
+    one_body: OneBodyDecomposition
+    two_body: TwoBodyDecomposition
+
+    @property
+    def nterms(self):
+        return len(self.one_body.channels) + len(self.two_body.channels)
+
+    @property
+    def denom(self):
+        return self.one_body.weight_sum + self.two_body.weight_sum
+
+    @property
+    def coefficients(self):
+        return np.array([c.a_i for c in self.one_body.channels]
+                        + [c.a_i for c in self.two_body.channels], dtype=np.float64)
+
 

@@ -1,13 +1,13 @@
-# Cholesky optimization: step 1
+# Cholesky optimization: steps 1 and 2
 
 This package implements input models, HDF5 loading, orthogonal Cholesky gauges,
-factor diagonalization, and deterministic identity checks. It does not yet
-generate density channels or optimize partitions/commutators, and it does not
-modify `sor_base.py`.
+factor diagonalization, deterministic identity checks, and fixed-partition
+density-channel construction. It does not yet optimize partitions/commutators
+or modify `sor_base.py`.
 
-Copy this directory into `ipie/hamiltonians/` (imports then start with
-`ipie.hamiltonians.cholesky_optimization`), or put its parent on `PYTHONPATH`
-and import `cholesky_optimization` directly. There are no imports from ipie.
+The package lives at `ipie/hamiltonians/optimize_cholesky/`. Run the examples
+and tests from the ipie repository root, or with ipie installed. Imports start
+with `ipie.hamiltonians.optimize_cholesky`.
 Install NumPy and SciPy; also install h5py for HDF5 loading:
 
 ```sh
@@ -36,7 +36,7 @@ For one file containing datasets `h1`, `eri`, and `chol`:
 
 ```python
 import numpy as np
-from cholesky_optimization import (
+from ipie.hamiltonians.optimize_cholesky import (
     ValidationOptions, load_problem, exponential_gauge,
     givens_gauge, build_gauge_state,
 )
@@ -83,8 +83,8 @@ prepared copies. In-memory data can instead be passed to
 
 `nelec` is optional at this step. Without it the policy is `hybrid`; `(1,1)`
 selects `ab_only`, and `N_down=0` selects `aa_only`. Counts are not guessed from
-HDF5 datasets. Policy selection is recorded only: there are no generated
-spin-dependent terms at step 1. The original h remains unchanged.
+HDF5 datasets. Preparation records the policy; step-2 channel builders use that policy to
+generate the appropriate spin products. The original h remains unchanged.
 
 ## Gauge and eigenvector conventions
 
@@ -141,12 +141,12 @@ explicitly choose tolerances matching that precision; converting to float64
 does not recover lost digits. Never loosen tolerances to mask an index-order
 or physical-convention error.
 
-## Channel contract for the next step
+## Channel contract
 
 `Channel(bix, spins, a_i, modes, d)` has exactly the requested fields:
 
 ```python
-from cholesky_optimization import Channel
+from ipie.hamiltonians.optimize_cholesky import Channel
 channel = Channel(
     bix=0, spins=(0, 1), a_i=5.0, modes=(2, 1), d=(0.1, -0.2)
 )
@@ -156,9 +156,9 @@ channel = Channel(
 actual branch amplitudes, and `a_i` is the positive **unnormalized** coefficient
 in Lambda*I-H. All four spin orientations are representable. A future adapter
 can canonicalize `(1,0)` to `(0,1)` by swapping both legs, since opposite spins
-commute. Mode and basis upper bounds, source identities, paired-domain
-constraints, and branch-sharing checks belong to channel construction in
-the next step. No channel is created by the loader or gauge builder now.
+commute. The step-2 builders enforce source enumeration, paired-domain constraints,
+and branch sharing. The loader and gauge builder themselves still emit no
+channels; call the channel builders described below.
 
 The `GaugeState` object is the completed output of step 1. It holds owned
 read-only arrays and diagnostics, with no optimizer backend or open HDF5
@@ -167,10 +167,10 @@ later; the present state does not imply optimization has occurred.
 
 ## Run tests
 
-From the directory containing `cholesky_optimization/`:
+From the ipie repository root:
 
 ```sh
-python -m unittest discover -s cholesky_optimization/tests -v
+python -m unittest discover -s ipie/hamiltonians/optimize_cholesky/tests -v
 ```
 
 The tests use independent dense contractions and temporary HDF5 files,
@@ -180,4 +180,135 @@ they execute normally after installing h5py. The array-only functions do not
 import h5py. The present implementation is a NumPy/SciPy reference; a later
 automatic-differentiation implementation must preserve these conventions
 without passing differentiable tensors through NumPy conversions.
+
+## Step 2: fixed partitions and density channels
+
+```python
+import numpy as np
+from ipie.hamiltonians.optimize_cholesky import (
+    load_problem, build_gauge_state, enumerate_sources,
+    build_fixed_decomposition, build_two_body_channels, get_rotation_matrix,
+)
+
+problem = load_problem("integrals.h5", nelec=(1, 1))
+gauge = build_gauge_state(problem.data)  # or use a step-1 rotated gauge
+sources = enumerate_sources(problem)
+t = np.zeros(len(sources))
+decomposition = build_fixed_decomposition(
+    problem, gauge, tau1=0.01, tau2=0.01, t=t,
+    partition="balanced_log",
+)
+
+# Keep these two lists separate for the future sor_base adapter.
+two_body_channels = decomposition.two_body.channels
+one_body_channels = decomposition.one_body.channels
+print(two_body_channels[:2])  # bix, spins, a_i, modes, actual signed d
+print(decomposition.denom)    # sum of all UNNORMALIZED coefficients
+U_up, U_down = get_rotation_matrix(decomposition, 0)
+```
+
+Choose the fixed positive scales small enough that all amplitudes are admissible.
+There is no automatic rescaling or clipping. If only the two-body list is wanted,
+call `build_two_body_channels(problem, gauge, tau2, t=...)`.
+One-body channels can be built separately with
+`build_one_body_channels(problem, tau1)`.
+
+### Sources and spin policies
+
+One entry in `sources` owns one ratio. Its two Eq. (10) branches or its four
+Eq. (14) hybrid branches share that ratio. `source_slices[i]` gives the
+half-open interval of **two-body** channels emitted by source i.
+The order is fixed, including exactly zero couplings:
+
+| Policy | Source order within each bix | N_source | N_two_body | Sum of two-body weights |
+| --- | --- | --- | --- | --- |
+| `hybrid` | alpha<=beta; diagonal UD two-branch, off-diagonal quartet | r*n*(n+1)/2 | 2*r*n*n | r*(2*n*n-n)/tau2 |
+| `ab_only` | all ordered spatial (alpha,beta), always spins=(0,1) | r*n*n | 2*r*n*n | r*n*n/tau2 |
+| `aa_only` | alpha<beta, spins=(0,0) | r*n*(n-1)/2 | r*n*(n-1) | r*n*(n-1)/(2*tau2) |
+
+Hybrid quartets are emitted as (UU,UD,DU,DD), with common leg signs
+(+,-,-,+), and each channel weight 1/tau2. Every Eq. (10) product emits the
++ branch followed by the - branch, each with weight 1/(2*tau2). Quartet
+amplitudes cannot be assigned independent spin-channel ratios under this
+identity. Different two-branch sources may have independent ratios.
+
+`hybrid` is a full-Fock-space identity; `ab_only` is used only for (1,1),
+and `aa_only` only for N_down=0. The builders reject a policy inconsistent
+with the PreparedProblem particle counts. If particle counts are absent,
+the generic hybrid policy is used. Fully spin-up systems with <=1 electron
+still retain the formal source list; its two-body action vanishes on that
+sector. No topology changes are made based on the sector or coupling size.
+
+### Two partition maps
+
+The finite scalar or vector `t` is a **fixed log ratio**, not a bounded z
+coordinate and not an optimizer input. A scalar broadcasts to all sources;
+`None` means zero. Let ell_L,ell_R be the source's two Cholesky eigenvalues.
+
+- `balanced_log` (default): with k=abs(ell_L*ell_R*tau2),
+  d_L=sign(ell_L)*sqrt(k)*exp(t),
+  d_R=-sign(ell_R)*sqrt(k)*exp(-t).
+  If either eigenvalue is zero, both amplitudes are defined to be zero.
+- `anchored_log`: d_L=ell_L*sqrt(tau2)*exp(t),
+  d_R=-ell_R*sqrt(tau2)*exp(-t).
+  At zero coupling one leg may survive. The complete source still cancels
+  correctly; these channels are not silently replaced by identities.
+
+Both maps enforce d_L*d_R=-W*tau2 and use analytic constant weights even at
+W=0. Both signs of each leg occur, so require abs(d)<amplitude_bound<=1.
+The default bound is 1; supply a smaller positive bound for a safety margin.
+Large fixed ratios or scales that violate the open domain raise ValueError.
+Amplitudes are evaluated in logarithmic form to avoid gratuitous overflow.
+
+`TwoBodyDecomposition` holds the gauge, policy, particle counts, scales,
+source table, fixed ratios, base amplitudes, source slices, and channel tuple.
+These metadata preserve the ownership needed by the future partition solver.
+No optimizer or automatic differentiation is implemented at this step.
+
+### One-body terms and normalization
+
+The one-body matrix is the original physical h, which is jointly diagonalized
+once. One channel per mode and retained spin has d=-epsilon*tau1 and weight
+1/tau1. Both spins are retained for hybrid/ab_only; only up spin for aa_only.
+Zero one-body eigenvalues are retained as identity channels. For these single
+branches the actual real-exponential condition is d>-1; positive d>=1 is valid.
+
+`FixedDecomposition` contains `one_body` and `two_body`. Its combined order is
+one-body channels followed by two-body channels. `coefficients` is the raw
+positive array; `denom` is their common sum B. The matrix helpers return
+[u_up,u_down], with None for an inactive identity block, matching sor_test.py.
+They multiply the stored rank-one factors literally, including any repeated
+same-spin cross term in a manually constructed channel.
+
+For E0=0, H=B*I-sum_i a_i*U_i. For an external scalar E0, Lambda=E0+B and
+Lambda*I-H=sum_i a_i*U_i. Divide the **combined** raw sum by B when checking
+the normalized Green function. Do not normalize the two lists separately.
+Full two-body and one-body reconstruction is exact in the policy's stated
+space, up to floating-point error and the input-validation tolerance.
+
+### Step-2 reference tests
+
+```sh
+python -m unittest discover -s ipie/hamiltonians/optimize_cholesky/tests -v
+python -m ipie.hamiltonians.optimize_cholesky.tests.test_channels
+```
+
+The second command prints readable H/G/Slater residuals and runs the new tests.
+Like `ipie/hamiltonians/tests/sor_test.py`, the tests use interleaved bitstrings,
+`string_act` fermionic signs, determinant minors to lift rotations, and Slater
+determinant coefficients. The reference Hamiltonian is independently built
+from **bare h plus the canonical quartic ERI operator**; no extra normal-order
+correction is subtracted in that reference. Tests check H, shifted raw G,
+normalized G, individual density-factor actions, and action on a general
+Slater determinant. Hybrid is also tested on full Fock space. Reduced policies
+are tested in their physical sectors and explicitly shown to fail outside them.
+
+Additional cases cover both partition maps, both signs of W, shared quartet
+ratios, known channel/weight counts, rotated gauges, diagonal opposite spins,
+zero couplings, a valid one-body d>1, empty two-body lists, and invalid domains.
+Their numerical checks use NumPy/SciPy and the existing pure-Python
+bitstring_utils. They do not call HDF5 I/O, PySCF, or sor_base construction.
+Importing the full ipie package may still require its installed runtime
+dependencies. The test module adds no new dependency beyond step 1.
+
 
