@@ -248,3 +248,25 @@ class FixedDecomposition:
                         + [c.a_i for c in self.two_body.channels], dtype=np.float64)
 
 
+@dataclass(frozen=True)
+class CommutatorLoss:
+    """Squared single-particle losses, matching sor_base's printed diagnostics.
+
+    comm2 is the unweighted optimization objective. Weighted fields are only
+    diagnostics. Their weights are normalized by the combined coefficient
+    sum when weights_normalized=True. weighted_mean=None means weight=0,
+    e.g. a one-channel decomposition with no unordered pairs.
+    """
+
+    comm2: float
+    weighted_comm2: float
+    weight: float
+    weighted_mean: Optional[float]
+    pair_count: int
+    weights_normalized: bool
+
+    def as_dict(self):
+        return asdict(self)
+
+
+

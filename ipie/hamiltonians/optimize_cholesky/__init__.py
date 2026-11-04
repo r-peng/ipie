@@ -4,7 +4,7 @@ from .models import (
     Channel, ErrorMetric, GaugeState, PreparedProblem, TensorData,
     ValidationError, ValidationOptions, ValidationReport,
     DensitySource, FixedDecomposition, OneBodyChannel, OneBodyDecomposition,
-    TwoBodyDecomposition,
+    TwoBodyDecomposition, CommutatorLoss,
 )
 from .prepare import (
     load_problem, prepare_problem, select_sector_policy,
@@ -18,6 +18,10 @@ from .channels import (
     build_fixed_decomposition, two_body_rotation_matrix, one_body_rotation_matrix,
     get_rotation_matrix,
 )
+from .objective import (
+    OverlapEvaluator, commutator_norm2, dense_commutator_loss,
+    overlap_commutator_loss, commutator_loss, raw_loss,
+)
 
 __all__ = [
     "Channel", "ErrorMetric", "GaugeState", "PreparedProblem", "TensorData",
@@ -29,5 +33,8 @@ __all__ = [
     "TwoBodyDecomposition", "fixed_partition_amplitudes", "enumerate_sources",
     "build_two_body_channels", "build_one_body_channels", "build_fixed_decomposition",
     "two_body_rotation_matrix", "one_body_rotation_matrix", "get_rotation_matrix",
+    "CommutatorLoss", "OverlapEvaluator", "commutator_norm2", "dense_commutator_loss",
+    "overlap_commutator_loss", "commutator_loss", "raw_loss",
 ]
+
 

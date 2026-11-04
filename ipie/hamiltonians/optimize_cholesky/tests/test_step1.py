@@ -16,7 +16,7 @@ except ImportError:
     h5py = None
 import numpy as np
 
-from ipie.hamiltonians.optimize_cholesky.gauge import (
+from ipie.hamiltonians.optimize_cholesky.prepare import (
     build_gauge_state,
     diagonalize_factors,
     exponential_gauge,
@@ -314,3 +314,4 @@ class ProblemPreparationTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+

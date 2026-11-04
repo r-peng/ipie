@@ -1,9 +1,9 @@
-# Cholesky optimization: steps 1 and 2
+# Cholesky optimization: steps 1 through 3
 
 This package implements input models, HDF5 loading, orthogonal Cholesky gauges,
 factor diagonalization, deterministic identity checks, and fixed-partition
-density-channel construction. It does not yet optimize partitions/commutators
-or modify `sor_base.py`.
+density-channel construction, and dense/overlap commutator-loss evaluation.
+It does not yet optimize partitions/gauges or modify `sor_base.py`.
 
 The package lives at `ipie/hamiltonians/optimize_cholesky/`. Run the examples
 and tests from the ipie repository root, or with ipie installed. Imports start
@@ -310,5 +310,141 @@ Their numerical checks use NumPy/SciPy and the existing pure-Python
 bitstring_utils. They do not call HDF5 I/O, PySCF, or sor_base construction.
 Importing the full ipie package may still require its installed runtime
 dependencies. The test module adds no new dependency beyond step 1.
+
+## Step 3: reference commutator loss
+
+```python
+from ipie.hamiltonians.optimize_cholesky import (
+    load_problem, build_gauge_state, build_fixed_decomposition,
+    commutator_loss, raw_loss, OverlapEvaluator,
+)
+
+problem = load_problem("integrals.h5", nelec=(1, 1))
+gauge = build_gauge_state(problem.data)
+decomposition = build_fixed_decomposition(problem, gauge, .01, .01, t=0.0)
+
+dense = commutator_loss(decomposition, method="dense")
+fast = commutator_loss(decomposition, method="overlap")
+print(dense.comm2, fast.comm2)
+print(fast.as_dict())
+loss = raw_loss(decomposition)  # unweighted squared objective only
+
+# Reuse a fixed-state cache for pair-by-pair inspection.
+evaluator = OverlapEvaluator(decomposition)
+pair_squared_norm = evaluator.pair_norm2(0, 1)
+same_total = evaluator.evaluate()
+```
+
+`commutator_loss` defaults to `method="overlap"`. Convenience functions
+`dense_commutator_loss` and `overlap_commutator_loss` return the same result
+type. All methods include both the one-body and two-body channel lists in
+their existing combined order. They evaluate real float64 single-particle
+matrices, not many-body Fock-space commutators.
+
+### Exact agreement with compute_total_commutativity
+
+For each unordered pair i<j, define
+
+```
+pair_ij = ||[u_i_up,u_j_up]||_F**2 + ||[u_i_down,u_j_down]||_F**2
+```
+
+`None` means identity in an inactive spin block. Squared spin norms are
+added; there is no square root. The returned `CommutatorLoss` fields map to
+`sor_base.compute_total_commutativity` as follows:
+
+| Returned field | Existing printed diagnostic |
+| --- | --- |
+| `comm2` | `comm2` = sum(pair_ij) = L_raw |
+| `weighted_comm2` | sum(a[i]*a[j]*pair_ij) |
+| `weight` | sum(a[i]*a[j]) over **all** i<j |
+| `weighted_mean` | `weighted_comm2/weight` |
+| `pair_count` | nterms*(nterms-1)/2, including commuting/identity pairs |
+| `weights_normalized` | Whether a[i] is the raw coefficient divided by denom |
+
+By default, `normalize_weights=True`: a[i]=coefficient[i]/decomposition.denom.
+This matches a parsed SumOfRotationBase object. To compare with raw coefficients,
+pass `normalize_weights=False`. A common coefficient rescaling leaves comm2
+and weighted_mean unchanged; it rescales the raw weighted numerator and
+denominator by the square of that factor. The unweighted comm2 alone is the
+optimization objective; weighted fields are diagnostics.
+
+The comparison requires the same actual channels, partitions, and coefficient
+convention. Fock-space equality of two Hamiltonian decompositions does not
+guarantee equal L_raw. Identity channels contribute zero commutators but still
+contribute to the weighted denominator. Retained anchored zero-coupling sources
+can have nonidentity channels, even though their Hamiltonian source sum is zero.
+No channels are coalesced or deleted by the objective evaluator.
+
+For fewer than two channels the pair sum is empty: comm2=weighted_comm2=weight=0
+and weighted_mean=None. This explicitly represents an undefined weighted mean;
+the existing print-only sor_base function divides by zero in this case.
+
+### Overlap formula and spin blocks
+
+Within each spin sector write the channel increment as A=V D V.T, where the
+active columns of V belong to one orthonormal h or Cholesky eigenbasis.
+Each generated block has at most two active columns. For another increment
+B=Z E Z.T and C=V.T @ Z, the public kernel `commutator_norm2(d,e,C)` uses
+
+```
+||[A,B]||_F**2 = 2*Tr(D**2 @ C @ E**2 @ C.T)
+                 - 2*Tr((D @ C @ E @ C.T) @ (D @ C @ E @ C.T))
+```
+
+Here D=diag(d), E=diag(e); the final matrix square is an ordinary matrix
+product. It is not an elementwise square or a squared Frobenius norm.
+
+`OverlapEvaluator` builds actual signed spin blocks from the stored channels.
+It preserves (down,up) leg assignments, rather than treating all opposite-spin
+channels as having the same spatial ordering. Repeated same-spin modes are
+merged using kappa_new=kappa_old+d+kappa_old*d. Distinct modes in one basis
+are orthogonal, so no cross term survives between them. Zero increments
+can be skipped without deleting the channel itself.
+
+Disjoint-spin blocks, one-body/one-body pairs in the joint h basis, and
+same-Cholesky-basis pairs commute structurally. Their zero contribution is
+skipped in the numerator, while their coefficient pair remains in `weight`.
+Other pairs use lazily cached Q.T@X_gamma or X_gamma.T@X_eta overlaps, with
+only small selected submatrices passed to the norm kernel. No dense channel
+matrices or commutators are constructed by the overlap evaluator.
+
+All bases must have orthonormal columns. Tiny negative squared norms relative
+to the computed terms are clamped to zero; materially negative values raise
+FloatingPointError. This is a roundoff safeguard, not a replacement for valid
+overlaps. Near commuting pairs, use absolute as well as relative comparisons
+against the dense reference.
+
+The cache is bound to a fixed decomposition and owns snapshots of the bases.
+Create a new evaluator when the gauge, amplitudes, or channel list changes.
+The reference evaluator still visits O(N_channels**2) unordered pairs. Its
+lazy basis-overlap cache can grow to O(r**2*n**2) storage; it does not promise
+cheap full objectives merely because individual blocks have low rank.
+There is no autodifferentiation, stochastic pair sampling, or partition
+optimization at this stage.
+
+### Run the step-3 comparisons
+
+```sh
+python -m unittest discover -s ipie/hamiltonians/optimize_cholesky/tests -v
+python -m ipie.hamiltonians.optimize_cholesky.tests.test_objective
+```
+
+The direct module command prints dense, overlap, and sor_base losses for the
+three policies, then runs the new tests. The tests AST-load the **actual**
+compute_total_commutativity function from the checked-out sor_base.py,
+unchanged, and capture its printed diagnostics. A read-only view supplies
+exactly the same channel matrices and coefficients. This avoids unrelated
+SOR construction/import dependencies while testing the requested reference
+function itself. It is not a replacement copy of that function.
+
+Additional tests cover every channel pair, both partition maps, rotated and
+identity gauges, signed low-rank coefficients, both spin contributions,
+opposite-spin leg ordering, repeated modes, zero sources, one-channel edge
+cases, raw/normalized weights, coefficient rescaling, invalid overlaps, and
+negative-roundoff handling. The overlap path is also tested with dense channel
+construction disabled. The stale step-1 test import has been updated from
+the removed gauge module to your merged prepare module.
+
 
 
