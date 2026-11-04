@@ -3,12 +3,12 @@ import pickle
 from ipie.utils.backend import arraylib as xp
 from ipie.utils.linalg import modified_cholesky
 from ipie.hamiltonians.sor_chol import build_commuting_groups,pack_cholesky
-from ipie.hamiltonians.sor_chol_opt import optimize_cholesky_gauge 
+#from ipie.hamiltonians.sor_chol_opt import optimize_cholesky_gauge 
 #from ipie.hamiltonians.sor_thc import fit_thc_from_eri
 #from ipie.hamiltonians.sor_thc_stage1_comm import fit_thc_from_eri
 #from ipie.hamiltonians.sor_thc_stage1_regularized import fit_thc_from_eri
-from ipie.hamiltonians.sor_thc_stage2_weighted import fit_thc_from_eri
-from ipie.hamiltonians.sor_df import optimize_df_commutator,save_grouped 
+#from ipie.hamiltonians.sor_thc_stage2_weighted import fit_thc_from_eri
+#from ipie.hamiltonians.sor_df import optimize_df_commutator,save_grouped 
 
 def _get_coeffs(a,g,uniform):
     sqrt_g = np.sqrt(np.fabs(g))
