@@ -337,6 +337,15 @@ class PartitionCoefficients:
         left, right = self.terms(t)
         return 2.0*(left-right)
 
+    def change(self, t):
+        """L(t)-L(reference), retaining tiny quadratic coordinate decreases."""
+        left,right = self.terms(t)
+        exponent = 2.0*(float(t)-self.t)
+        if abs(exponent) < 0.5:
+            return math.fsum((self.left_term*math.expm1(exponent),
+                              self.right_term*math.expm1(-exponent)))
+        return math.fsum((left,right,-self.left_term,-self.right_term))
+
 
 @dataclass(frozen=True)
 class PartitionSweep:
@@ -371,6 +380,8 @@ class PartitionOptimizationResult:
     history: Tuple[PartitionSweep, ...]
     converged: bool
     status: str
+    amplitude_limit: Optional[float] = None
+    max_abs_t: float = 30.0
 
     @property
     def t(self):
@@ -383,6 +394,82 @@ class PartitionOptimizationResult:
     @property
     def projected_gradient_norm(self):
         return self.history[-1].projected_gradient_norm
+
+
+class GaugeRegularityError(ValueError):
+    """A requested smooth gauge derivative is undefined or ill-conditioned."""
+
+
+class InnerConvergenceError(ValueError):
+    """A relaxed gauge gradient was requested without a converged inner solve."""
+
+    def __init__(self, message, result=None):
+        super().__init__(message)
+        self.result = result
+
+
+@dataclass(frozen=True)
+class GradientOptions:
+    """Smooth-branch guards, applied separately to each Cholesky factor.
+
+    No eigengap is shifted or clipped. Balanced amplitudes require eigenvalues
+    away from zero; anchored amplitudes can be differentiated at a simple zero.
+    bound_switch_atol detects ties between an amplitude bound and the t cap.
+    """
+
+    gap_atol: float = 1e-12
+    gap_rtol: float = 1e-10
+    zero_atol: float = 1e-12
+    zero_rtol: float = 1e-10
+    bound_switch_atol: float = 1e-10
+
+    def __post_init__(self):
+        for name in self.__dataclass_fields__:
+            value = getattr(self, name)
+            if isinstance(value, (bool, np.bool_)) or not isinstance(value, Real) or not np.isfinite(value) or value < 0:
+                raise ValueError(f"{name} must be finite, real, and nonnegative")
+
+
+@dataclass(frozen=True)
+class GaugeGradient:
+    """Raw loss and gauge derivatives at exactly the stored decomposition.
+
+    gradient_O is the ambient derivative, tangent_gradient its Frobenius-metric
+    projection, generator_gradient=skew(gradient_O @ O.T). A left plane-angle
+    derivative is TWICE the corresponding upper generator entry.
+    fixed_gradient_O holds t fixed; bound_correction_O supplies the fixed-z
+    chain rule in fixed_z/relaxed modes. Inner optimizer steps are not unrolled.
+    """
+
+    loss: float
+    decomposition: FixedDecomposition
+    mode: str
+    gradient_O: np.ndarray
+    tangent_gradient: np.ndarray
+    generator_gradient: np.ndarray
+    fixed_gradient_O: np.ndarray
+    bound_correction_O: np.ndarray
+    partition_gradient: np.ndarray
+    eigenvalue_gradient: np.ndarray
+    eigenvector_gradient: np.ndarray
+    rotated_cholesky_gradient: np.ndarray
+    normalized_partitions: Optional[np.ndarray] = None
+    inner_result: Optional[PartitionOptimizationResult] = None
+
+
+@dataclass(frozen=True)
+class GaugeDifference:
+    step: float
+    finite_difference: float
+    absolute_error: float
+    relative_error: float
+
+
+@dataclass(frozen=True)
+class GaugeGradientCheck:
+    analytic: float
+    differences: Tuple[GaugeDifference, ...]
+
 
 
 

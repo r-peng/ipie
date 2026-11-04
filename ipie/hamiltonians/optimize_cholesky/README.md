@@ -1,9 +1,10 @@
-# Cholesky optimization: steps 1 through 4
+# Cholesky optimization: steps 1 through 5
 
 This package implements input models, HDF5 loading, orthogonal Cholesky gauges,
-factor diagonalization, deterministic identity checks, and fixed-partition
-density-channel construction, and dense/overlap commutator-loss evaluation.
-It does not yet optimize partitions/gauges or modify `sor_base.py`.
+factor diagonalization, deterministic identity checks, density-channel
+construction, dense/overlap commutator loss, partition optimization, and
+analytic gauge gradients. An outer gauge optimizer and the `sor_base.py`
+adapter remain future steps.
 
 The package lives at `ipie/hamiltonians/optimize_cholesky/`. Run the examples
 and tests from the ipie repository root, or with ipie installed. Imports start
@@ -618,6 +619,247 @@ zero couplings, unchanged input/weights/gauge, full Hamiltonian reconstruction
 and agreement with the actual `compute_total_commutativity` function after
 optimization. The inner path is exercised with dense rotation construction,
 eigendecomposition and ERI validation disabled.
+
+## Step 5: analytic gauge gradients
+
+The new modules are `derivatives.py` (small-kernel, eigensystem and gauge-map
+pullbacks) and `gradients.py` (complete fixed-partition and relaxed gradients).
+They use NumPy/SciPy float64 arithmetic, with no autodiff dependency. The
+objective remains the unweighted squared `L_raw` from step 3.
+
+### Evaluating a trial gauge
+
+```python
+import numpy as np
+from ipie.hamiltonians.optimize_cholesky import (
+    GaugeEvaluator, exponential_gauge, exponential_gauge_vjp,
+)
+
+# problem is the existing prepare_problem(...) / load_problem(...) result.
+evaluator = GaugeEvaluator(
+    problem, tau1=dt, tau2=dt, partition="balanced_log",
+)
+r = problem.data.nchol
+theta = np.zeros(r*(r-1)//2)
+O = exponential_gauge(theta, r)
+
+# Hold every physical log ratio t_i fixed.
+fixed = evaluator.fixed(O, t=0.0)
+print(fixed.loss, fixed.partition_gradient)
+gradient_theta = exponential_gauge_vjp(theta, r, fixed.gradient_O)
+```
+
+For the two-spatial-orbital `(1,1)` case documented separately, the balanced
+`t=0` choice is already a global partition minimum at every admissible gauge.
+Use `evaluator.fixed(O, t=0.0)` directly; no inner solve is required.
+
+For general systems, evaluate the relaxed loss and gradient together:
+
+```python
+relaxed = evaluator.relaxed(
+    O, t0=None, max_sweeps=500,
+    gradient_atol=1e-11, gradient_rtol=1e-9,
+    amplitude_limit=None, max_abs_t=30.0,
+)
+gradient_theta = exponential_gauge_vjp(theta, r, relaxed.gradient_O)
+print(relaxed.loss, relaxed.inner_result.status,
+      relaxed.inner_result.projected_gradient_norm)
+optimized = relaxed.decomposition
+```
+
+Every call to `relaxed` performs an inner solve at that specific trial gauge.
+An unfinished inner solve raises `InnerConvergenceError`, whose `.result`
+contains the step-4 diagnostics. Increase the sweep limit or adjust the
+specified tolerances explicitly. With `t0=None`, start at the current interval
+midpoints. A supplied warm-start t vector is projected onto the current
+intervals before construction; amplitudes are never clipped separately.
+
+`GaugeEvaluator` caches the fixed one-body channels and source topology. Each
+trial rotates the original factors and diagonalizes the resulting batch once.
+It performs no full ERI reconstruction or dense-channel construction. The
+fast trial `GaugeState` has `diagnostics=None`; use `validate_gauge_state`
+for an independent full validation when desired, outside the loss loop.
+The gradient still visits channel pairs and caches basis overlaps; this is
+a deterministic reference implementation, not a linear-scaling optimizer.
+
+Standalone functions also accept existing step-2/4 objects:
+
+```python
+fixed = fixed_partition_gradient(problem, decomposition)
+relaxed = relaxed_gauge_gradient(problem, partition_result)
+```
+
+`relaxed_gauge_gradient` checks a freshly computed partition KKT residual
+and verifies the saved bounds and loss. Step-4 results now record the actual
+`amplitude_limit` and `max_abs_t`, so a nondefault inner bound is not silently
+replaced by a default when taking its derivative.
+
+### Fixed t, fixed normalized coordinates, and relaxed derivatives
+
+There are three intentionally separate interfaces:
+
+| Method | Quantities held fixed | Gauge derivative |
+| --- | --- | --- |
+| `evaluator.fixed(O, t=...)` | Physical t vector | Partial derivative of L(O,t) |
+| `evaluator.fixed_z(O, z=..., ...)` | Normalized z vector | Includes the interval map |
+| `evaluator.relaxed(O, ...)` | Inner problem definition | Envelope derivative at the returned inner solution |
+
+The step-4 intervals are `lower_i(O) <= t_i <= upper_i(O)`. To use a fixed
+domain for both balanced and asymmetric anchored partitions, define
+
+```
+c_i(O) = (lower_i+upper_i)/2
+h_i(O) = (upper_i-lower_i)/2
+t_i = c_i(O)+h_i(O)*z_i,     -1 <= z_i <= 1.
+```
+
+The fixed-z chain rule is
+
+```
+derivative_O L(O,t(O,z))
+    = partial_O L(O,t) + sum_i g_i*(derivative_O c_i+z_i*derivative_O h_i)
+g_i = partial L / partial t_i.
+```
+
+Equivalently, the endpoint adjoints are `g_i*(1-z_i)/2` for the lower bound
+and `g_i*(1+z_i)/2` for the upper bound. These derivatives include the actual
+amplitude limits, asymmetric anchored intervals and clipping by the finite
+`max_abs_t` cap. A cap-controlled endpoint is constant and has zero derivative.
+With uncapped balanced intervals `[-T_i,T_i]`, this reduces to the previously
+documented correction `sum_i g_i*z_i*derivative_O T_i`.
+
+At a smooth converged inner minimum, the envelope theorem uses this fixed-z
+derivative. It does not require differentiating through the coordinate-sweep
+algorithm. For an interior optimum `g_i=0`; at a lower active wall `g_i>=0`
+and the correction is `g_i*derivative_O lower_i`; at an upper active wall
+`g_i<=0` and it is `g_i*derivative_O upper_i`. Therefore using a fixed-t
+gradient for a relaxed loss generally fails at moving active bounds.
+
+For finite inner tolerances the returned derivative is an approximate
+envelope gradient. The implementation retains the small interior residual
+terms in the fixed-z chain rule. Gradient checks should tighten the inner
+tolerance and re-solve the SAME local branch at every perturbed gauge.
+KKT convergence does not certify a global inner minimum in the general case.
+The relaxed gradient assumes a regular consistently tracked local minimum;
+changes of solution branch can make the value function nonsmooth.
+
+### Analytic reverse pass
+
+For an overlap block `C=V.T@Z`, the norm derivative is propagated into both
+bases: `bar_V=Z@bar_C.T`, `bar_Z=V@bar_C`. Actual signed channel amplitudes
+are differentiated before their shared-source pullback. Zero legs are kept
+in the differentiable blocks: a zero amplitude can have a nonzero derivative
+when the same spin block contains another active mode.
+
+`commutator_norm2_derivatives(d,e,C)` returns the norm and the three polynomial
+derivatives with respect to d, e and C. It differentiates the analytic norm
+formula, not the negative-roundoff clamp. Same-basis channels commute for
+every gauge and are skipped structurally.
+
+For `L=X@diag(ell)@X.T`, `eigh_vjp` implements
+
+```
+M = X.T@bar_X
+D[a,b] = 1/(ell[b]-ell[a]) for a != b; D[a,a] = 0
+bar_L = X @ (diag(bar_ell)+sym(D*M)) @ X.T
+```
+
+The rotated-factor derivative then gives the ambient gauge derivative
+`E[gamma,eta] = sum_pr bar_L[gamma,p,r]*L_original[eta,p,r]`.
+For both fixed and moving-bound objectives, `GaugeGradient` returns:
+
+| Field | Meaning |
+| --- | --- |
+| `loss`, `decomposition` | Value and the exact corresponding channel snapshot |
+| `gradient_O` | Ambient gauge derivative E |
+| `fixed_gradient_O` | Contribution holding physical t fixed |
+| `bound_correction_O` | Moving-interval contribution; sum with the previous field gives E |
+| `tangent_gradient` | Frobenius-metric tangent projection at O |
+| `generator_gradient` | `skew(E@O.T)`; tangent gradient is this matrix times O |
+| `partition_gradient` | Physical t gradient, not a z gradient |
+| `eigenvalue_gradient`, `eigenvector_gradient` | Spectral adjoints; the former includes bound response |
+| `rotated_cholesky_gradient` | Symmetric factor adjoints including bound response |
+| `normalized_partitions`, `inner_result` | z for fixed-z/relaxed modes; inner diagnostics for relaxed mode |
+
+All derivative arrays are owned read-only snapshots. For a left tangent
+direction `delta_O=K@O`, with `K.T=-K`, the directional derivative is
+`sum(gradient_O*(K@O))`. The local plane-angle derivative is **twice** the
+upper entry of `generator_gradient`, because the skew generator has both
+an upper and a lower varying entry. This factor is distinct from any
+choice of manifold metric.
+
+### Exponential and ordered Givens coordinates
+
+`exponential_gauge_vjp(theta,r,E,reference=None)` uses the exact Frechet
+adjoint of `expm(S(theta))@reference`. A local tangent generator is not
+the gradient in accumulated global exponential coordinates at nonzero theta.
+
+`givens_gauge_vjp(r,rotations,E,reference=None)` differentiates the exact
+left-multiplication order in `givens_gauge`, including repeated plane indices.
+The returned vector has one entry per rotation in the original list order.
+Reflection references and the zero-parameter r=1 exponential case are supported.
+
+### Smooth-branch requirements
+
+`GradientOptions` configures per-factor eigengap and near-zero tolerances.
+The implementation raises `GaugeRegularityError` for repeated/near-degenerate
+Cholesky eigenvalues; it never adds an epsilon to their differences. It also
+rejects zero/near-zero eigenvalues used by `balanced_log`, where the square
+root/absolute-value sign branch need not have a smooth gauge derivative.
+`anchored_log` supports a simple zero eigenvalue because its amplitudes are
+linear in the individual eigenvalues; the other eigengaps must still be regular.
+
+For moving-bound derivatives, an amplitude endpoint tied with the numerical
+cap or a collapsed interval is reported explicitly when needed by the chain
+rule. Active-set or eigenvalue branch changes can require directional rather
+than ordinary smooth derivatives. These cases are not silently smoothed.
+
+### Checking the two gradient definitions separately
+
+```python
+from ipie.hamiltonians.optimize_cholesky import check_gauge_direction
+
+# K is any skew-symmetric r*r matrix. Keep the same t on every trial.
+fixed_check = check_gauge_direction(
+    lambda matrix: evaluator.fixed(matrix, t=0.0), O, K,
+)
+
+# Re-relax at EVERY positive and negative finite-difference point.
+seed = relaxed.decomposition.two_body.t
+relaxed_check = check_gauge_direction(
+    lambda matrix: evaluator.relaxed(
+        matrix, t0=seed, max_sweeps=500,
+        gradient_atol=1e-12, gradient_rtol=0,
+    ), O, K,
+)
+for row in relaxed_check.differences:
+    print(row.step, relaxed_check.analytic,
+          row.finite_difference, row.absolute_error)
+```
+
+Use the same bound settings at every point if the center used nondefault
+`amplitude_limit` or `max_abs_t`. The helper uses the orthogonality-preserving
+path `expm(step*K)@O` and reports a sequence of central differences, rather
+than a single step-size result.
+
+```sh
+python -m unittest ipie.hamiltonians.optimize_cholesky.tests.test_gradients -v
+python -m unittest discover -s ipie/hamiltonians/optimize_cholesky/tests -v
+```
+
+The step-5 tests separately cover fixed t versus independent dense differences,
+fixed z with moving and capped intervals, and re-relaxed envelope gradients.
+They include all three sectors, both partition maps, active walls with nonzero
+raw t gradients, interior solutions, exact coordinate-map pullbacks, simple
+zero anchored legs, regularity failures and Hamiltonian reconstruction.
+At active amplitude bounds the tests also verify that omitting the correction
+produces an appreciably wrong derivative.
+
+Step 4 received one numerical fix needed for tight relaxed-gradient checks:
+`PartitionCoefficients.change(t)` uses `expm1` for tiny coordinate changes.
+Subtracting four nearly equal profile terms could previously hide a legitimate
+small decrease and stall the inner solve above its requested gradient tolerance.
+
 
 
 

@@ -6,6 +6,8 @@ from .models import (
     DensitySource, FixedDecomposition, OneBodyChannel, OneBodyDecomposition,
     TwoBodyDecomposition, CommutatorLoss, PartitionCoefficients,
     PartitionSweep, PartitionOptimizationResult,
+    GaugeRegularityError, InnerConvergenceError, GradientOptions, GaugeGradient,
+    GaugeDifference, GaugeGradientCheck,
 )
 from .prepare import (
     load_problem, prepare_problem, select_sector_policy,
@@ -27,6 +29,13 @@ from .partitions import (
     analytic_partition_update, optimize_partitions, partition_bounds,
     partition_coefficients, projected_partition_gradient, with_partitions,
 )
+from .derivatives import (
+    commutator_norm2_derivatives, eigh_vjp, exponential_gauge_vjp, givens_gauge_vjp,
+)
+from .gradients import (
+    GaugeEvaluator, fixed_partition_gradient, normalized_partition_gradient,
+    relaxed_gauge_gradient, check_gauge_direction,
+)
 
 __all__ = [
     "Channel", "ErrorMetric", "GaugeState", "PreparedProblem", "TensorData",
@@ -43,7 +52,12 @@ __all__ = [
     "PartitionCoefficients", "PartitionSweep", "PartitionOptimizationResult",
     "analytic_partition_update", "optimize_partitions", "partition_bounds",
     "partition_coefficients", "projected_partition_gradient", "with_partitions",
+    "GaugeRegularityError", "InnerConvergenceError", "GradientOptions", "GaugeGradient",
+    "GaugeDifference", "GaugeGradientCheck", "commutator_norm2_derivatives", "eigh_vjp",
+    "exponential_gauge_vjp", "givens_gauge_vjp", "GaugeEvaluator", "fixed_partition_gradient",
+    "normalized_partition_gradient", "relaxed_gauge_gradient", "check_gauge_direction",
 ]
+
 
 
 

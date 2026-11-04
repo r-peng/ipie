@@ -103,17 +103,30 @@ def partition_bounds(decomposition, *, amplitude_limit=None, max_abs_t=30.0):
     """
     _validate_partition_state(decomposition)
     two = decomposition.two_body
+    return _partition_intervals(two.gauge.eigenvalues, two.sources, two.tau2,
+                                two.partition, two.amplitude_bound,
+                                amplitude_limit=amplitude_limit, max_abs_t=max_abs_t)
+
+
+def _partition_limits(amplitude_bound, amplitude_limit, max_abs_t):
     cap = positive_scale(max_abs_t, "max_abs_t")
-    rho = (1.0-1e-8)*two.amplitude_bound if amplitude_limit is None else positive_scale(
+    rho = (1.0-1e-8)*amplitude_bound if amplitude_limit is None else positive_scale(
         amplitude_limit, "amplitude_limit")
-    if not 0 < rho < two.amplitude_bound or not np.log(rho) < np.log(two.amplitude_bound):
+    if not 0 < rho < amplitude_bound or not np.log(rho) < np.log(amplitude_bound):
         raise ValueError("amplitude_limit must be strictly below the open amplitude_bound")
+    return rho, cap
+
+
+def _partition_intervals(eigenvalues, sources, tau2, partition, amplitude_bound, *,
+                         amplitude_limit=None, max_abs_t=30.0):
+    """Same bounds before a feasible starting decomposition has been built."""
+    rho, cap = _partition_limits(amplitude_bound, amplitude_limit, max_abs_t)
     log_rho = math.log(rho)
-    log_tau = math.log(two.tau2)
-    bounds = np.empty((len(two.sources), 2))
-    for i, source in enumerate(two.sources):
-        left, right = (two.gauge.eigenvalues[source.bix, p] for p in source.modes)
-        if two.partition == "balanced_log":
+    log_tau = math.log(tau2)
+    bounds = np.empty((len(sources), 2))
+    for i, source in enumerate(sources):
+        left, right = (eigenvalues[source.bix, p] for p in source.modes)
+        if partition == "balanced_log":
             base = (-np.inf if left == 0 or right == 0 else
                     0.5*(math.log(abs(left))+math.log(abs(right))+log_tau))
             log_left = log_right = base
@@ -326,8 +339,7 @@ def optimize_partitions(decomposition, *, max_sweeps=100,
             step = optimal-current.t
             if step == 0:
                 continue
-            left, right = current.terms(optimal)
-            change = math.fsum((left, right, -current.left_term, -current.right_term))
+            change = current.change(optimal)
             roundoff = 128*np.finfo(float).eps*max(workspace.loss, current.left_term,
                                                 current.right_term, np.finfo(float).tiny)
             if change > roundoff:
@@ -352,4 +364,6 @@ def optimize_partitions(decomposition, *, max_sweeps=100,
     return PartitionOptimizationResult(
         workspace.snapshot(), initial_loss, workspace.loss, bounds, coefficients,
         gradient, projected, threshold, tuple(history), bool(converged),
-        "converged" if converged else "max_sweeps")
+        "converged" if converged else "max_sweeps",
+        *_partition_limits(decomposition.two_body.amplitude_bound, amplitude_limit, max_abs_t))
+
