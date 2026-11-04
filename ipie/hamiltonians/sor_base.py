@@ -153,12 +153,12 @@ class SizeGroup:
             if np.fabs(Wpq)<thresh:
                 continue
             if S is None:
-                self.add_2body_hubbard(bix,(0,0),a,Wpq,[p,q])
+                self.add_2body_hubbard(bix,(0,0),a,Wpq,[p,q],uniform=uniform)
             else:
-                self.add_2body_hubbard(bix,(0,0),.5*a,Wpq,[p,q])
-                self.add_2body_hubbard(bix,(0,0),.5*a,Wpq,[q,p])
+                self.add_2body_hubbard(bix,(0,0),a,.5*Wpq,[p,q],uniform=uniform)
+                self.add_2body_hubbard(bix,(0,0),a,.5*Wpq,[q,p],uniform=uniform)
 
-    def decompose_full_2body(self,bix,dt,niform='coefficient',thresh=1e-6):
+    def decompose_full_2body(self,bix,dt,uniform='coefficient',thresh=1e-6):
         W = self.integrals[bix]
         S = self.overlaps[bix]
         a = 1./np.sqrt(dt)
@@ -197,6 +197,7 @@ class SumOfRotationBase:
         # one with key=number of auxiliary modes
 
     def decompose_h1(self,h1,dt,uniform='coefficient',iprint=0):
+        # for cholesky vectors, pass the effective h'
         if iprint>0:
             print('1-body decomposition: ')
             print('a=',1./dt)
@@ -227,7 +228,7 @@ class SumOfRotationBase:
                 print(f'spin={s} bands:',ek)
             sg.add_basis(vk,ek,'h1')
             bix = sg.get_basis_index()
-            sg.decompose_1body(bix,s,dt,uniform=uniform,hresh=self.thresh)
+            sg.decompose_1body(bix,s,dt,uniform=uniform,thresh=self.thresh)
         self.size_groups[self.nbasis] = sg
 
     def parse_decomposition(self,iprint=0):
@@ -289,7 +290,7 @@ class SumOfRotationBase:
         self.a /= self.denom
         self.nterms = self.a.size
         if iprint>0:
-            print(f'asum1={self.asum1},asum2={self.asum2},const={self.const}')
+            print(f'asum1={self.asum1},asum2={self.asum2}')
             print('normalization=',xp.fabs(self.a).sum())
             print('number of terms=',self.nterms)
             #print('a=',self.a)
@@ -380,7 +381,7 @@ class HubbardSOR(SumOfRotationBase):
             print('Hubbard 2-body decomposition: ')
             print('coefficient =',a)
             print('rotation =',np.sqrt(U*dt))
-        sg.decompose_hubbard(bix,dt,rho)
+        sg.decompose_hubbard(bix,dt)
         self.size_groups[self.nbasis] = sg
 
 class QCSOR(SumOfRotationBase):
