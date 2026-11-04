@@ -627,6 +627,78 @@ pullbacks) and `gradients.py` (complete fixed-partition and relaxed gradients).
 They use NumPy/SciPy float64 arithmetic, with no autodiff dependency. The
 objective remains the unweighted squared `L_raw` from step 3.
 
+### Derivative backend option
+
+Select the derivative backend when constructing the engine:
+
+```python
+evaluator = GaugeEvaluator(
+    problem, tau1=dt, tau2=dt,
+    partition="balanced_log", backend="numpy",
+)
+print(evaluator.backend)  # "numpy", read-only
+```
+
+`backend` defaults to `"numpy"`, preserving existing calls and numerical
+results. The accepted names are case-sensitive:
+
+| Backend request | Current behavior |
+| --- | --- |
+| `"numpy"` | Existing analytic NumPy/SciPy derivatives |
+| `"pytorch"` | Reserved; immediately raises `NotImplementedError` |
+| Another string | Raises `ValueError` |
+| A non-string | Raises `TypeError` |
+
+The engine validates this choice before one-body setup, eigendecomposition
+or inner optimization. The reserved path never imports PyTorch and never
+silently falls back to NumPy. No PyTorch installation is needed.
+The selection remains fixed for that engine instance; construct a new engine
+to request a different backend.
+
+The same optional keyword is available on standalone derivative entry points:
+
+```python
+fixed = fixed_partition_gradient(problem, decomposition, backend="numpy")
+normalized = normalized_partition_gradient(
+    problem, decomposition, backend="numpy",
+)
+relaxed = relaxed_gauge_gradient(problem, partition_result, backend="numpy")
+
+gradient_theta = exponential_gauge_vjp(
+    theta, r, fixed.gradient_O, reference=None, backend=evaluator.backend,
+)
+gradient_angles = givens_gauge_vjp(
+    r, rotations, fixed.gradient_O, reference=None, backend=evaluator.backend,
+)
+```
+
+Existing positional reference arguments for the two coordinate pullbacks
+remain valid. The small overlap/eigh primitives remain explicit NumPy
+helpers; backend resolution is kept outside the channel-pair loops.
+`check_gauge_direction` uses the backend already selected by its evaluator
+callable. Input preparation, channel construction, partition optimization
+and value-only loss functions retain their current NumPy interfaces.
+
+This is a derivative-computation setting, separate from the `dense`/`overlap`
+loss method and from the global `ipie.utils.backend` array backend.
+`backends.py` centralizes name validation. The current forward calculations,
+SciPy operations and immutable NumPy snapshots are not a PyTorch autograd
+graph. A future PyTorch implementation must supply a tensor-based forward
+and derivative path, including the relaxed moving-bound chain rule; changing
+the accepted backend name alone will not provide that support. Public engine
+and derivative calls can keep the interface introduced here.
+
+Backend compatibility tests:
+
+```sh
+python -m unittest ipie.hamiltonians.optimize_cholesky.tests.test_backends -v
+```
+
+These tests verify default/explicit NumPy equality in all three gauge modes,
+standalone and coordinate-pullback compatibility, immediate unsupported-backend
+errors, invalid-name/type errors, and operation in a fresh interpreter that
+blocks every `torch` import.
+
 ### Evaluating a trial gauge
 
 ```python
@@ -859,6 +931,7 @@ Step 4 received one numerical fix needed for tight relaxed-gradient checks:
 `PartitionCoefficients.change(t)` uses `expm1` for tiny coordinate changes.
 Subtracting four nearly equal profile terms could previously hide a legitimate
 small decrease and stall the inner solve above its requested gradient tolerance.
+
 
 
 

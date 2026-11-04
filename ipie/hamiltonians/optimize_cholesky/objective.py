@@ -229,3 +229,4 @@ def commutator_loss(decomposition, *, method="overlap", normalize_weights=True):
 def raw_loss(decomposition, *, method="overlap"):
     """Only L_raw: the unweighted sum of squared single-particle norms."""
     return commutator_loss(decomposition, method=method).comm2
+

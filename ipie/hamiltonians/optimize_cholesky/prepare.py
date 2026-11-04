@@ -189,3 +189,4 @@ def build_gauge_state(data, O=None, options=None):
         array.setflags(write=False)
     return GaugeState(state.O, state.chol, state.eigenvalues, state.X, report)
 
+

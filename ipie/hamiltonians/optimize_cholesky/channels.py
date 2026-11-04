@@ -246,3 +246,4 @@ def get_rotation_matrix(decomposition, index):
                                          decomposition.one_body)
     return two_body_rotation_matrix(decomposition.two_body.channels[index-n_one],
                                      decomposition.two_body.gauge)
+

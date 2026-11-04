@@ -9,6 +9,27 @@ from .partitions import _readonly
 from .prepare import exponential_gauge, givens_gauge, skew_from_parameters
 from .validation import _real_array
 
+def _resolve_derivative_backend(backend):
+    """Validate a backend request before entering numerical work.
+
+    Keep this outside the channel-pair kernels. A future PyTorch backend must
+    implement the differentiable forward/gradient path at the gauge-gradient
+    entry points; accepting the name alone would not create an autograd graph.
+    """
+    if not isinstance(backend, str):
+        raise TypeError("Derivative backend must be a string: 'numpy' or 'pytorch'")
+    if backend == "numpy":
+        return backend
+    if backend == "pytorch":
+        raise NotImplementedError(
+            "Derivative backend 'pytorch' is not implemented yet; use backend='numpy'. "
+            "The current implementation uses analytic NumPy/SciPy derivatives."
+        )
+    raise ValueError(
+        f"Unknown derivative backend {backend!r}; expected 'numpy' or 'pytorch' "
+        "('pytorch' is reserved and not implemented yet)"
+    )
+
 
 def _gradient_options(options):
     if options is None:
@@ -68,12 +89,14 @@ def eigh_vjp(eigenvalues, eigenvectors, grad_values, grad_vectors, *, options=No
     return _readonly((result+result.T)/2)
 
 
-def exponential_gauge_vjp(theta, nchol, gradient_O, reference=None):
+def exponential_gauge_vjp(theta, nchol, gradient_O, reference=None, *, backend="numpy"):
     """Gradient in the packed global exponential coordinates of prepare.py.
 
     O=expm(S(theta))@reference. Uses the exact Frechet adjoint; the local
     skew generator gradient is not the global theta gradient away from zero.
+    The optional backend matches GaugeEvaluator; 'pytorch' is not implemented.
     """
+    _resolve_derivative_backend(backend)
     O = exponential_gauge(theta,nchol,reference)
     E = _real_array(gradient_O,"gradient_O")
     if E.shape != O.shape:
@@ -85,8 +108,12 @@ def exponential_gauge_vjp(theta, nchol, gradient_O, reference=None):
     return _readonly(adjoint[rows,cols]-adjoint[cols,rows])
 
 
-def givens_gauge_vjp(nchol, rotations, gradient_O, reference=None):
-    """Angle gradient in the exact ordered Givens sequence of prepare.py."""
+def givens_gauge_vjp(nchol, rotations, gradient_O, reference=None, *, backend="numpy"):
+    """Angle gradient in the exact ordered Givens sequence of prepare.py.
+
+    The optional backend matches GaugeEvaluator; 'pytorch' is not implemented.
+    """
+    _resolve_derivative_backend(backend)
     rotations = tuple(rotations)
     O = givens_gauge(nchol,rotations,reference)
     E = _real_array(gradient_O,"gradient_O")
@@ -109,3 +136,4 @@ def givens_gauge_vjp(nchol, rotations, gradient_O, reference=None):
         gradient[i] = np.sum(ep*(-s*rp+c*rq))+np.sum(eq*(-c*rp-s*rq))
         adjoint[p],adjoint[q] = c*ep-s*eq,s*ep+c*eq
     return _readonly(gradient)
+

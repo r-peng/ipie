@@ -13,7 +13,7 @@ from scipy.linalg import expm
 
 from .channels import (build_one_body_channels, enumerate_sources,
                        fixed_partition_amplitudes, positive_scale)
-from .derivatives import _gradient_options, commutator_norm2_derivatives, eigh_vjp
+from .derivatives import _gradient_options, commutator_norm2_derivatives, eigh_vjp, _resolve_derivative_backend
 from .models import (
     FixedDecomposition, GaugeDifference, GaugeGradient, GaugeGradientCheck,
     GaugeRegularityError, GaugeState, InnerConvergenceError,
@@ -26,7 +26,6 @@ from .partitions import (
 )
 from .prepare import diagonalize_factors, rotate_cholesky
 from .validation import _gauge_array, _real_array
-
 
 def _coordinates(value, count, name):
     values = _real_array(value,name)
@@ -210,22 +209,26 @@ def _assemble(problem,decomposition,options,mode,*,bounds=None,amplitude_limit=N
         None if z is None else _readonly(z),inner_result)
 
 
-def fixed_partition_gradient(problem,decomposition,*,options=None):
+def fixed_partition_gradient(problem,decomposition,*,options=None,backend="numpy"):
     """d L_raw/dO with physical log ratios t held fixed, including eigh.
 
     No partition-bound response is part of this derivative. Trial gauges with
     the same t must independently satisfy the open amplitude domain.
+    backend='pytorch' is reserved and raises NotImplementedError.
     """
+    _resolve_derivative_backend(backend)
     return _assemble(problem,decomposition,_gradient_options(options),"fixed_t")
 
 
 def normalized_partition_gradient(problem,decomposition,*,amplitude_limit=None,
-                                  max_abs_t=30.,options=None):
+                                  max_abs_t=30.,options=None,backend="numpy"):
     """Gauge derivative at fixed z in t=(lower+upper)/2+(upper-lower)*z/2.
 
     This supports both maps and capped/asymmetric intervals. It is different
     from a fixed-t derivative even when no partition optimizer is involved.
+    backend='pytorch' is reserved and raises NotImplementedError.
     """
+    _resolve_derivative_backend(backend)
     two = decomposition.two_body
     bounds = _partition_intervals(two.gauge.eigenvalues,two.sources,two.tau2,
                                  two.partition,two.amplitude_bound,
@@ -234,20 +237,22 @@ def normalized_partition_gradient(problem,decomposition,*,amplitude_limit=None,
                      bounds=bounds,amplitude_limit=amplitude_limit,max_abs_t=max_abs_t)
 
 
-def relaxed_gauge_gradient(problem,result,*,options=None):
+def relaxed_gauge_gradient(problem,result,*,options=None,backend="numpy"):
     """Envelope gradient at a converged step-4 solution, including moving bounds.
 
     Uses the recorded amplitude_limit/max_abs_t, not guessed default bounds.
     Assumes a regular consistently tracked local inner minimum; no claim of
     a global inner solution is made for a general multi-source problem.
+    backend='pytorch' is rejected before inspecting the inner result.
     """
+    backend = _resolve_derivative_backend(backend)
     if not isinstance(result,PartitionOptimizationResult):
         raise TypeError("result must be PartitionOptimizationResult")
     if not result.converged:
         raise InnerConvergenceError("Relaxed gradient requires a converged partition solve",result)
     derivative = normalized_partition_gradient(
         problem,result.decomposition,amplitude_limit=result.amplitude_limit,
-        max_abs_t=result.max_abs_t,options=options)
+        max_abs_t=result.max_abs_t,options=options,backend=backend)
     two = result.decomposition.two_body
     bounds = _partition_intervals(two.gauge.eigenvalues,two.sources,two.tau2,
                                  two.partition,two.amplitude_bound,
@@ -270,9 +275,13 @@ class GaugeEvaluator:
 
     Cache fixed h channels/source topology, rotate/eigh once at each trial O,
     then evaluate without n^4 ERI reconstruction. No outer optimizer is run.
+    Select derivative computation with backend='numpy' (default). The reserved
+    backend='pytorch' raises before initialization performs numerical work.
     """
 
-    def __init__(self,problem,*,tau1,tau2,partition="balanced_log",amplitude_bound=1.,options=None):
+    def __init__(self,problem,*,tau1,tau2,partition="balanced_log",amplitude_bound=1.,
+                 options=None,backend="numpy"):
+        self._backend = _resolve_derivative_backend(backend)
         if not isinstance(problem,PreparedProblem):
             raise TypeError("problem must be a PreparedProblem")
         self.problem = problem
@@ -287,6 +296,11 @@ class GaugeEvaluator:
         counts = [2 if s.kind == "two_branch" else 4 for s in self.sources]
         endpoints = np.r_[0,np.cumsum(counts)]
         self.source_slices = tuple((int(a),int(b)) for a,b in zip(endpoints[:-1],endpoints[1:]))
+
+    @property
+    def backend(self):
+        """Derivative backend chosen at construction (read-only)."""
+        return self._backend
 
     def _gauge(self,O):
         data = self.problem.data
@@ -312,7 +326,8 @@ class GaugeEvaluator:
 
     def fixed(self,O=None,*,t=0.):
         """Loss and derivative with t fixed; appropriate for the two-orbital shortcut."""
-        return fixed_partition_gradient(self.problem,self.decomposition(O,t=t),options=self.options)
+        return fixed_partition_gradient(self.problem,self.decomposition(O,t=t),
+                                         options=self.options,backend=self.backend)
 
     def _bounds(self,gauge,amplitude_limit,max_abs_t):
         return _partition_intervals(gauge.eigenvalues,self.sources,self.tau2,
@@ -330,7 +345,7 @@ class GaugeEvaluator:
         t = np.where(z == 1,bounds[:,1],np.where(z == -1,bounds[:,0],t))
         return normalized_partition_gradient(self.problem,self._decomposition(gauge,t),
                                               amplitude_limit=amplitude_limit,max_abs_t=max_abs_t,
-                                              options=self.options)
+                                              options=self.options,backend=self.backend)
 
     def relaxed(self,O=None,*,t0=None,max_sweeps=500,gradient_atol=1e-11,
                 gradient_rtol=1e-9,amplitude_limit=None,max_abs_t=30.):
@@ -347,7 +362,7 @@ class GaugeEvaluator:
         inner = optimize_partitions(self._decomposition(gauge,t),max_sweeps=max_sweeps,
                                     gradient_atol=gradient_atol,gradient_rtol=gradient_rtol,
                                     amplitude_limit=amplitude_limit,max_abs_t=max_abs_t)
-        return relaxed_gauge_gradient(self.problem,inner,options=self.options)
+        return relaxed_gauge_gradient(self.problem,inner,options=self.options,backend=self.backend)
 
 
 def check_gauge_direction(evaluator,O,K,*,steps=(1e-3,3e-4,1e-4,3e-5,1e-5)):
@@ -376,3 +391,4 @@ def check_gauge_direction(evaluator,O,K,*,steps=(1e-3,3e-4,1e-4,3e-5,1e-5)):
         scale = max(abs(finite),abs(analytic),np.finfo(float).tiny)
         differences.append(GaugeDifference(step,float(finite),float(error),float(error/scale)))
     return GaugeGradientCheck(analytic,tuple(differences))
+

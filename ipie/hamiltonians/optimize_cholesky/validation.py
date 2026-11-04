@@ -174,3 +174,4 @@ def validate_gauge_state(data, state, options=None):
     checks["normal_order_invariance"] = _metric(rotated_square_sum, original_square_sum, options)
     return _require_report(ValidationReport(checks, options))
 
+

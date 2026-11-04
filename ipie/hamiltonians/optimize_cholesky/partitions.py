@@ -367,3 +367,4 @@ def optimize_partitions(decomposition, *, max_sweeps=100,
         "converged" if converged else "max_sweeps",
         *_partition_limits(decomposition.two_body.amplitude_bound, amplitude_limit, max_abs_t))
 
+
