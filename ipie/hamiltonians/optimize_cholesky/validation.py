@@ -175,3 +175,4 @@ def validate_gauge_state(data, state, options=None):
     return _require_report(ValidationReport(checks, options))
 
 
+

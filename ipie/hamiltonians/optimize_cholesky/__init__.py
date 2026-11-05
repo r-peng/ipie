@@ -8,6 +8,9 @@ from .models import (
     PartitionSweep, PartitionOptimizationResult,
     GaugeRegularityError, InnerConvergenceError, GradientOptions, GaugeGradient,
     GaugeDifference, GaugeGradientCheck,
+    GaugeFeasibilityError, InnerOptions, OptimizerOptions, LBFGSOptions,
+    OuterOptions, ExponentialEvaluation, OptimizerIteration, OuterIteration,
+    OuterTrial, OuterOptimizationResult,
 )
 from .prepare import (
     load_problem, prepare_problem, select_sector_policy,
@@ -36,6 +39,11 @@ from .gradients import (
     GaugeEvaluator, fixed_partition_gradient, normalized_partition_gradient,
     relaxed_gauge_gradient, check_gauge_direction,
 )
+from .outer import ExponentialGaugeObjective, optimize_gauge
+from .solvers import (
+    OuterOptimizer, LBFGSOptimizer, GDMOptimizer,
+    OptimizerRun, OptimizerStep, OptimizerSummary,
+)
 
 __all__ = [
     "Channel", "ErrorMetric", "GaugeState", "PreparedProblem", "TensorData",
@@ -56,7 +64,14 @@ __all__ = [
     "GaugeDifference", "GaugeGradientCheck", "commutator_norm2_derivatives", "eigh_vjp",
     "exponential_gauge_vjp", "givens_gauge_vjp", "GaugeEvaluator", "fixed_partition_gradient",
     "normalized_partition_gradient", "relaxed_gauge_gradient", "check_gauge_direction",
+    "GaugeFeasibilityError", "InnerOptions", "OptimizerOptions", "LBFGSOptions",
+    "OuterOptions", "ExponentialEvaluation", "OptimizerIteration",
+    "OuterIteration", "OuterTrial", "OuterOptimizationResult",
+    "ExponentialGaugeObjective", "optimize_gauge",
+    "OuterOptimizer", "LBFGSOptimizer", "GDMOptimizer",
+    "OptimizerRun", "OptimizerStep", "OptimizerSummary",
 ]
+
 
 
 

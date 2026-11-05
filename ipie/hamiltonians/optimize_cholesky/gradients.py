@@ -11,18 +11,34 @@ import math
 import numpy as np
 from scipy.linalg import expm
 
-from .channels import (build_one_body_channels, enumerate_sources,
-                       fixed_partition_amplitudes, positive_scale)
+from .channels import (
+        build_one_body_channels, 
+        enumerate_sources,
+        fixed_partition_amplitudes, 
+        positive_scale
+)
 from .derivatives import _gradient_options, commutator_norm2_derivatives, eigh_vjp, _resolve_derivative_backend
 from .models import (
-    FixedDecomposition, GaugeDifference, GaugeGradient, GaugeGradientCheck,
-    GaugeRegularityError, GaugeState, InnerConvergenceError,
-    PartitionOptimizationResult, PreparedProblem, TwoBodyDecomposition,
+    FixedDecomposition, 
+    GaugeDifference, 
+    GaugeGradient, 
+    GaugeGradientCheck,
+    GaugeRegularityError, 
+    GaugeState, 
+    InnerConvergenceError,
+    PartitionOptimizationResult, 
+    PreparedProblem, 
+    TwoBodyDecomposition,
 )
 from .objective import OverlapEvaluator
 from .partitions import (
-    _partition_intervals, _partition_limits, _readonly, _source_channels,
-    _validate_partition_state, optimize_partitions, projected_partition_gradient,
+    _partition_intervals, 
+    _partition_limits, 
+    _readonly, 
+    _source_channels,
+    _validate_partition_state, 
+    optimize_partitions, 
+    projected_partition_gradient,
 )
 from .prepare import diagonalize_factors, rotate_cholesky
 from .validation import _gauge_array, _real_array
@@ -250,9 +266,14 @@ def relaxed_gauge_gradient(problem,result,*,options=None,backend="numpy"):
         raise TypeError("result must be PartitionOptimizationResult")
     if not result.converged:
         raise InnerConvergenceError("Relaxed gradient requires a converged partition solve",result)
-    derivative = normalized_partition_gradient(
-        problem,result.decomposition,amplitude_limit=result.amplitude_limit,
-        max_abs_t=result.max_abs_t,options=options,backend=backend)
+    try:
+        derivative = normalized_partition_gradient(
+            problem,result.decomposition,amplitude_limit=result.amplitude_limit,
+            max_abs_t=result.max_abs_t,options=options,backend=backend)
+    except (GaugeRegularityError,FloatingPointError,np.linalg.LinAlgError) as exc:
+        # A rejected outer trial can still account for the completed inner work.
+        exc.inner_result = result
+        raise
     two = result.decomposition.two_body
     bounds = _partition_intervals(two.gauge.eigenvalues,two.sources,two.tau2,
                                  two.partition,two.amplitude_bound,
@@ -391,4 +412,5 @@ def check_gauge_direction(evaluator,O,K,*,steps=(1e-3,3e-4,1e-4,3e-5,1e-5)):
         scale = max(abs(finite),abs(analytic),np.finfo(float).tiny)
         differences.append(GaugeDifference(step,float(finite),float(error),float(error/scale)))
     return GaugeGradientCheck(analytic,tuple(differences))
+
 

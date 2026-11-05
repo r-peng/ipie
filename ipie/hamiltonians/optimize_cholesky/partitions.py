@@ -13,8 +13,12 @@ import numpy as np
 
 from .channels import fixed_partition_amplitudes, positive_scale
 from .models import (
-    Channel, FixedDecomposition, PartitionCoefficients,
-    PartitionOptimizationResult, PartitionSweep,
+    Channel, 
+    FixedDecomposition, 
+    PartitionCoefficients, 
+    GaugeFeasibilityError,
+    PartitionOptimizationResult, 
+    PartitionSweep,
 )
 from .objective import OverlapEvaluator, commutator_norm2
 from .validation import _real_array
@@ -135,7 +139,7 @@ def _partition_intervals(eigenvalues, sources, tau2, partition, amplitude_bound,
             log_right = -np.inf if right == 0 else math.log(abs(right))+0.5*log_tau
         lower, upper = max(-cap, log_right-log_rho), min(cap, log_rho-log_left)
         if lower > upper:
-            raise ValueError(f"Source {i} has no feasible partition within the requested bounds; "
+            raise GaugeFeasibilityError(f"Source {i} has no feasible partition within the requested bounds; "
                              "reduce tau2, increase amplitude_limit or increase max_abs_t")
         bounds[i] = (lower, upper)
     return _readonly(bounds)
@@ -366,5 +370,6 @@ def optimize_partitions(decomposition, *, max_sweeps=100,
         gradient, projected, threshold, tuple(history), bool(converged),
         "converged" if converged else "max_sweeps",
         *_partition_limits(decomposition.two_body.amplitude_bound, amplitude_limit, max_abs_t))
+
 
 

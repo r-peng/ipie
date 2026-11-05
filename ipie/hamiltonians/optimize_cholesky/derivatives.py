@@ -137,3 +137,4 @@ def givens_gauge_vjp(nchol, rotations, gradient_O, reference=None, *, backend="n
         adjoint[p],adjoint[q] = c*ep-s*eq,s*ep+c*eq
     return _readonly(gradient)
 
+

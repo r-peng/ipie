@@ -1,10 +1,11 @@
-# Cholesky optimization: steps 1 through 5
+# Cholesky optimization: steps 1 through 6
 
 This package implements input models, HDF5 loading, orthogonal Cholesky gauges,
 factor diagonalization, deterministic identity checks, density-channel
 construction, dense/overlap commutator loss, partition optimization, and
-analytic gauge gradients. An outer gauge optimizer and the `sor_base.py`
-adapter remain future steps.
+analytic gauge gradients, and fixed-exponential outer gauge optimization.
+The outer driver has a solver-independent parent and a working L-BFGS child.
+The `sor_base.py` adapter remains a future step.
 
 The package lives at `ipie/hamiltonians/optimize_cholesky/`. Run the examples
 and tests from the ipie repository root, or with ipie installed. Imports start
@@ -681,7 +682,7 @@ and value-only loss functions retain their current NumPy interfaces.
 
 This is a derivative-computation setting, separate from the `dense`/`overlap`
 loss method and from the global `ipie.utils.backend` array backend.
-`backends.py` centralizes name validation. The current forward calculations,
+`derivatives.py` centralizes name validation. The current forward calculations,
 SciPy operations and immutable NumPy snapshots are not a PyTorch autograd
 graph. A future PyTorch implementation must supply a tensor-based forward
 and derivative path, including the relaxed moving-bound chain rule; changing
@@ -931,6 +932,326 @@ Step 4 received one numerical fix needed for tight relaxed-gradient checks:
 `PartitionCoefficients.change(t)` uses `expm1` for tiny coordinate changes.
 Subtracting four nearly equal profile terms could previously hide a legitimate
 small decrease and stall the inner solve above its requested gradient tolerance.
+
+## Step 6: outer optimization in fixed exponential coordinates
+
+`outer.py` supplies the fixed-exponential reduced objective. The concrete
+`LBFGSOptimizer` in `solvers/lbfgs.py` minimizes it with Armijo backtracking,
+using the shared `OuterOptimizer` lifecycle in `solvers/base.py`. The
+reference matrix stays fixed for the entire L-BFGS run:
+
+```
+O(theta) = expm(S(theta)) @ reference
+F(theta) = L_raw(O(theta), t_star(O(theta)))
+```
+
+`S` uses the same strict-upper-triangle packing as `exponential_gauge`.
+Every new trial gauge independently relaxes the complete partition block
+and computes the step-5 moving-bound envelope gradient. This includes
+rejected line-search points. No finite-difference outer gradient or
+differentiation through the partition-sweep algorithm is used.
+
+### Run a nested outer solve
+
+```python
+from ipie.hamiltonians.optimize_cholesky import (
+    GaugeEvaluator, InnerOptions, ExponentialGaugeObjective,
+    LBFGSOptions, LBFGSOptimizer,
+)
+
+engine = GaugeEvaluator(
+    problem, tau1=dt, tau2=dt, partition="balanced_log", backend="numpy",
+)
+
+def report(row):
+    print(
+        f"outer {row.iteration:3d}: L_raw={row.loss:.10e} "
+        f"g_theta={row.gradient_norm:.3e} "
+        f"g_tangent={row.tangent_gradient_norm:.3e} "
+        f"inner_sweeps={row.inner_sweeps}"
+    )
+
+objective = ExponentialGaugeObjective(
+    engine,
+    reference=None,    # identity by default
+    inner_t0=None,     # each trial starts at its own interval midpoints
+    inner_options=InnerOptions(
+        max_sweeps=500, gradient_atol=1e-12, gradient_rtol=0,
+        amplitude_limit=None, max_abs_t=30.0,
+    ),
+)
+solver = LBFGSOptimizer(
+    objective,
+    options=LBFGSOptions(
+        max_iterations=100, max_evaluations=1000,
+        gradient_atol=1e-8, gradient_rtol=1e-6,
+        memory=10, max_step_norm=1.0,
+    ),
+)
+result = solver.optimize(initial=None, callback=report)  # zero theta by default
+
+print(result.status, result.message)
+print(result.initial_loss, result.loss, result.gradient_norm)
+print(result.partition_result.projected_gradient_norm)
+optimized = result.decomposition
+O_optimized = result.O
+```
+
+`result.loss` is the raw squared commutator loss at the final accepted gauge
+and its final relaxed partitions. `result.initial_loss` is already the
+**relaxed** loss at the initial gauge; it is not an unrelaxed baseline.
+The returned `decomposition` contains the ordinary source/channel objects,
+positive weights and amplitudes needed by the future SOR adapter.
+
+`OptimizerOptions` contains common stopping, budget and final-validation
+settings. `LBFGSOptions` extends it with memory and line-search settings.
+`InnerOptions` configures partition relaxation; `GradientOptions` is still
+supplied to the engine for derivative regularity guards.
+
+Existing calls to `optimize_gauge(engine, options=OuterOptions(...), ...)`
+continue to work and delegate to `LBFGSOptimizer`. That convenience function
+also accepts `LBFGSOptions` or common `OptimizerOptions` (the latter uses
+default L-BFGS-specific settings). The legacy `OuterOptions` constructor,
+including its positional field order, and the result fields are preserved.
+Choose other solvers by constructing their classes; the parent does not
+dispatch on a solver string.
+
+### Solver class boundaries
+
+| File/class | Responsibility |
+| --- | --- |
+| `outer.py`: `ExponentialGaugeObjective` | Fixed reference and coordinate map, nested partitions, exact pullback, joint cache, final gauge validation |
+| `solvers/base.py`: `OuterOptimizer` | Fresh run state, per-run counters, budgets, accepted-state bookkeeping, callbacks, stopping, final validation |
+| `solvers/lbfgs.py`: `LBFGSOptimizer` | Packed-theta proposals, two-loop recursion, Armijo acceptance, curvature memory, exponential-coordinate result |
+| `solvers/gdm.py`: `GDMOptimizer` | Reserved subclass; currently raises `NotImplementedError` before evaluating the objective |
+
+The parent neither assumes exponential coordinates nor computes directions,
+chooses trial paths, performs line searches, or interprets curvature history.
+It takes an objective and exposes three abstract hooks:
+
+```python
+class NewOptimizer(OuterOptimizer):
+    def _initialize(self, initial):
+        # Return (initial_evaluation, fresh_solver_state).
+        ...
+
+    def _step(self, point, run, iteration):
+        # Return OptimizerStep(evaluation=accepted_point, ...), or
+        # OptimizerStep(status="reason", message="...", ...) on failure.
+        ...
+
+    def _build_result(self, point, summary):
+        # Package this solver's point plus common summary metadata.
+        ...
+```
+
+`run.solver_state` is opaque to the parent. The child must respect the
+remaining budget during any multi-evaluation step via `_budget_exhausted(run)`.
+Only an accepted `OptimizerStep.evaluation` replaces the stored point.
+The parent passes common `OptimizerIteration` records to callbacks; a child
+can extend `_iteration_record`, as L-BFGS does for memory diagnostics.
+
+The objective provides `evaluate(parameters)` and a cumulative `evaluations`
+counter. Its points provide `loss`, `gradient_norm`, `tangent_gradient_norm`,
+and `gauge_gradient.inner_result` for partition diagnostics. No `theta` or
+`reference` is required by the parent. The optional objective counters are
+`failed_evaluations`, `cache_hits` and `inner_sweeps`. With final validation
+enabled, the objective also provides `validate(point)` and the child's result
+is a dataclass with a `validation_report` field.
+
+`GDMOptimizer` is an extension point, not an available numerical solver yet.
+Its future implementation can use matrix-valued gauge points, its own
+manifold objective, geometric paths/retractions and transported directions
+or history. Those choices will live in the GDM child and its objective,
+without adding GDM branches to the parent. No claim of a Q-Chem-equivalent
+GDM algorithm is made by this placeholder.
+
+The callback receives immutable scalar `OuterIteration` records at iteration
+zero and after each accepted step, never at rejected trials. Raising
+`StopIteration` stops at the current accepted state with
+`status="callback_stopped"`. Other callback exceptions propagate.
+
+For your two-orbital `(1,1)` balanced setting, interval midpoints are zero
+and the inner gradient already vanishes. The generic nested call therefore
+reports zero inner sweeps without requiring a separate outer algorithm.
+The gauge objective may still vary, or it may already be stationary at the
+initial gauge. Single-factor problems have no continuous gauge parameters
+and are evaluated once.
+
+### Reference, seed and cache semantics
+
+The `reference` argument is the fixed right factor in `exp(S(theta))@reference`.
+To start from an existing orthogonal `O_initial`, use `reference=O_initial`
+with the default zero theta. Alternatively, pass an existing packed theta
+with identity reference. Passing nonzero theta and a nonidentity reference
+applies both transformations in the stated order.
+
+L-BFGS never recenters this reference or reuses curvature information
+in a different coordinate chart. Reflection references are supported. A new
+call to `optimize_gauge`, or to the same `solver.optimize(...)`, starts with
+empty curvature history. Reusing a solver/objective preserves the objective's
+one-entry cache. Each result and evaluation budget uses counters relative to
+the start of that optimize call, so a cached initial point can report zero
+fresh evaluations and one cache hit.
+
+`inner_t0` is copied once and stays fixed across the entire run. It can be a
+scalar or one log ratio per source. Every trial projects that same seed into
+its own feasible intervals. With `None`, every trial independently uses its
+current interval midpoints. Neither accepted nor rejected trial partitions
+replace the seed. This avoids a history-dependent objective caused by
+feeding different initial guesses to identical parameter values. General
+inner solves can still select different local branches as the gauge changes;
+the envelope assumptions from step 5 remain necessary.
+
+`ExponentialGaugeObjective` can also be used directly:
+
+```python
+from ipie.hamiltonians.optimize_cholesky import ExponentialGaugeObjective
+
+objective = ExponentialGaugeObjective(
+    engine, reference=None, inner_options=InnerOptions(), inner_t0=None,
+)
+point = objective.evaluate(theta)
+value, gradient_theta = objective.value_and_grad(theta)
+```
+
+The one-entry cache stores a matching `ExponentialEvaluation`: copied theta,
+value, exact coordinate gradient, gauge derivative and converged inner
+snapshot. A repeated theta reuses that joint record. `value_and_grad` returns
+a writable gradient copy for external optimizers. The reference, inner
+configuration and seed are read-only. Do not modify the underlying engine
+configuration during a run; create a new objective instead.
+
+### L-BFGS and line-search behavior
+
+The exact coordinate gradient is obtained with
+`exponential_gauge_vjp(theta,r,E,reference,backend=engine.backend)`, where E
+already includes partition-bound response. Search directions and curvature
+pairs live in the global packed-theta space:
+
+```
+s_k = theta_(k+1) - theta_k
+y_k = grad_theta_(k+1) - grad_theta_k
+```
+
+There is no need to reset history just because the partitions changed:
+both endpoint gradients describe the same nested objective definition.
+The standard two-loop L-BFGS recursion stores at most `memory` pairs. A
+pair is retained only when `s.T@y` is positive and exceeds
+`curvature_rtol*norm(s)*norm(y)`. A nonfinite or non-descent direction clears
+the history and falls back to steepest descent.
+
+Without curvature history, steepest descent is normalized to unit coordinate
+length so a small numerical scale of `L_raw` does not force tiny initial
+steps. Trial displacement norms are capped by `max_step_norm`. The line search
+starts at `initial_step`, shrinks by `backtrack`, and accepts only
+
+```
+F(theta + alpha*p) <= F(theta) + armijo*alpha*(grad_theta @ p).
+```
+
+This reference implementation enforces Armijo decrease and filters curvature
+explicitly; it does not require a strong-Wolfe line search.
+
+An infeasible trial interval raises `GaugeFeasibilityError`, which remains a
+`ValueError` subclass for compatibility. That error, `GaugeRegularityError`,
+`InnerConvergenceError`, `FloatingPointError` and `numpy.linalg.LinAlgError`
+reject the trial and trigger backtracking. No fake zero gradient or infinite
+loss is passed off as a valid evaluation. Unimplemented backends and
+programming/configuration errors propagate. Failure at the initial point
+raises immediately, since no valid accepted result exists yet.
+
+### Convergence, status and diagnostics
+
+At each accepted state the optimizer checks both
+
+```
+norm(gradient_theta, infinity) <= gradient_atol
+                               + gradient_rtol*initial_coordinate_norm
+norm(tangent_gradient, Frobenius) <= gradient_atol
+                                  + gradient_rtol*initial_tangent_norm.
+```
+
+The physical tangent check matters because accumulated exponential
+coordinates can become singular/redundant. A small coordinate gradient alone
+is reported as `coordinate_stalled` if the physical tangent criterion fails.
+Small loss changes or small steps alone never imply convergence.
+
+| Status | Meaning |
+| --- | --- |
+| `converged` | Both outer gradient tests passed; the stored inner solve also converged |
+| `max_iterations` | Accepted-iteration limit reached |
+| `max_evaluations` | Fresh trial-evaluation budget exhausted |
+| `line_search_failed` | No admissible Armijo-decreasing trial was accepted |
+| `coordinate_stalled` | Coordinate test passed but physical tangent test failed |
+| `stalled` | A usable numerical descent direction could not be represented |
+| `callback_stopped` | Callback requested stopping at an accepted state |
+
+All nonconverged exits preserve the last **accepted** point. A rejected trial
+cannot overwrite its theta, loss, gradient or channel decomposition.
+`history` contains accepted-state diagnostics; `trials` contains scalar
+accepted/rejected trial records and rejection reasons. Its `attempt` field
+numbers line-search trials starting at one within each iteration. Inspect these if a
+line search stops:
+
+```python
+for row in result.trials[-5:]:
+    print(row.iteration, row.step_size, row.accepted, row.reason)
+```
+
+`evaluations` counts fresh oracle calls within this run, including recoverable
+failed calls and an uncached initial evaluation; cache hits are recorded
+separately. `inner_sweeps`
+sums sweeps reported by returned inner snapshots, including snapshots attached
+to post-inner gradient failures. An exceptional inner run that produces no
+snapshot cannot report its partial work. Full gauge/ERI validation is run
+once on the final accepted state by default and returned as
+`result.validation_report`. Set `LBFGSOptions(validate_final=False)` to omit
+that explicit final reference check; it is never repeated inside the loops.
+
+This is a local smooth-branch optimizer. Nonsmooth eigenvalue-zero minima or
+active-set/inner-branch transitions can cause honest nonconverged exits even
+after substantial descent. It does not certify a global gauge minimum.
+Use sufficiently tight inner tolerances for the requested outer accuracy.
+
+The outer parameterization is unconstrained; feasibility is handled by
+rejecting inadmissible trials. This is not a separate constrained-gauge KKT
+solver at the boundary of the admissible gauge domain. A sufficiently small
+tau2, for example the conservative all-gauge bound documented in the note,
+avoids that domain restriction:
+
+```
+tau2*lambda_max(G) < rho**2,
+G[gamma,eta] = trace(L_original[gamma] @ L_original[eta]).
+```
+
+Here rho is the actual closed amplitude limit: the explicit `amplitude_limit`,
+or `(1-1e-8)*engine.amplitude_bound` when that option is None.
+
+### Step-6 verification
+
+```sh
+python -m unittest ipie.hamiltonians.optimize_cholesky.tests.test_outer -v
+python -m unittest ipie.hamiltonians.optimize_cholesky.tests.test_outer_controlled -v
+python -m unittest ipie.hamiltonians.optimize_cholesky.tests.test_solver_classes -v
+python -m unittest discover -s ipie/hamiltonians/optimize_cholesky/tests -v
+```
+
+Controlled analytic quadratic oracles test optimizer convergence, Armijo
+descent, curvature filtering, fallback directions, callback stopping,
+iteration/evaluation budgets, failure recovery and accepted-state retention.
+These tests make no Hamiltonian-validation claim. Separate physical tests
+verify nested descent, dense-loss/gradient parity, moving-bound response,
+final ERI/Hamiltonian reconstruction in all three sectors and both maps,
+the two-orbital zero-inner-sweep shortcut, a nontrivial physical converged
+case, and a singular exponential chart with a nonzero physical gradient.
+
+The class tests compare the direct L-BFGS API with the compatibility wrapper
+on a physical Hamiltonian, run the generic parent with a test-only matrix
+objective that has no exponential attributes, verify final-validation calls,
+check repeated-run memory/budget/counter behavior, and assert that GDM fails
+explicitly before doing any objective work.
+
 
 
 

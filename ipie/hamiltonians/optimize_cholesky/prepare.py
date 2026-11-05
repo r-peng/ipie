@@ -6,9 +6,14 @@ from pathlib import Path
 import numpy as np
 from scipy.linalg import expm
 
-from ipie.hamiltonians.optimize_cholesky.models import PreparedProblem, TensorData, GaugeState
-from ipie.hamiltonians.optimize_cholesky.validation import (
-    _factor_array, _gauge_array, _options, validate_inputs, _real_array, validate_gauge_state,
+from .models import PreparedProblem, TensorData, GaugeState
+from .validation import (
+    _factor_array, 
+    _gauge_array, 
+    _options, 
+    _real_array, 
+    validate_inputs, 
+    validate_gauge_state,
 )
 
 
@@ -188,5 +193,6 @@ def build_gauge_state(data, O=None, options=None):
     for array in (state.O, state.chol, state.eigenvalues, state.X):
         array.setflags(write=False)
     return GaugeState(state.O, state.chol, state.eigenvalues, state.X, report)
+
 
 

@@ -400,6 +400,10 @@ class GaugeRegularityError(ValueError):
     """A requested smooth gauge derivative is undefined or ill-conditioned."""
 
 
+class GaugeFeasibilityError(ValueError):
+    """A trial gauge admits no partition within the configured amplitude box."""
+
+
 class InnerConvergenceError(ValueError):
     """A relaxed gauge gradient was requested without a converged inner solve."""
 
@@ -469,6 +473,254 @@ class GaugeDifference:
 class GaugeGradientCheck:
     analytic: float
     differences: Tuple[GaugeDifference, ...]
+
+
+def _solver_real(value, name, *, positive=False):
+    if isinstance(value, (bool, np.bool_)) or not isinstance(value, Real) or not np.isfinite(value):
+        raise ValueError(f"{name} must be a finite real scalar")
+    if value < 0 or (positive and value == 0):
+        raise ValueError(f"{name} must be {'positive' if positive else 'nonnegative'}")
+
+
+def _solver_integer(value, name, minimum):
+    if isinstance(value, (bool, np.bool_)) or not isinstance(value, Integral) or value < minimum:
+        raise ValueError(f"{name} must be an integer >= {minimum}")
+
+
+@dataclass(frozen=True)
+class InnerOptions:
+    """One fixed partition-solver configuration for the entire outer run."""
+
+    max_sweeps: int = 500
+    gradient_atol: float = 1e-11
+    gradient_rtol: float = 1e-9
+    amplitude_limit: Optional[float] = None
+    max_abs_t: float = 30.0
+
+    def __post_init__(self):
+        _solver_integer(self.max_sweeps, "max_sweeps", 0)
+        _solver_real(self.gradient_atol, "inner gradient_atol")
+        _solver_real(self.gradient_rtol, "inner gradient_rtol")
+        _solver_real(self.max_abs_t, "max_abs_t", positive=True)
+        if self.amplitude_limit is not None:
+            _solver_real(self.amplitude_limit, "amplitude_limit", positive=True)
+            if self.amplitude_limit >= 1:
+                raise ValueError("amplitude_limit must be < 1")
+
+
+@dataclass(frozen=True)
+class OptimizerOptions:
+    """Solver-independent outer stopping, evaluation budget and validation."""
+
+    max_iterations: int = 100
+    max_evaluations: int = 1000
+    gradient_atol: float = 1e-8
+    gradient_rtol: float = 1e-6
+    validate_final: bool = True
+
+    def __post_init__(self):
+        _validate_optimizer_options(self)
+
+
+def _validate_optimizer_options(options):
+    _solver_integer(options.max_iterations, "max_iterations", 0)
+    _solver_integer(options.max_evaluations, "max_evaluations", 1)
+    _solver_real(options.gradient_atol, "gradient_atol")
+    _solver_real(options.gradient_rtol, "gradient_rtol")
+    if not isinstance(options.validate_final, (bool,np.bool_)):
+        raise ValueError("validate_final must be boolean")
+
+
+def _validate_lbfgs_options(options):
+    _solver_integer(options.memory, "memory", 1)
+    _solver_integer(options.max_line_search, "max_line_search", 1)
+    _solver_real(options.curvature_rtol, "curvature_rtol")
+    for name in ("initial_step", "backtrack", "armijo", "min_step", "max_step_norm"):
+        _solver_real(getattr(options,name), name, positive=True)
+    if not 0 < options.backtrack < 1 or not 0 < options.armijo < 1:
+        raise ValueError("backtrack and armijo must lie strictly between 0 and 1")
+    if options.curvature_rtol >= 1:
+        raise ValueError("curvature_rtol must be < 1")
+    if options.min_step > options.initial_step:
+        raise ValueError("min_step cannot exceed initial_step")
+
+
+@dataclass(frozen=True)
+class LBFGSOptions(OptimizerOptions):
+    """L-BFGS curvature and Armijo settings, extending common outer options."""
+
+    memory: int = 10
+    initial_step: float = 1.0
+    backtrack: float = 0.5
+    armijo: float = 1e-4
+    max_line_search: int = 25
+    min_step: float = 1e-12
+    max_step_norm: float = 1.0
+    curvature_rtol: float = 1e-10
+
+    def __post_init__(self):
+        super().__post_init__()
+        _validate_lbfgs_options(self)
+
+
+@dataclass(frozen=True)
+class OuterOptions:
+    """Legacy L-BFGS configuration; new code can use LBFGSOptions.
+
+    The original field order and constructor remain available. This legacy
+    record is accepted by LBFGSOptimizer and optimize_gauge, and converted
+    into LBFGSOptions. The solver-independent parent uses OptimizerOptions.
+    """
+
+    max_iterations: int = 100
+    max_evaluations: int = 1000
+    memory: int = 10
+    gradient_atol: float = 1e-8
+    gradient_rtol: float = 1e-6
+    initial_step: float = 1.0
+    backtrack: float = 0.5
+    armijo: float = 1e-4
+    max_line_search: int = 25
+    min_step: float = 1e-12
+    max_step_norm: float = 1.0
+    curvature_rtol: float = 1e-10
+    validate_final: bool = True
+
+    def __post_init__(self):
+        _validate_optimizer_options(self)
+        _validate_lbfgs_options(self)
+
+
+@dataclass(frozen=True)
+class ExponentialEvaluation:
+    """Matching parameters, reduced loss, gradient and converged inner snapshot."""
+
+    theta: np.ndarray
+    gradient_theta: np.ndarray
+    gauge_gradient: GaugeGradient
+
+    @property
+    def loss(self):
+        return self.gauge_gradient.loss
+
+    @property
+    def decomposition(self):
+        return self.gauge_gradient.decomposition
+
+    @property
+    def O(self):
+        return self.decomposition.two_body.gauge.O
+
+    @property
+    def gradient_norm(self):
+        return float(np.max(np.abs(self.gradient_theta),initial=0.))
+
+    @property
+    def tangent_gradient_norm(self):
+        return float(np.linalg.norm(self.gauge_gradient.tangent_gradient,"fro"))
+
+
+@dataclass(frozen=True)
+class OptimizerIteration:
+    """Common accepted-state diagnostics with no solver-specific fields."""
+
+    iteration: int
+    loss: float
+    gradient_norm: float
+    tangent_gradient_norm: float
+    step_size: float
+    step_norm: float
+    loss_decrease: float
+    inner_sweeps: int
+    inner_projected_gradient_norm: float
+    line_search_trials: int
+
+
+@dataclass(frozen=True)
+class OuterIteration:
+    """L-BFGS accepted-state diagnostics, retaining the step-6 record layout."""
+
+    iteration: int
+    loss: float
+    gradient_norm: float
+    tangent_gradient_norm: float
+    step_size: float
+    step_norm: float
+    loss_decrease: float
+    inner_sweeps: int
+    inner_projected_gradient_norm: float
+    line_search_trials: int
+    curvature_update: bool
+    memory_size: int
+
+
+@dataclass(frozen=True)
+class OuterTrial:
+    iteration: int
+    attempt: int
+    step_size: float
+    accepted: bool
+    loss: Optional[float]
+    reason: str
+
+
+@dataclass(frozen=True)
+class OuterOptimizationResult:
+    """Last ACCEPTED state, never the last rejected line-search evaluation."""
+
+    evaluation: ExponentialEvaluation
+    reference: np.ndarray
+    initial_theta: np.ndarray
+    initial_loss: float
+    gradient_threshold: float
+    tangent_gradient_threshold: float
+    history: Tuple[OuterIteration, ...]
+    trials: Tuple[OuterTrial, ...]
+    converged: bool
+    status: str
+    message: str
+    evaluations: int
+    failed_evaluations: int
+    cache_hits: int
+    inner_sweeps: int
+    validation_report: Optional[ValidationReport] = None
+
+    @property
+    def theta(self):
+        return self.evaluation.theta
+
+    @property
+    def O(self):
+        return self.evaluation.O
+
+    @property
+    def loss(self):
+        return self.evaluation.loss
+
+    @property
+    def gradient_theta(self):
+        return self.evaluation.gradient_theta
+
+    @property
+    def gradient_norm(self):
+        return self.evaluation.gradient_norm
+
+    @property
+    def tangent_gradient_norm(self):
+        return self.evaluation.tangent_gradient_norm
+
+    @property
+    def decomposition(self):
+        return self.evaluation.decomposition
+
+    @property
+    def partition_result(self):
+        return self.evaluation.gauge_gradient.inner_result
+
+    @property
+    def iterations(self):
+        return self.history[-1].iteration
+
 
 
 
