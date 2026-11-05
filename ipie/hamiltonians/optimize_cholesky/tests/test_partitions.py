@@ -1,28 +1,33 @@
-"""Partition profiles, sequential updates, KKT stopping and exact H checks.
-
-The coefficient oracle below forms isolated dense leg commutators. It does
-not use the overlap formula or infer coefficients by fitting loss values.
-"""
+"""Partition coefficients, bounds, and sequential relaxation."""
 
 from dataclasses import replace
 import math
 import unittest
-from unittest.mock import patch
-
 import numpy as np
+from unittest.mock import patch
 from scipy.optimize import minimize_scalar
-
 from ipie.hamiltonians.optimize_cholesky import (
-    PartitionCoefficients, analytic_partition_update, build_fixed_decomposition,
-    build_gauge_state, get_rotation_matrix, optimize_partitions, partition_bounds,
-    partition_coefficients, prepare_problem, projected_partition_gradient,
-    raw_loss, with_partitions,
+    PartitionCoefficients,
+    analytic_partition_update,
+    build_fixed_decomposition,
+    build_gauge_state,
+    get_rotation_matrix,
+    optimize_partitions,
+    partition_bounds,
+    partition_coefficients,
+    prepare_problem,
+    projected_partition_gradient,
+    raw_loss,
+    with_partitions,
 )
 from ipie.hamiltonians.optimize_cholesky.tests.test_channels import (
-    check_hamiltonian, make_decomposition,
+    check_hamiltonian,
+    make_decomposition,
 )
-from ipie.hamiltonians.optimize_cholesky.tests.test_objective import dense_pair, sor_diagnostics
+from ipie.hamiltonians.optimize_cholesky.tests.test_loss import dense_pair, sor_diagnostics
 
+
+# test_partitions
 
 def dense_coefficients(decomposition, source_index):
     two = decomposition.two_body
@@ -273,7 +278,7 @@ class InnerSolverTests(unittest.TestCase):
         with patch("numpy.linalg.eigh",side_effect=AssertionError("eigh in inner loop")), \
              patch("ipie.hamiltonians.optimize_cholesky.channels.validate_gauge_state",
                    side_effect=AssertionError("ERI validation in inner loop")), \
-             patch("ipie.hamiltonians.optimize_cholesky.objective.get_rotation_matrix",
+             patch("ipie.hamiltonians.optimize_cholesky.loss.get_rotation_matrix",
                    side_effect=AssertionError("dense rotations in inner loop")):
             result = optimize_partitions(decomposition,max_sweeps=2)
         self.assertLess(result.loss,result.initial_loss)
@@ -303,5 +308,3 @@ class InnerSolverTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-
-

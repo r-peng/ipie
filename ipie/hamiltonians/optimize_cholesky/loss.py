@@ -14,7 +14,7 @@ import numpy as np
 
 from .channels import get_rotation_matrix
 from .models import CommutatorLoss, FixedDecomposition
-from .validation import _real_array
+from .problem import _real_array
 
 
 def commutator_norm2(d, e, overlap):
@@ -229,5 +229,3 @@ def commutator_loss(decomposition, *, method="overlap", normalize_weights=True):
 def raw_loss(decomposition, *, method="overlap"):
     """Only L_raw: the unweighted sum of squared single-particle norms."""
     return commutator_loss(decomposition, method=method).comm2
-
-

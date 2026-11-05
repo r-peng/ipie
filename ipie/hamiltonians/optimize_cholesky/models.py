@@ -517,6 +517,7 @@ class OptimizerOptions:
     gradient_atol: float = 1e-8
     gradient_rtol: float = 1e-6
     validate_final: bool = True
+    verbosity: int = 0
 
     def __post_init__(self):
         _validate_optimizer_options(self)
@@ -525,6 +526,7 @@ class OptimizerOptions:
 def _validate_optimizer_options(options):
     _solver_integer(options.max_iterations, "max_iterations", 0)
     _solver_integer(options.max_evaluations, "max_evaluations", 1)
+    _solver_integer(options.verbosity, "verbosity", 0)
     _solver_real(options.gradient_atol, "gradient_atol")
     _solver_real(options.gradient_rtol, "gradient_rtol")
     if not isinstance(options.validate_final, (bool,np.bool_)):
@@ -585,6 +587,7 @@ class OuterOptions:
     max_step_norm: float = 1.0
     curvature_rtol: float = 1e-10
     validate_final: bool = True
+    verbosity: int = 0
 
     def __post_init__(self):
         _validate_optimizer_options(self)
@@ -720,10 +723,3 @@ class OuterOptimizationResult:
     @property
     def iterations(self):
         return self.history[-1].iteration
-
-
-
-
-
-
-

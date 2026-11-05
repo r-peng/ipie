@@ -1,24 +1,26 @@
-"""Small-system Hamiltonian/Slater checks in the style of tests/sor_test.py.
-
-Uses the repository's bitstring signs, interleaved spin orbitals, exterior
-minors for propagators, and direct original quartic ERIs for the reference H.
-No normal-order correction is subtracted from h in that quartic reference.
-Run with unittest, pytest, or `python -m ...tests.test_channels`.
-"""
+"""Channel construction and Hamiltonian reconstruction."""
 
 from dataclasses import replace
 import itertools
 import unittest
-
 import numpy as np
-
 from ipie.hamiltonians.bitstring_utils import get_all_configs_u11, string_act
 from ipie.hamiltonians.optimize_cholesky import (
-    Channel, build_fixed_decomposition, build_gauge_state, build_one_body_channels,
-    build_two_body_channels, enumerate_sources, exponential_gauge, get_rotation_matrix,
-    givens_gauge, prepare_problem, two_body_rotation_matrix,
+    Channel,
+    build_fixed_decomposition,
+    build_gauge_state,
+    build_one_body_channels,
+    build_two_body_channels,
+    enumerate_sources,
+    exponential_gauge,
+    get_rotation_matrix,
+    givens_gauge,
+    prepare_problem,
+    two_body_rotation_matrix,
 )
 
+
+# test_channels
 
 def get_occupied_orbitals(cf, norb):
     return [p for p in range(norb) if (cf >> p) & 1]
@@ -295,7 +297,4 @@ def run_reference_checks():
 
 
 if __name__ == "__main__":
-    run_reference_checks()
     unittest.main()
-
-

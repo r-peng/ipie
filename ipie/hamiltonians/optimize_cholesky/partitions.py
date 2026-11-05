@@ -20,8 +20,8 @@ from .models import (
     PartitionOptimizationResult, 
     PartitionSweep,
 )
-from .objective import OverlapEvaluator, commutator_norm2
-from .validation import _real_array
+from .loss import OverlapEvaluator, commutator_norm2
+from .problem import _real_array
 
 
 def _readonly(array):
@@ -370,6 +370,3 @@ def optimize_partitions(decomposition, *, max_sweeps=100,
         gradient, projected, threshold, tuple(history), bool(converged),
         "converged" if converged else "max_sweeps",
         *_partition_limits(decomposition.two_body.amplitude_bound, amplitude_limit, max_abs_t))
-
-
-

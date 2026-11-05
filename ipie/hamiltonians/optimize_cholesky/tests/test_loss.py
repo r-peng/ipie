@@ -1,27 +1,32 @@
-"""Dense/overlap parity and direct agreement with the real sor_base function.
-
-Only that reference function is AST-loaded, unchanged, to avoid unrelated
-SCF/MPI imports. No numerical operation inside the reference is mocked.
-"""
+"""Dense and overlap reference commutator loss."""
 
 import ast
-from contextlib import redirect_stdout
-from dataclasses import replace
 import io
 import json
-from pathlib import Path
 import unittest
-from unittest.mock import patch
-
 import numpy as np
-
+from contextlib import redirect_stdout
+from dataclasses import replace
+from pathlib import Path
+from unittest.mock import patch
 from ipie.hamiltonians.optimize_cholesky import (
-    Channel, FixedDecomposition, OverlapEvaluator, build_fixed_decomposition,
-    build_gauge_state, commutator_loss, commutator_norm2, dense_commutator_loss,
-    get_rotation_matrix, overlap_commutator_loss, prepare_problem, raw_loss,
+    Channel,
+    FixedDecomposition,
+    OverlapEvaluator,
+    build_fixed_decomposition,
+    build_gauge_state,
+    commutator_loss,
+    commutator_norm2,
+    dense_commutator_loss,
+    get_rotation_matrix,
+    overlap_commutator_loss,
+    prepare_problem,
+    raw_loss,
 )
 from ipie.hamiltonians.optimize_cholesky.tests.test_channels import make_decomposition
 
+
+# test_objective
 
 def load_sor_reference():
     """Read the current checked-out compute_total_commutativity, not a copy."""
@@ -151,7 +156,7 @@ class TotalLossTests(unittest.TestCase):
                                             atol=2e-15,rtol=2e-10)
         r = decomposition.two_body.gauge.X.shape[0]
         self.assertLessEqual(evaluator.overlap_cache_size,r*(r+1)//2)
-        with patch("ipie.hamiltonians.optimize_cholesky.objective.get_rotation_matrix",
+        with patch("ipie.hamiltonians.optimize_cholesky.loss.get_rotation_matrix",
                    side_effect=AssertionError("overlap evaluator must not build dense rotations")):
             self.assertGreater(evaluator.evaluate().comm2,0)
 
@@ -264,7 +269,4 @@ def run_reference_checks():
 
 
 if __name__ == "__main__":
-    run_reference_checks()
     unittest.main()
-
-
