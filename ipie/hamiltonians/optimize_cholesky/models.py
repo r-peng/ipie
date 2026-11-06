@@ -533,6 +533,12 @@ def _validate_optimizer_options(options):
         raise ValueError("validate_final must be boolean")
 
 
+LINE_SEARCHES = ("armijo", "weak_wolfe")
+"""armijo: sufficient-decrease backtracking (original behavior, default).
+weak_wolfe: Lewis-Overton bracketing on sufficient decrease plus the weak
+curvature condition g(theta+alpha*p).p >= wolfe_c2*g(theta).p; see README."""
+
+
 def _validate_lbfgs_options(options):
     _solver_integer(options.memory, "memory", 1)
     _solver_integer(options.max_line_search, "max_line_search", 1)
@@ -545,11 +551,25 @@ def _validate_lbfgs_options(options):
         raise ValueError("curvature_rtol must be < 1")
     if options.min_step > options.initial_step:
         raise ValueError("min_step cannot exceed initial_step")
+    if options.line_search not in LINE_SEARCHES:
+        raise ValueError(f"line_search must be one of {LINE_SEARCHES}; got {options.line_search!r}")
+    _solver_real(options.wolfe_c2, "wolfe_c2", positive=True)
+    if not options.armijo < options.wolfe_c2 < 1:
+        raise ValueError("wolfe_c2 must satisfy armijo < wolfe_c2 < 1")
+    _solver_real(options.wolfe_max_step_norm, "wolfe_max_step_norm", positive=True)
+    if options.wolfe_max_step_norm < options.max_step_norm:
+        raise ValueError("wolfe_max_step_norm cannot be smaller than max_step_norm")
 
 
 @dataclass(frozen=True)
 class LBFGSOptions(OptimizerOptions):
-    """L-BFGS curvature and Armijo settings, extending common outer options."""
+    """L-BFGS curvature and line-search settings, extending common outer options.
+
+    line_search="weak_wolfe" selects Lewis-Overton weak-Wolfe bracketing,
+    intended for reduced objectives with kinks (see README). wolfe_c2 is the
+    curvature constant and wolfe_max_step_norm caps the parameter displacement
+    reached by step expansion. Both are ignored by the default "armijo" search.
+    """
 
     memory: int = 10
     initial_step: float = 1.0
@@ -559,6 +579,9 @@ class LBFGSOptions(OptimizerOptions):
     min_step: float = 1e-12
     max_step_norm: float = 1.0
     curvature_rtol: float = 1e-10
+    line_search: str = "armijo"
+    wolfe_c2: float = 0.9
+    wolfe_max_step_norm: float = math.pi
 
     def __post_init__(self):
         super().__post_init__()
@@ -588,6 +611,9 @@ class OuterOptions:
     curvature_rtol: float = 1e-10
     validate_final: bool = True
     verbosity: int = 0
+    line_search: str = "armijo"
+    wolfe_c2: float = 0.9
+    wolfe_max_step_norm: float = math.pi
 
     def __post_init__(self):
         _validate_optimizer_options(self)
@@ -655,6 +681,7 @@ class OuterIteration:
     line_search_trials: int
     curvature_update: bool
     memory_size: int
+    acceptance: str = ""
 
 
 @dataclass(frozen=True)

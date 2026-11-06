@@ -279,7 +279,9 @@ the iteration. Start with these functions/methods:
 | Location | What to inspect |
 | --- | --- |
 | `_lbfgs_direction` | Two-loop inverse-Hessian product and last-pair scaling |
-| `LBFGSOptimizer._step` | Descent fallback, displacement cap, Armijo trials, failures, curvature acceptance |
+| `LBFGSOptimizer._step` | Descent fallback, displacement cap, search dispatch, curvature acceptance |
+| `LBFGSOptimizer._armijo_search` | Original sufficient-decrease backtracking (default) |
+| `LBFGSOptimizer._weak_wolfe_search` | Lewis-Overton weak-Wolfe bracketing for kinked objectives |
 | `ExponentialGaugeObjective.evaluate` | Gauge, inner convergence, coordinate pullback, joint cache and work counters |
 | `OuterOptimizer.optimize` | Accepted-state lifecycle, budgets, callbacks and stopping |
 
@@ -287,7 +289,9 @@ Without history, steepest descent is normalized. A nonfinite/non-descent
 quasi-Newton direction clears memory and falls back to steepest descent.
 `max_step_norm` caps the initial trial displacement; Armijo accepts only
 `F(theta+alpha*p) <= F(theta)+armijo*alpha*(gradient_theta@p)`.
-Backtracking multiplies alpha by `backtrack`; this is not a strong-Wolfe search.
+With the default `line_search="armijo"`, backtracking multiplies alpha by
+`backtrack`; this is not a Wolfe search. See the next section for
+`line_search="weak_wolfe"`.
 Curvature pairs use `s=theta_new-theta`, `y=g_new-g`; only sufficiently positive
 `s@y` values are retained, with at most `memory` pairs.
 
@@ -320,14 +324,86 @@ matching accepted state. Full gauge/ERI validation runs once outside the loops
 by default and is stored in `validation_report`; use `validate_final=False` to
 omit it. No outer or inner trial reconstructs ERI for this final reference check.
 
+## Weak-Wolfe line search for kinked objectives
+
+The relaxed reduced loss is not smooth. For one source the inner problem is
+`min_t C + A*exp(2t) + B*exp(-2t) = C + 2*sqrt(A*B)` (AM-GM), and with the
+anchored amplitudes `A ~ ell_alpha**2`, `B ~ ell_beta**2`. The square root makes
+the reduced loss depend on `|ell_alpha*ell_beta|`, so it has a kink on every
+surface where an eigenvalue of a rotated factor crosses zero (the inner
+minimizer escapes to `t = +-infinity` there, so Danskin's theorem fails). The
+balanced map shows the same `|ell|` already at fixed `t`. For two orbitals with
+`nelec=(1,1)` the reduced loss is exactly
+`4*tau2*sum_g H_g*nuc_g**2 + 8*tau2**2*sum_{g<e} K_ge*nuc_g**2*nuc_e**2`, with
+`nuc_g` the nuclear norm (sum of absolute eigenvalues) of rotated factor `g`.
+Nuclear norms reward rank-deficient factors, so minimizers typically lie ON
+kinks, where the gradient does not vanish and gradient tests cannot pass.
+
+`line_search="weak_wolfe"` (in `LBFGSOptions` or legacy `OuterOptions`) uses the
+Lewis-Overton bracketing search intended for such objectives. A trial is
+accepted when
+
+    F(theta+alpha*p) <= F(theta) + armijo*alpha*(g@p)          (decrease)
+    g(theta+alpha*p)@p >= wolfe_c2*(g@p)                        (weak curvature)
+
+A decrease failure, or a recoverable invalid trial, becomes the upper bracket; a
+curvature failure becomes the lower bracket. A finite bracket is bisected;
+otherwise alpha doubles, up to the displacement cap `wolfe_max_step_norm`
+(default pi radians in theta). The curvature test must be the weak, one-sided
+one: at a kink the directional derivative jumps, so strong Wolfe has no
+solution, whereas a point just beyond the kink satisfies the weak test. Every
+accepted Wolfe step therefore gives `s@y > 0`, the curvature pair is kept, and
+the quasi-Newton model learns the large curvature across the kink while still
+moving along the kink surface.
+
+If no trial satisfies both conditions within `max_line_search` attempts, the
+lowest-loss trial that satisfied the decrease condition is accepted, labelled
+`armijo_only` (or `expansion_capped` if expansion stopped at the cap). Only if
+no trial decreased the loss does the step return `line_search_failed`; at a
+nonsmooth minimizer this is the expected termination, not a programming
+failure. Each accepted record carries `acceptance` (`armijo`, `weak_wolfe`,
+`armijo_only`, `expansion_capped`); trial reasons add `insufficient_curvature`.
+With `verbosity=2` each trial prints its `slope_ratio=g(theta+alpha*p)@p/(g@p)`,
+which must be `<= wolfe_c2` for the curvature test to pass.
+
+```python
+from ipie.hamiltonians.optimize_cholesky import near_zero_eigenvalues
+result = optimize_gauge(engine, theta0=theta,
+                        options=OuterOptions(max_iterations=200, line_search="weak_wolfe"),
+                        inner_options=InnerOptions(max_sweeps=500, gradient_atol=1e-12,
+                                                   gradient_rtol=0))
+print(result.status, result.loss)
+print(near_zero_eigenvalues(result))   # ((factor, mode, eigenvalue), ...) = active kinks
+```
+
+`near_zero_eigenvalues(state, rtol=1e-6, atol=0)` accepts a `GaugeState`, a
+`FixedDecomposition`, or any result with `.decomposition`, and reports
+eigenvalues with `|ell| <= atol + rtol*max|ell|` within each factor.
+
+Options: `line_search` (`"armijo"` default, or `"weak_wolfe"`), `wolfe_c2`
+(default 0.9, requires `armijo < wolfe_c2 < 1`), `wolfe_max_step_norm` (default
+pi, must be at least `max_step_norm`). The first trial keeps the existing
+`initial_step` and `max_step_norm` behavior. The default remains `armijo`, so
+existing scripts and results are unchanged unless `weak_wolfe` is requested.
+
+On H2/STO-3G (Lowdin orbitals, R=2.4 bohr, r=3, tau1=tau2=0.05, balanced map),
+from six random starts with |theta| <= 0.1 Armijo stopped at reduced losses
+between 1.40401e-3 and 1.41642e-3; weak Wolfe reached 1.4034834e-3 from four
+starts, 1.4034836e-3 from a fifth, and the same 1.41642e-3 as Armijo from the
+sixth, which is a distinct local minimum on another pair of kinks. Weak Wolfe
+used 1.4-3.9 times as many evaluations, because it keeps making progress
+along the kink surface instead of stopping early. It does not choose basins:
+use several starting gauges when local minima matter.
+
 ## Tests and installation
 
-Six test modules group the same responsibilities as the implementation:
+Seven test modules group the same responsibilities as the implementation:
 `test_problem` combines input/model checks; `test_channels` checks reconstruction;
 `test_loss` compares dense/overlap/SOR losses; `test_partitions` checks analytic
 updates; `test_gradients` includes backend and moving-bound checks; and
 `test_optimizers` combines physical, controlled-quadratic, class and dispatch
-tests. These use small exact systems and independent numerical references.
+tests; and `test_weak_wolfe` checks the weak-Wolfe search on smooth, kinked
+and physical objectives, plus `near_zero_eigenvalues`. These use small exact systems and independent numerical references.
 
 ```sh
 python -m unittest ipie.hamiltonians.optimize_cholesky.tests.test_problem -v
@@ -336,6 +412,7 @@ python -m unittest ipie.hamiltonians.optimize_cholesky.tests.test_loss -v
 python -m unittest ipie.hamiltonians.optimize_cholesky.tests.test_partitions -v
 python -m unittest ipie.hamiltonians.optimize_cholesky.tests.test_gradients -v
 python -m unittest ipie.hamiltonians.optimize_cholesky.tests.test_optimizers -v
+python -m unittest ipie.hamiltonians.optimize_cholesky.tests.test_weak_wolfe -v
 python -m unittest discover -s ipie/hamiltonians/optimize_cholesky/tests -v
 ```
 

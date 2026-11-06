@@ -344,6 +344,36 @@ def diagonalize_factors(chol, options=None):
     return np.linalg.eigh(chol)
 
 
+def near_zero_eigenvalues(state, *, rtol=1e-6, atol=0.0):
+    """Return ((factor, mode, eigenvalue), ...) with |ell| <= atol+rtol*max_mode|ell_factor|.
+
+    The relaxed reduced loss depends on |ell_{gamma,alpha}| (the inner optimum
+    over a source's partition is 2*sqrt(A*B), proportional to |ell_alpha*ell_beta|),
+    so it has a kink on every surface ell_{gamma,alpha}(O)=0. A minimizer that
+    makes a rotated factor rank-deficient sits on such a kink, where gradient
+    tests cannot pass. Use this after a line-search termination to see which
+    kinks are active. The scale is per factor, so it detects rank deficiency.
+
+    state may be a GaugeState, a FixedDecomposition, or any result with a
+    .decomposition attribute (outer or partition optimization results).
+    """
+    if not isinstance(rtol, Real) or not isinstance(atol, Real) or rtol < 0 or atol < 0:
+        raise ValueError("rtol and atol must be nonnegative real numbers")
+    gauge = state
+    if hasattr(gauge, "decomposition") and not hasattr(gauge, "eigenvalues"):
+        gauge = gauge.decomposition
+    if hasattr(gauge, "two_body"):
+        gauge = gauge.two_body.gauge
+    if not hasattr(gauge, "eigenvalues"):
+        raise TypeError("state must be a GaugeState, FixedDecomposition, or a result with .decomposition")
+    ell = np.asarray(gauge.eigenvalues, dtype=np.float64)
+    found = []
+    for g, values in enumerate(ell):
+        tolerance = atol+rtol*np.max(np.abs(values), initial=0.0)
+        found.extend((g, int(a), float(values[a])) for a in np.flatnonzero(np.abs(values) <= tolerance))
+    return tuple(found)
+
+
 def build_gauge_state(data, O=None, options=None):
     """Build and fully validate a step-1 state against supplied exact ERIs.
 

@@ -373,6 +373,18 @@ class ExponentialGaugeObjective:
 
 # Explicit L-BFGS: directions, Armijo line search, curvature updates
 
+@dataclass(frozen=True)
+class _SearchOutcome:
+    """Line-search result: an accepted evaluation, or a failure status."""
+
+    candidate: Any
+    step_size: float
+    trials: Tuple[OuterTrial, ...]
+    acceptance: str
+    status: str = ""
+    message: str = ""
+
+
 def _coerce_lbfgs_options(options):
     if options is None:
         return LBFGSOptions()
@@ -440,11 +452,48 @@ class LBFGSOptimizer(OuterOptimizer):
         slope = float(np.dot(gradient, direction))
         if not np.isfinite(slope) or slope >= 0:
             return OptimizerStep(status="stalled", message="A negative coordinate directional derivative is not representable")
+        # 3. Line search; every new gauge re-relaxes its partitions.
+        search = (self._weak_wolfe_search if options.line_search == "weak_wolfe"
+                  else self._armijo_search)
+        outcome = search(point, direction, slope, run, iteration)
+        if outcome.candidate is None:
+            return OptimizerStep(status=outcome.status, message=outcome.message,
+                                 trials=outcome.trials)
+        candidate, alpha = outcome.candidate, outcome.step_size
+        # 4. Store only acceptable positive-curvature pairs in this fixed chart.
+        s = candidate.theta-point.theta
+        y = candidate.gradient_theta-point.gradient_theta
+        sy = float(np.dot(s, y))
+        curvature_scale = float(np.linalg.norm(s)*np.linalg.norm(y))
+        update = (np.isfinite(sy) and sy > 0 and np.isfinite(curvature_scale)
+                  and sy > options.curvature_rtol*curvature_scale and np.isfinite(1.0/sy))
+        if update:
+            pairs.append((s.copy(), y.copy(), 1.0/sy))
+            del pairs[:-options.memory]
+        # 5. Only this accepted snapshot is offered to the common lifecycle.
+        return OptimizerStep(
+            evaluation=candidate, trials=outcome.trials, step_size=alpha,
+            step_norm=float(np.linalg.norm(s)), line_search_trials=len(outcome.trials),
+            diagnostics={"curvature_update": bool(update), "memory_size": len(pairs),
+                         "acceptance": outcome.acceptance},
+        )
+
+    def _print_rejected(self, attempt, alpha, reason):
+        if self.options.verbosity >= 2:
+            print(
+                f"\t[line search] "
+                f"attempt={attempt} alpha={alpha:.4e} "
+                f"rejected: {reason}",
+                flush=True,
+            )
+
+    def _armijo_search(self, point, direction, slope, run, iteration):
+        """Original sufficient-decrease backtracking, unchanged in behavior."""
+        options = self.options
         alpha = options.initial_step
         candidate = None
         exhausted = False
         trials = []
-        # 3. Armijo backtracking; every new gauge re-relaxes its partitions.
         for attempt in range(1, options.max_line_search+1):
             if alpha < options.min_step:
                 break
@@ -459,15 +508,8 @@ class LBFGSOptimizer(OuterOptimizer):
             except RECOVERABLE_TRIAL_ERRORS as exc:
                 reason = f"{type(exc).__name__}: {exc}"
                 trials.append(OuterTrial(iteration, attempt, alpha, False, None, reason))
-                if options.verbosity >= 2:
-                    print(
-                        f"\t[line search] "
-                        f"attempt={attempt} alpha={alpha:.4e} "
-                        f"rejected: {reason}",
-                        flush=True,
-                    )
+                self._print_rejected(attempt, alpha, reason)
             else:
-                # This assignment replaces the previous inline expression.
                 rhs = point.loss + options.armijo * alpha * slope
                 accepted = trial.loss <= rhs
                 if options.verbosity >= 2:
@@ -486,36 +528,127 @@ class LBFGSOptimizer(OuterOptimizer):
                     break
                 trials.append(OuterTrial(iteration, attempt, alpha, False, trial.loss, "insufficient_decrease"))
             alpha *= options.backtrack
-        if candidate is None:
-            if exhausted:
-                status, message = "max_evaluations", "Outer evaluation budget exhausted during line search"
+        if candidate is not None:
+            return _SearchOutcome(candidate, alpha, tuple(trials), "armijo")
+        if exhausted:
+            status, message = "max_evaluations", "Outer evaluation budget exhausted during line search"
+        else:
+            reason = trials[-1].reason if trials else "step is below a numerical or configured limit"
+            status, message = ("line_search_failed",
+                               "No admissible Armijo-decreasing trial was accepted; "+reason)
+        return _SearchOutcome(None, 0.0, tuple(trials), "", status, message)
+
+    def _weak_wolfe_search(self, point, direction, slope, run, iteration):
+        """Lewis-Overton weak-Wolfe bracketing for objectives that may have kinks.
+
+        Accept alpha when both
+          F(theta+alpha*p) <= F(theta) + armijo*alpha*slope        (decrease)
+          g(theta+alpha*p).p >= wolfe_c2*slope                      (weak curvature)
+        hold. A decrease failure or a recoverable invalid trial sets the upper
+        bracket; a curvature failure sets the lower bracket. The next trial
+        bisects a finite bracket, otherwise doubles alpha up to the expansion
+        cap wolfe_max_step_norm/||p||. The weak (one-sided) curvature test is
+        essential: at a kink the directional derivative jumps and never becomes
+        small, so strong Wolfe has no solution there, whereas any point just
+        beyond the kink satisfies the weak test and yields s.y > 0.
+
+        If no point satisfies both conditions within max_line_search trials,
+        the lowest-loss trial that satisfied the decrease condition is accepted
+        (acceptance "armijo_only", or "expansion_capped" if expansion stopped
+        at the cap). Only when no trial decreased F does the step fail; at a
+        nonsmooth minimizer that is the expected termination.
+        """
+        options = self.options
+        c1, c2 = options.armijo, options.wolfe_c2
+        alpha_max = options.wolfe_max_step_norm/float(np.linalg.norm(direction))
+        lower, upper = 0.0, math.inf
+        alpha = min(options.initial_step, alpha_max)
+        trials = []
+        best = None  # (trial index, evaluation, alpha) with lowest decreasing loss
+        exhausted = False
+        stop = "max_line_search trials used"
+        capped = False
+        for attempt in range(1, options.max_line_search+1):
+            if alpha < options.min_step:
+                stop = "alpha below min_step"
+                break
+            if upper < math.inf and upper-lower <= options.min_step*max(1.0, upper):
+                stop = "bracket collapsed below min_step"
+                break
+            if self._budget_exhausted(run):
+                exhausted = True
+                break
+            theta = point.theta+alpha*direction
+            if np.array_equal(theta, point.theta) or (
+                    best is not None and np.array_equal(theta, best[1].theta)):
+                stop = "trial parameters unchanged in floating point"
+                break
+            try:
+                trial = self.objective.evaluate(theta)
+            except RECOVERABLE_TRIAL_ERRORS as exc:
+                reason = f"{type(exc).__name__}: {exc}"
+                trials.append(OuterTrial(iteration, attempt, alpha, False, None, reason))
+                self._print_rejected(attempt, alpha, reason)
+                upper = alpha
             else:
-                reason = trials[-1].reason if trials else "step is below a numerical or configured limit"
-                status, message = ("line_search_failed",
-                                   "No admissible Armijo-decreasing trial was accepted; "+reason)
-            return OptimizerStep(status=status, message=message, trials=tuple(trials))
-        # 4. Store only acceptable positive-curvature pairs in this fixed chart.
-        s = candidate.theta-point.theta
-        y = candidate.gradient_theta-point.gradient_theta
-        sy = float(np.dot(s, y))
-        curvature_scale = float(np.linalg.norm(s)*np.linalg.norm(y))
-        update = (np.isfinite(sy) and sy > 0 and np.isfinite(curvature_scale)
-                  and sy > options.curvature_rtol*curvature_scale and np.isfinite(1.0/sy))
-        if update:
-            pairs.append((s.copy(), y.copy(), 1.0/sy))
-            del pairs[:-options.memory]
-        # 5. Only this accepted snapshot is offered to the common lifecycle.
-        return OptimizerStep(
-            evaluation=candidate, trials=tuple(trials), step_size=alpha,
-            step_norm=float(np.linalg.norm(s)), line_search_trials=len(trials),
-            diagnostics={"curvature_update": bool(update), "memory_size": len(pairs)},
-        )
+                trial_slope = float(np.dot(trial.gradient_theta, direction))
+                decrease = trial.loss <= point.loss+c1*alpha*slope
+                curvature = math.isfinite(trial_slope) and trial_slope >= c2*slope
+                if decrease and curvature:
+                    reason = "weak_wolfe"
+                elif not decrease:
+                    reason = "insufficient_decrease"
+                else:
+                    reason = "insufficient_curvature"
+                if options.verbosity >= 2:
+                    print(
+                        f"\t[line search] "
+                        f"attempt={attempt} alpha={alpha:.4e} "
+                        f"Ftrial={trial.loss:.6e} "
+                        f"dF={trial.loss-point.loss:+.4e} "
+                        f"required_dF={c1*alpha*slope:+.4e} "
+                        f"slope_ratio={trial_slope/slope:+.4e} "
+                        f"required_ratio<={c2:.3g} "
+                        f"result={reason}",
+                        flush=True,
+                    )
+                if reason == "weak_wolfe":
+                    trials.append(OuterTrial(iteration, attempt, alpha, True, trial.loss, reason))
+                    return _SearchOutcome(trial, alpha, tuple(trials), reason)
+                trials.append(OuterTrial(iteration, attempt, alpha, False, trial.loss, reason))
+                if not decrease:
+                    upper = alpha
+                else:
+                    lower = alpha
+                    if best is None or trial.loss < best[1].loss:
+                        best = (len(trials)-1, trial, alpha)
+                    if upper == math.inf and alpha >= alpha_max:
+                        capped = True
+                        stop = "step expansion reached wolfe_max_step_norm"
+                        break
+            alpha = 0.5*(lower+upper) if upper < math.inf else min(2.0*lower, alpha_max)
+        if best is not None:
+            index, candidate, alpha = best
+            acceptance = "expansion_capped" if capped else "armijo_only"
+            trials[index] = replace(trials[index], accepted=True, reason=acceptance)
+            return _SearchOutcome(candidate, alpha, tuple(trials), acceptance)
+        if exhausted:
+            status, message = "max_evaluations", "Outer evaluation budget exhausted during line search"
+        else:
+            last = trials[-1].reason if trials else "no trial was evaluated"
+            status, message = (
+                "line_search_failed",
+                f"Weak-Wolfe search found no decreasing trial ({stop}; last: {last}). "
+                "At a nonsmooth (kink) minimizer this is the expected termination; "
+                "see near_zero_eigenvalues(result).")
+        return _SearchOutcome(None, 0.0, tuple(trials), "", status, message)
 
     def _iteration_record(self, point, index, *, previous=None, step=None):
         common = super()._iteration_record(point, index, previous=previous, step=step)
         details = {} if step is None else step.diagnostics
         return OuterIteration(**asdict(common), curvature_update=details.get("curvature_update", False),
-                              memory_size=details.get("memory_size", 0))
+                              memory_size=details.get("memory_size", 0),
+                              acceptance=details.get("acceptance", ""))
 
     def _build_result(self, point, summary):
         return OuterOptimizationResult(
