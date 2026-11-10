@@ -2,7 +2,7 @@ import numpy as np
 import pickle
 from ipie.utils.backend import arraylib as xp
 from ipie.utils.linalg import modified_cholesky
-from ipie.hamiltonians.sor_chol import build_commuting_groups,pack_cholesky
+#from ipie.hamiltonians.sor_chol import build_commuting_groups,pack_cholesky
 #from ipie.hamiltonians.sor_chol_opt import optimize_cholesky_gauge 
 #from ipie.hamiltonians.sor_thc import fit_thc_from_eri
 #from ipie.hamiltonians.sor_thc_stage1_comm import fit_thc_from_eri
@@ -50,12 +50,15 @@ def compute_total_commutativity(ham):
     #print('weight=',weight)
     #print('weighted_comm2/weight=',weighted_comm2/weight)
 
-def _parse_mu(mu,ek):
+def _parse_mu(mu,ek,s):
     if mu is None:
         return 0.
     if mu=='mean':
         return ek.sum()/ek.size
-    return mu
+    try:
+        return mu[s]
+    except TypeError:
+        return mu
 
 class SizeGroup:
     def __init__(self):
@@ -221,7 +224,7 @@ class SumOfRotationBase:
             ek,vk = np.linalg.eigh(h1+self.v0[0]) 
             if iprint>0:
                 print(f'bands for both spin:',ek)
-            mu = _parse_mu(mu,ek)
+            mu = _parse_mu(mu,ek,0)
             ek -= mu
             self.mu[0] = self.mu[1] = mu
             if iprint>0:
@@ -242,7 +245,7 @@ class SumOfRotationBase:
             ek,vk = np.linalg.eigh(h1+v0) 
             if iprint>0:
                 print(f'spin={s} bands:',ek)
-            mu = _parse_mu(mu,ek)
+            mu = _parse_mu(mu,ek,s)
             ek -= mu
             self.mu[s] = mu
             if iprint>0:
@@ -480,7 +483,7 @@ class QCSOR(SumOfRotationBase):
             bix = sg.get_basis_index()
             if iprint>0:
                 print('basis index=',bix)
-
+                #print(W)
             S = np.eye(nbasis) if isometry else sg.overlaps[-1]
             if self.decomp_type=='ab_only':
                 self.v0 += .5*(np.dot(X,np.dot(W*S,X.T)))[None,:,:]
