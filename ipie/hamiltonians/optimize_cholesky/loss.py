@@ -9,10 +9,16 @@ rooted. Two objectives are supported (loss_kind):
 Because [u_i,u_j]=[A_i,A_j] is bilinear, a_i a_j ||[A_i,A_j]||^2 equals
 ||[sqrt(a_i) A_i, sqrt(a_j) A_j]||^2: L_w is L_raw evaluated on blocks whose
 merged amplitudes kappa are scaled by sqrt(a_i). Every kernel is therefore
-shared. The coefficient-weighted diagnostics of commutator_loss match
-sor_base.compute_total_commutativity when supplied the same actual channels
-and the same normalized coefficients. This module is a real float64 NumPy
-reference, not an autodiff implementation.
+shared; the optimizer layers use those scaled blocks.
+
+commutator_loss(..., loss_kind=) is the diagnostic entry point. It evaluates
+unscaled pair norms once and accumulates, in one pass, L_raw, the
+sor_base-compatible weighted fields (normalized by denom by default) and the
+unnormalized L_w; .objective holds the one selected by loss_kind. Its weighted
+diagnostics match sor_base.compute_total_commutativity when supplied the same
+actual channels and the same normalized coefficients. objective_loss returns
+only the selected value. This module is a real float64 NumPy reference, not an
+autodiff implementation.
 """
 
 from dataclasses import dataclass
@@ -95,8 +101,18 @@ def pair_scales(decomposition, loss_kind="raw"):
     return weights
 
 
-def _accumulate(pair_norm2, weights, normalize_weights):
-    raw = weighted = weight = 0.0
+def _accumulate(pair_norm2, weights, normalize_weights, coefficients, loss_kind="raw"):
+    """One pass over all i<j pairs.
+
+    weights are the (possibly normalized) diagnostic weights; coefficients are
+    the stored unnormalized a_i used for L_w. Sums are sequential, as in
+    sor_base; with normalize_weights=False the weighted and unnormalized sums
+    are therefore bitwise identical.
+    """
+    loss_kind = loss_kind_name(loss_kind)
+    if coefficients.shape != weights.shape:
+        raise ValueError("coefficients and weights must have one entry per channel")
+    raw = weighted = weight = unnormalized = 0.0
     count = weights.size
     for i in range(count):
         for j in range(i+1, count):
@@ -104,22 +120,27 @@ def _accumulate(pair_norm2, weights, normalize_weights):
             wij = float(weights[i] * weights[j])
             raw += pair
             weighted += wij * pair
+            unnormalized += float(coefficients[i] * coefficients[j]) * pair
             # Include ALL pairs, even when their commutator is structurally zero.
             weight += wij
-    if not all(np.isfinite(value) for value in (raw, weighted, weight)):
+    if not all(np.isfinite(value) for value in (raw, weighted, weight, unnormalized)):
         raise FloatingPointError("Overflow in total commutator diagnostics")
     return CommutatorLoss(raw, weighted, weight, weighted/weight if weight > 0 else None,
-                          count*(count-1)//2, bool(normalize_weights))
+                          count*(count-1)//2, bool(normalize_weights), unnormalized, loss_kind,
+                          raw if loss_kind == "raw" else unnormalized)
 
 
-def dense_commutator_loss(decomposition, *, normalize_weights=True):
+def dense_commutator_loss(decomposition, *, normalize_weights=True, loss_kind="raw"):
     """Literal reference matching sor_base, using full n*n spin matrices.
 
     normalize_weights=True uses a_i/denom, as after parse_decomposition().
     False reproduces the same formulas with raw coefficients. Neither option
-    alters the channels or the unweighted objective.
+    alters the channels, comm2 or weighted_comm2_unnormalized; loss_kind only
+    selects which of the two is reported as .objective.
     """
+    loss_kind = loss_kind_name(loss_kind)
     weights = _weights(decomposition, normalize_weights)
+    coefficients = _weights(decomposition, False)
     matrices = [get_rotation_matrix(decomposition, i) for i in range(weights.size)]
 
     def pair_norm2(i, j):
@@ -131,7 +152,7 @@ def dense_commutator_loss(decomposition, *, normalize_weights=True):
             result += float(np.linalg.norm(comm, "fro")**2)
         return result
 
-    return _accumulate(pair_norm2, weights, normalize_weights)
+    return _accumulate(pair_norm2, weights, normalize_weights, coefficients, loss_kind)
 
 
 @dataclass(frozen=True)
@@ -252,25 +273,43 @@ class OverlapEvaluator:
             raise FloatingPointError("Nonfinite commutator loss")
         return value
 
-    def evaluate(self, *, normalize_weights=True):
+    def evaluate(self, *, normalize_weights=True, loss_kind="raw"):
+        """All diagnostics from UNSCALED pair norms; loss_kind selects .objective.
+
+        The evaluator's own constructor loss_kind controls block scaling for
+        the optimizer layers; diagnostics require unscaled blocks, i.e. an
+        evaluator constructed with the default loss_kind='raw'.
+        """
         if self.loss_kind != "raw":
-            raise ValueError("evaluate() reports raw-norm diagnostics; build the evaluator "
-                             "with loss_kind='raw' or use total() for the weighted objective")
+            raise ValueError("evaluate() needs unscaled blocks; build the evaluator with the default "
+                             "loss_kind='raw' and pass evaluate(loss_kind='weighted'), or use total() "
+                             "for the scaled weighted objective")
         weights = _weights(self.decomposition, normalize_weights)
-        return _accumulate(self.pair_norm2, weights, normalize_weights)
+        coefficients = _weights(self.decomposition, False)
+        return _accumulate(self.pair_norm2, weights, normalize_weights, coefficients, loss_kind)
 
 
-def overlap_commutator_loss(decomposition, *, normalize_weights=True):
+def overlap_commutator_loss(decomposition, *, normalize_weights=True, loss_kind="raw"):
     """Cached-overlap evaluation; no dense channel or commutator matrices."""
-    return OverlapEvaluator(decomposition).evaluate(normalize_weights=normalize_weights)
+    return OverlapEvaluator(decomposition).evaluate(normalize_weights=normalize_weights,
+                                                    loss_kind=loss_kind)
 
 
-def commutator_loss(decomposition, *, method="overlap", normalize_weights=True):
-    """Return raw squared loss plus sor_base-compatible weighted diagnostics."""
+def commutator_loss(decomposition, *, method="overlap", normalize_weights=True, loss_kind="raw"):
+    """Raw loss, unnormalized weighted loss and sor_base-compatible diagnostics.
+
+    The returned .objective is L_raw (comm2) for loss_kind='raw' and the
+    unnormalized L_w (weighted_comm2_unnormalized) for loss_kind='weighted',
+    independent of normalize_weights, which affects only weighted_comm2,
+    weight and the SOR-style diagnostics.
+    """
+    loss_kind = loss_kind_name(loss_kind)
     if method == "overlap":
-        return overlap_commutator_loss(decomposition, normalize_weights=normalize_weights)
+        return overlap_commutator_loss(decomposition, normalize_weights=normalize_weights,
+                                       loss_kind=loss_kind)
     if method == "dense":
-        return dense_commutator_loss(decomposition, normalize_weights=normalize_weights)
+        return dense_commutator_loss(decomposition, normalize_weights=normalize_weights,
+                                     loss_kind=loss_kind)
     raise ValueError("method must be 'overlap' or 'dense'")
 
 
@@ -280,17 +319,17 @@ def raw_loss(decomposition, *, method="overlap"):
 
 
 def objective_loss(decomposition, *, loss_kind="raw", method="overlap"):
-    """The optimized objective for loss_kind.
+    """Only the optimized objective for loss_kind.
 
     raw: L_raw. weighted: sum_{i<j} a_i a_j ||[u_i,u_j]||_F^2 with the stored
-    unnormalized a_i, i.e. commutator_loss(...,normalize_weights=False)
-    .weighted_comm2. method='overlap' uses sqrt(a)-scaled blocks; 'dense' uses
-    literal matrices and explicit pair weights.
+    unnormalized a_i, equal to commutator_loss(..., loss_kind='weighted')
+    .objective up to summation order. method='overlap' uses sqrt(a)-scaled
+    blocks and math.fsum, exactly as the partition solver and gradients do;
+    'dense' uses literal matrices and explicit pair weights.
     """
     loss_kind = loss_kind_name(loss_kind)
     if method == "dense":
-        result = dense_commutator_loss(decomposition, normalize_weights=False)
-        return result.comm2 if loss_kind == "raw" else result.weighted_comm2
+        return dense_commutator_loss(decomposition, loss_kind=loss_kind).objective
     if method != "overlap":
         raise ValueError("method must be 'overlap' or 'dense'")
     if loss_kind == "raw":

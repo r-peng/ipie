@@ -285,14 +285,31 @@ class FixedDecomposition:
         return float(self.denom + self.shift_energy)
 
 
+LOSS_KINDS = ("raw", "weighted")
+"""raw: sum_{i<j} ||[u_i,u_j]||_F^2.
+weighted: sum_{i<j} a_i*a_j*||[u_i,u_j]||_F^2 with the stored (unnormalized) a_i."""
+
+
 @dataclass(frozen=True)
 class CommutatorLoss:
     """Squared single-particle losses, matching sor_base's printed diagnostics.
 
-    comm2 is the unweighted optimization objective. Weighted fields are only
-    diagnostics. Their weights are normalized by the combined coefficient
-    sum when weights_normalized=True. weighted_mean=None means weight=0,
-    e.g. a one-channel decomposition with no unordered pairs.
+    Field                          Value
+    comm2                          L_raw = sum_{i<j} ||[u_i,u_j]||_F^2
+    weighted_comm2                 sum_{i<j} w_i w_j ||[u_i,u_j]||_F^2, w_i = a_i/denom
+                                   if weights_normalized else a_i (sor_base convention)
+    weight                         sum_{i<j} w_i w_j over ALL pairs (same w)
+    weighted_mean                  weighted_comm2/weight; None if weight=0
+    weighted_comm2_unnormalized    L_w = sum_{i<j} a_i a_j ||[u_i,u_j]||_F^2, always with
+                                   the stored a_i, independent of weights_normalized
+    loss_kind, objective           the selected objective: comm2 for 'raw',
+                                   weighted_comm2_unnormalized for 'weighted'
+
+    The normalized weighted_comm2 equals L_w/denom**2; weighted_mean is the
+    same in both normalizations. weighted_mean=None means weight=0, e.g. a
+    one-channel decomposition with no unordered pairs. The three appended
+    fields default to None/'raw' so records built with the original six
+    positional fields remain valid.
     """
 
     comm2: float
@@ -301,6 +318,16 @@ class CommutatorLoss:
     weighted_mean: Optional[float]
     pair_count: int
     weights_normalized: bool
+    weighted_comm2_unnormalized: Optional[float] = None
+    loss_kind: str = "raw"
+    objective: Optional[float] = None
+
+    def __post_init__(self):
+        if not isinstance(self.loss_kind, str) or self.loss_kind not in LOSS_KINDS:
+            raise ValueError(f"loss_kind must be one of {LOSS_KINDS}; got {self.loss_kind!r}")
+        expected = self.comm2 if self.loss_kind == "raw" else self.weighted_comm2_unnormalized
+        if self.objective is not None and expected is not None and self.objective != expected:
+            raise ValueError("objective must equal the field selected by loss_kind")
 
     def as_dict(self):
         return asdict(self)
@@ -656,11 +683,6 @@ def _validate_optimizer_options(options):
     _solver_real(options.gradient_rtol, "gradient_rtol")
     if not isinstance(options.validate_final, (bool,np.bool_)):
         raise ValueError("validate_final must be boolean")
-
-
-LOSS_KINDS = ("raw", "weighted")
-"""raw: sum_{i<j} ||[u_i,u_j]||_F^2.
-weighted: sum_{i<j} a_i*a_j*||[u_i,u_j]||_F^2 with the stored (unnormalized) a_i."""
 
 
 LINE_SEARCHES = ("armijo", "weak_wolfe")
