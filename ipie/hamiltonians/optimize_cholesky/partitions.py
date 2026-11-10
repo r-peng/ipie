@@ -1,8 +1,13 @@
-"""Fixed-gauge partition optimization of the unweighted squared L_raw.
+"""Fixed-gauge partition (and optional shift) optimization of L_raw or L_w.
 
 Each source owns one t, shared by its two branches or four-spin quartet.
-The basis-overlap cache is reused throughout a sequential (Gauss-Seidel)
-inner solve. No ERIs, eigendecompositions or dense rotations are rebuilt.
+With optimize_shift=True the spin-resolved one-body shifts (mu_up, mu_down)
+are inner variables too: mu starts at mu*(t0), and every sweep updates all
+t's sequentially, then each mu exactly. The basis-overlap cache is reused
+throughout a sequential (Gauss-Seidel) inner solve. No ERIs,
+eigendecompositions or dense rotations are rebuilt. loss_kind='weighted'
+uses sqrt(a_i)-scaled blocks, so every source profile keeps the exact
+C + A exp(2t) + B exp(-2t) form.
 """
 
 from dataclasses import replace
@@ -20,8 +25,16 @@ from .models import (
     PartitionOptimizationResult, 
     PartitionSweep,
 )
-from .loss import OverlapEvaluator, commutator_norm2
+from .loss import OverlapEvaluator, commutator_norm2, loss_kind_name
 from .problem import _real_array
+from .shift import (
+    check_one_body_shift,
+    one_body_limit_value,
+    shift_bounds,
+    shift_profiles,
+    shift_tolerance,
+    with_shift,
+)
 
 
 def _readonly(array):
@@ -195,12 +208,17 @@ def projected_partition_gradient(t, gradient, bounds):
 class _PartitionWorkspace:
     """Private mutable amplitudes/blocks; public input/evaluator stay fixed."""
 
-    def __init__(self, decomposition):
+    def __init__(self, decomposition, loss_kind="raw"):
         t, amplitudes = _validate_partition_state(decomposition)
         self.decomposition = decomposition
         self.two = decomposition.two_body
+        self.one_body = decomposition.one_body
+        self.shift = list(check_one_body_shift(self.one_body))
+        self.shift_changed = False
         self.t, self.amplitudes = t.copy(), amplitudes.copy()
-        self.evaluator = OverlapEvaluator(decomposition)
+        self.evaluator = OverlapEvaluator(decomposition, loss_kind=loss_kind)
+        self.loss_kind = self.evaluator.loss_kind
+        self.root_scales = self.evaluator.root_scales
         self.blocks = list(self.evaluator.blocks)
         self.offset = len(decomposition.one_body.channels)
         self.spin_counts = []
@@ -233,8 +251,10 @@ class _PartitionWorkspace:
         # Branch signs disappear in each isolated-leg squared norm. Counting
         # the spins retains the exact multiplicity of two-branch/quartet U's.
         # Every same-bix channel, including this source, commutes identically.
+        # Every channel of one source shares one a_i, hence one loss scale.
+        scale = float(self.root_scales[self.offset+self.two.source_slices[i][0]])
         for leg, mode in enumerate(source.modes):
-            d = self.amplitudes[i,leg]
+            d = self.amplitudes[i,leg] if scale == 1.0 else scale*self.amplitudes[i,leg]
             values = []
             for blocks in self.blocks:
                 for spin, multiplicity in enumerate(self.spin_counts[i][leg]):
@@ -261,21 +281,44 @@ class _PartitionWorkspace:
             legs = [[], []]
             for spin, mode, d in zip(channel.spins, channel.modes, channel.d):
                 legs[spin].append((mode,d))
-            self.blocks[j] = tuple(self.evaluator._block(source.bix, spin_legs) for spin_legs in legs)
+            self.blocks[j] = tuple(self.evaluator._block(source.bix, spin_legs, self.root_scales[j])
+                                   for spin_legs in legs)
+
+    def shift_coefficients(self, lower):
+        """Exact per-spin mu profiles with every t at its CURRENT value."""
+        one_body = replace(self.one_body, shift=tuple(self.shift))
+        return shift_profiles(self.blocks, self.evaluator._overlap, one_body,
+                              self.root_scales, lower)
+
+    def update_shift(self, shift):
+        """Rebuild one-body blocks at a new (mu_up, mu_down); domain is checked."""
+        one_body = self.one_body
+        for j, channel in enumerate(one_body.channels):
+            d = (float(shift[channel.spin])-one_body.eigenvalues[channel.mode])*one_body.tau1
+            if not math.isfinite(d) or 1.0+d <= 0:
+                raise GaugeFeasibilityError("Shift leaves the one-body real-exponential domain 1+d>0")
+            blocks = [None, None]
+            blocks[channel.spin] = self.evaluator._block(-1, ((channel.mode, float(d)),),
+                                                         self.root_scales[j])
+            self.blocks[j] = tuple(blocks)
+        self.shift = [float(mu) for mu in shift]
+        self.shift_changed = True
 
     def snapshot(self):
-        return with_partitions(self.decomposition, self.t)
+        result = with_partitions(self.decomposition, self.t)
+        return with_shift(result, tuple(self.shift)) if self.shift_changed else result
 
 
-def partition_coefficients(decomposition, source_index=None):
+def partition_coefficients(decomposition, source_index=None, *, loss_kind="raw"):
     """A_i,B_i,C_i for one source, or a tuple for all sources.
 
     Other t's are held at their CURRENT values. The sums include every
-    external one-/two-body channel with its actual spin and multiplicity;
-    a_i weights are not included in L_raw. C is obtained from the full loss
-    minus the two nonnegative current-coordinate terms, and may be negative.
+    external one-/two-body channel with its actual spin and multiplicity.
+    For loss_kind='raw' no a_i weights enter; for 'weighted' every pair
+    carries a_i*a_j. C is obtained from the full loss minus the two
+    nonnegative current-coordinate terms, and may be negative.
     """
-    workspace = _PartitionWorkspace(decomposition)
+    workspace = _PartitionWorkspace(decomposition, loss_kind)
     if source_index is None:
         return tuple(workspace.coefficients(i) for i in range(len(workspace.t)))
     if isinstance(source_index, (bool, np.bool_)) or not isinstance(source_index, Integral):
@@ -293,27 +336,69 @@ def _tolerance(value, name):
 
 def optimize_partitions(decomposition, *, max_sweeps=100,
                         gradient_atol=1e-10, gradient_rtol=1e-8,
-                        amplitude_limit=None, max_abs_t=30.0):
+                        amplitude_limit=None, max_abs_t=30.0, loss_kind="raw",
+                        optimize_shift=False, one_body_limit=None,
+                        shift_atol=0.0, shift_rtol=1e-8):
     """Sequential exact coordinate updates, at a fixed Cholesky gauge.
 
+    loss_kind selects L_raw ('raw') or the unnormalized L_w ('weighted').
     Stop only when ||projected_gradient_t||_inf <= gradient_atol +
     gradient_rtol*initial_projected_gradient_norm, evaluated AFTER a full
     sweep with every other coordinate at its latest value. max_sweeps=0
     checks the input without updating it. Loss changes are diagnostics.
 
+    optimize_shift=True also relaxes (mu_up, mu_down). mu is first set to its
+    exact minimizer mu*(t0) (so no mu seed enters), and each sweep updates all
+    t's and then each mu exactly. Since mu is then exactly optimal at the
+    current t whenever the test is made, its gradient vanishes (or is
+    wall-filtered at mu >= max(eps)-one_body_limit/tau1) and needs no
+    threshold. The extra shift test requires the last sweep to have moved every
+    mu by at most shift_atol + shift_rtol*(max(eps)-min(eps)). A nonzero shift
+    requires particle numbers on the decomposition.
+
     A maximum-sweep exit returns converged=False, status='max_sweeps'; it
     is not silently treated as convergence. This is a reference coordinate
-    solver for L_raw, not a weighted-loss or outer gauge optimizer.
+    solver, not an outer gauge optimizer.
     """
     if isinstance(max_sweeps, (bool, np.bool_)) or not isinstance(max_sweeps, Integral) or max_sweeps < 0:
         raise ValueError("max_sweeps must be a nonnegative integer")
     atol = _tolerance(gradient_atol, "gradient_atol")
     rtol = _tolerance(gradient_rtol, "gradient_rtol")
+    loss_kind = loss_kind_name(loss_kind)
+    if not isinstance(optimize_shift, (bool, np.bool_)):
+        raise ValueError("optimize_shift must be boolean")
+    optimize_shift = bool(optimize_shift)
+    rho1 = one_body_limit_value(one_body_limit)
+    lower = shift_bounds(decomposition.one_body, rho1)
+    shift_tol = shift_tolerance(decomposition.one_body.eigenvalues, shift_atol, shift_rtol)
+    if optimize_shift and decomposition.two_body.nelec is None:
+        raise ValueError("optimize_shift requires particle numbers: pass nelec to prepare_problem")
     bounds = partition_bounds(decomposition, amplitude_limit=amplitude_limit, max_abs_t=max_abs_t)
-    workspace = _PartitionWorkspace(decomposition)
+    workspace = _PartitionWorkspace(decomposition, loss_kind)
     if np.any(workspace.t < bounds[:,0]) or np.any(workspace.t > bounds[:,1]):
         raise ValueError("Initial t lies outside the optimizer bounds; use feasible initial partitions "
                          "or increase amplitude_limit/max_abs_t")
+    input_loss = workspace.loss
+
+    def relax_shift():
+        """Exact mu step at the current t; returns the largest |change|."""
+        new = list(workspace.shift)
+        for profile in workspace.shift_coefficients(lower):
+            new[profile.spin] = profile.update
+        change = max(abs(a-b) for a, b in zip(new, workspace.shift))
+        workspace.update_shift(new)
+        return change
+
+    def shift_gradient():
+        result = [0.0, 0.0]
+        for profile in workspace.shift_coefficients(lower):
+            result[profile.spin] = float(profile.projected_gradient)
+        return tuple(result)
+
+    if optimize_shift:
+        # mu*(t0): the starting mu is determined by t0, never by a separate seed.
+        relax_shift()
+        workspace.loss = workspace.total_loss()
 
     def diagnostics():
         coefficients = tuple(workspace.coefficients(i) for i in range(len(workspace.t)))
@@ -329,13 +414,13 @@ def optimize_partitions(decomposition, *, max_sweeps=100,
     threshold = atol+rtol*norm
     if not math.isfinite(threshold):
         raise ValueError("Gradient stopping threshold is not representable")
-    history = [PartitionSweep(0, workspace.loss, norm, 0.0, 0.0, 0)]
+    history = [PartitionSweep(0, workspace.loss, norm, 0.0, 0.0, 0, 0.0)]
     converged = norm <= threshold
     for sweep in range(1, max_sweeps+1):
         if converged:
             break
         previous_loss = workspace.loss
-        updates, max_step = 0, 0.0
+        updates, max_step, shift_change = 0, 0.0, 0.0
         for i in range(len(workspace.t)):
             # Recompute after EVERY previous accepted coordinate update.
             current = workspace.coefficients(i)
@@ -354,19 +439,25 @@ def optimize_partitions(decomposition, *, max_sweeps=100,
             workspace.loss = math.fsum((workspace.loss, change))
             max_step = max(max_step, abs(step))
             updates += 1
+        if optimize_shift:
+            # t's first, then mu: at the check below mu is exactly optimal at the latest t.
+            shift_change = relax_shift()
         # Refresh the complete nonnegative sum once per sweep to prevent
         # accumulated subtraction error from affecting diagnostics/C_i.
         workspace.loss = workspace.total_loss()
         roundoff = 512*np.finfo(float).eps*max(previous_loss, workspace.loss, np.finfo(float).tiny)
         if workspace.loss > previous_loss+roundoff:
-            raise FloatingPointError("Sequential sweep increased the full raw loss")
+            raise FloatingPointError(f"Sequential sweep increased the full {loss_kind} loss")
         coefficients, gradient, projected, norm = diagnostics()
         history.append(PartitionSweep(sweep, workspace.loss, norm,
-                                     previous_loss-workspace.loss, max_step, updates))
-        converged = norm <= threshold
+                                     previous_loss-workspace.loss, max_step, updates, shift_change))
+        converged = norm <= threshold and (not optimize_shift or shift_change <= shift_tol)
 
     return PartitionOptimizationResult(
         workspace.snapshot(), initial_loss, workspace.loss, bounds, coefficients,
         gradient, projected, threshold, tuple(history), bool(converged),
         "converged" if converged else "max_sweeps",
-        *_partition_limits(decomposition.two_body.amplitude_bound, amplitude_limit, max_abs_t))
+        *_partition_limits(decomposition.two_body.amplitude_bound, amplitude_limit, max_abs_t),
+        loss_kind=loss_kind, optimize_shift=optimize_shift, shift_bounds=lower,
+        shift_gradient=shift_gradient() if optimize_shift else None, shift_tolerance=shift_tol, input_loss=input_loss,
+        one_body_limit=one_body_limit, shift_atol=float(shift_atol), shift_rtol=float(shift_rtol))

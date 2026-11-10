@@ -169,12 +169,50 @@ def build_two_body_channels(problem, gauge, tau2, t=None, *, partition="balanced
                                 tuple(slices), tuple(channels))
 
 
-def build_one_body_channels(problem, tau1):
+def shift_pair(shift):
+    """Canonical (mu_up, mu_down) floats; None means (0, 0)."""
+    if shift is None:
+        return (0.0, 0.0)
+    try:
+        values = tuple(shift)
+    except TypeError as exc:
+        raise ValueError("shift must be a pair (mu_up, mu_down)") from exc
+    if len(values) != 2 or any(isinstance(v, (bool, np.bool_)) or not isinstance(v, Real)
+                               or not np.isfinite(v) for v in values):
+        raise ValueError("shift must contain two finite real numbers (mu_up, mu_down)")
+    return (float(values[0]), float(values[1]))
+
+
+def _one_body_from_eigensystem(X, ell, tau1, shift, spins, nelec):
+    """Channels d[k,sigma]=(mu_sigma-epsilon_k)*tau1 on a fixed h eigensystem."""
+    shift = shift_pair(shift)
+    if nelec is None and any(shift):
+        raise ValueError("A nonzero one-body shift requires particle numbers: pass nelec "
+                         "to prepare_problem (sum_sigma mu_sigma N_sigma must be a constant)")
+    if 1 not in spins and shift[1] != 0:
+        raise ValueError("This policy emits no down-spin one-body channels; mu_down must be 0")
+    weight = 1.0 / tau1
+    if not np.isfinite(weight) or weight <= 0:
+        raise ValueError("tau1 gives a nonrepresentable positive coefficient")
+    channels = []
+    for s in spins:
+        ds = (shift[s] - ell) * tau1
+        if not np.isfinite(ds).all() or np.any(1.0 + ds <= 0):
+            raise ValueError("One-body amplitudes require 1-(epsilon-mu)*tau1 > 0; "
+                             "choose smaller tau1 or a larger shift")
+        channels.extend(OneBodyChannel(s, weight, k, float(d)) for k, d in enumerate(ds))
+    return OneBodyDecomposition(X, ell, tau1, tuple(channels), shift)
+
+
+def build_one_body_channels(problem, tau1, shift=None):
     """Jointly diagonalize bare h and retain one channel per mode and spin.
 
-    d=-epsilon*tau1, weight=1/tau1. Zero eigenvalues are retained as identity
-    channels. Only up spin is emitted for aa_only. Real exponentials require
-    d>-1; positive d>=1 is allowed because this identity has no minus branch.
+    d=(mu_sigma-epsilon)*tau1, weight=1/tau1, with shift=(mu_up, mu_down)
+    defaulting to zero. Zero amplitudes are retained as identity channels.
+    Only up spin is emitted for aa_only (mu_down must then be 0). Real
+    exponentials require d>-1; positive d>=1 is allowed because this identity
+    has no minus branch. A nonzero shift requires problem.nelec, since
+    sum_sigma mu_sigma N_sigma is folded into Lambda.
     """
     policy = _problem_policy(problem)
     tau1 = positive_scale(tau1, "tau1")
@@ -185,26 +223,26 @@ def build_one_body_channels(problem, tau1):
     _require_report(ValidationReport({"h1_symmetry": _metric(h, h.T, problem.report.options)},
                                      problem.report.options))
     ell, X = np.linalg.eigh(h)
-    weight = 1.0 / tau1
-    if not np.isfinite(weight) or weight <= 0:
-        raise ValueError("tau1 gives a nonrepresentable positive coefficient")
-    ds = -ell * tau1
-    if not np.isfinite(ds).all() or np.any(1.0 + ds <= 0):
-        raise ValueError("One-body amplitudes require 1-epsilon*tau1 > 0; choose smaller tau1")
-    spins = (0,) if policy == "aa_only" else (0,1)
-    channels = tuple(OneBodyChannel(s, weight, k, float(d))
-                     for s in spins for k, d in enumerate(ds))
     ell.setflags(write=False)
     X.setflags(write=False)
-    return OneBodyDecomposition(X, ell, tau1, channels)
+    spins = (0,) if policy == "aa_only" else (0,1)
+    return _one_body_from_eigensystem(X, ell, tau1, shift, spins, problem.nelec)
+
+
+def one_body_at_shift(one_body, shift, nelec):
+    """Rebuild one-body channels at a new shift, reusing the cached eigensystem."""
+    if not isinstance(one_body, OneBodyDecomposition):
+        raise TypeError("one_body must be a OneBodyDecomposition")
+    return _one_body_from_eigensystem(one_body.X, one_body.eigenvalues, one_body.tau1,
+                                      shift, one_body.spins, nelec)
 
 
 def build_fixed_decomposition(problem, gauge, tau1, tau2, t=None, *,
-                              partition="balanced_log", amplitude_bound=1.0):
+                              partition="balanced_log", amplitude_bound=1.0, shift=None):
     """Build both lists with the same policy, without normalizing either list."""
     two_body = build_two_body_channels(problem, gauge, tau2, t,
                                        partition=partition, amplitude_bound=amplitude_bound)
-    one_body = build_one_body_channels(problem, tau1)
+    one_body = build_one_body_channels(problem, tau1, shift)
     result = FixedDecomposition(one_body, two_body)
     if not np.isfinite(result.denom) or result.denom <= 0:
         raise ValueError("The combined positive coefficient sum is not representable")

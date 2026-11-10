@@ -1,19 +1,28 @@
 """Reference squared commutator loss: dense matrices versus small overlaps.
 
 For u=diag(I+A_up,I+A_down), squared spin norms are ADDED, never square
-rooted. The optimized objective is the unweighted sum over all i<j. The
-coefficient-weighted diagnostics match sor_base.compute_total_commutativity
-when supplied the same actual channels and the same normalized coefficients.
-This module is a real float64 NumPy reference, not an autodiff implementation.
+rooted. Two objectives are supported (loss_kind):
+
+  raw       L_raw = sum_{i<j} ||[u_i,u_j]||_F^2
+  weighted  L_w   = sum_{i<j} a_i a_j ||[u_i,u_j]||_F^2   (unnormalized a_i)
+
+Because [u_i,u_j]=[A_i,A_j] is bilinear, a_i a_j ||[A_i,A_j]||^2 equals
+||[sqrt(a_i) A_i, sqrt(a_j) A_j]||^2: L_w is L_raw evaluated on blocks whose
+merged amplitudes kappa are scaled by sqrt(a_i). Every kernel is therefore
+shared. The coefficient-weighted diagnostics of commutator_loss match
+sor_base.compute_total_commutativity when supplied the same actual channels
+and the same normalized coefficients. This module is a real float64 NumPy
+reference, not an autodiff implementation.
 """
 
 from dataclasses import dataclass
+import math
 from numbers import Integral, Real
 
 import numpy as np
 
 from .channels import get_rotation_matrix
-from .models import CommutatorLoss, FixedDecomposition
+from .models import LOSS_KINDS, CommutatorLoss, FixedDecomposition
 from .problem import _real_array
 
 
@@ -65,6 +74,24 @@ def _weights(decomposition, normalize_weights):
         if not np.isfinite(total) or total <= 0:
             raise ValueError("Combined coefficient sum must be finite and positive")
         weights = weights / total
+    return weights
+
+
+def loss_kind_name(loss_kind):
+    if not isinstance(loss_kind, str) or loss_kind not in LOSS_KINDS:
+        raise ValueError(f"loss_kind must be one of {LOSS_KINDS}; got {loss_kind!r}")
+    return loss_kind
+
+
+def pair_scales(decomposition, loss_kind="raw"):
+    """Per-channel s_i with pair weight s_i*s_j (combined one-body-first order).
+
+    raw: s_i=1. weighted: s_i=a_i, the stored UNNORMALIZED Green weights.
+    """
+    loss_kind = loss_kind_name(loss_kind)
+    weights = _weights(decomposition, False)
+    if loss_kind == "raw":
+        return np.ones_like(weights)
     return weights
 
 
@@ -123,9 +150,13 @@ class OverlapEvaluator:
     Build a new evaluator after changing bases, channels, or amplitudes.
     """
 
-    def __init__(self, decomposition):
+    def __init__(self, decomposition, *, loss_kind="raw"):
         _weights(decomposition, False)
         self.decomposition = decomposition
+        self.loss_kind = loss_kind_name(loss_kind)
+        self.scales = pair_scales(decomposition, self.loss_kind)
+        self.root_scales = np.sqrt(self.scales)
+        self.root_scales.setflags(write=False)
         X = _real_array(decomposition.two_body.gauge.X, "Cholesky bases")
         if X.ndim != 3 or X.shape[0] < 1 or X.shape[1] != X.shape[2] or X.shape[1] < 1:
             raise ValueError("Cholesky bases must have shape (r,n,n)")
@@ -135,19 +166,22 @@ class OverlapEvaluator:
             self._bases[bix] = self._basis(basis, f"Cholesky basis {bix}")
         self._overlaps = {}
         blocks = []
-        for channel in decomposition.one_body.channels:
+        for index, channel in enumerate(decomposition.one_body.channels):
             self._leg(channel.spin, channel.mode, channel.d)
             spin_blocks = [None, None]
-            spin_blocks[channel.spin] = self._block(-1, ((channel.mode,channel.d),))
+            spin_blocks[channel.spin] = self._block(-1, ((channel.mode,channel.d),),
+                                                    self.root_scales[index])
             blocks.append(tuple(spin_blocks))
-        for channel in decomposition.two_body.channels:
+        offset = len(decomposition.one_body.channels)
+        for index, channel in enumerate(decomposition.two_body.channels):
             if channel.bix not in self._bases or channel.bix < 0:
                 raise ValueError("Channel Cholesky basis index is out of range")
             legs = [[], []]
             for spin, mode, d in zip(channel.spins, channel.modes, channel.d):
                 self._leg(spin, mode, d)
                 legs[spin].append((mode,d))
-            blocks.append(tuple(self._block(channel.bix, spin_legs) for spin_legs in legs))
+            blocks.append(tuple(self._block(channel.bix, spin_legs, self.root_scales[offset+index])
+                                for spin_legs in legs))
         self.blocks = tuple(blocks)
 
     def _basis(self, array, name):
@@ -170,16 +204,19 @@ class OverlapEvaluator:
             raise ValueError("Channel amplitudes must be finite and real")
 
     @staticmethod
-    def _block(basis, legs):
+    def _block(basis, legs, scale=1.0):
         coefficients = {}
         for mode, d in legs:
             old = coefficients.get(mode, 0.0)
             coefficients[mode] = old + d + old*d
         # Distinct modes are orthogonal. Repeated mode: (1+old P)(1+d P).
+        # The loss scale multiplies the MERGED amplitude (the matrix A), never d.
         active = [(mode,float(kappa)) for mode,kappa in coefficients.items() if kappa != 0]
         if not active:
             return None
-        return _SpinBlock(basis, tuple(p for p,_ in active), tuple(d for _,d in active))
+        scale = float(scale)
+        return _SpinBlock(basis, tuple(p for p,_ in active),
+                          tuple(d if scale == 1.0 else scale*d for _,d in active))
 
     def _overlap(self, left, right):
         key = (min(left,right), max(left,right))
@@ -207,7 +244,18 @@ class OverlapEvaluator:
             result += commutator_norm2(left.kappa, right.kappa, C)
         return result
 
+    def total(self):
+        """The loss_kind objective: fsum of all (scaled) pair norms."""
+        value = math.fsum(self.pair_norm2(i, j) for i in range(len(self.blocks))
+                          for j in range(i+1, len(self.blocks)))
+        if not math.isfinite(value):
+            raise FloatingPointError("Nonfinite commutator loss")
+        return value
+
     def evaluate(self, *, normalize_weights=True):
+        if self.loss_kind != "raw":
+            raise ValueError("evaluate() reports raw-norm diagnostics; build the evaluator "
+                             "with loss_kind='raw' or use total() for the weighted objective")
         weights = _weights(self.decomposition, normalize_weights)
         return _accumulate(self.pair_norm2, weights, normalize_weights)
 
@@ -229,3 +277,22 @@ def commutator_loss(decomposition, *, method="overlap", normalize_weights=True):
 def raw_loss(decomposition, *, method="overlap"):
     """Only L_raw: the unweighted sum of squared single-particle norms."""
     return commutator_loss(decomposition, method=method).comm2
+
+
+def objective_loss(decomposition, *, loss_kind="raw", method="overlap"):
+    """The optimized objective for loss_kind.
+
+    raw: L_raw. weighted: sum_{i<j} a_i a_j ||[u_i,u_j]||_F^2 with the stored
+    unnormalized a_i, i.e. commutator_loss(...,normalize_weights=False)
+    .weighted_comm2. method='overlap' uses sqrt(a)-scaled blocks; 'dense' uses
+    literal matrices and explicit pair weights.
+    """
+    loss_kind = loss_kind_name(loss_kind)
+    if method == "dense":
+        result = dense_commutator_loss(decomposition, normalize_weights=False)
+        return result.comm2 if loss_kind == "raw" else result.weighted_comm2
+    if method != "overlap":
+        raise ValueError("method must be 'overlap' or 'dense'")
+    if loss_kind == "raw":
+        return raw_loss(decomposition, method="overlap")
+    return OverlapEvaluator(decomposition, loss_kind=loss_kind).total()

@@ -210,12 +210,24 @@ class TwoBodyDecomposition:
 
 @dataclass(frozen=True)
 class OneBodyDecomposition:
-    """One-body channels and the jointly diagonalized original h."""
+    """One-body channels and the jointly diagonalized original h.
+
+    shift=(mu_up, mu_down) gives d[k,sigma]=(mu_sigma-epsilon_k)*tau1, i.e. the
+    channels represent sum_k (epsilon_k-mu_sigma) n_{k,sigma}. The remainder
+    sum_sigma mu_sigma N_sigma is a constant only on a fixed (N_up, N_down)
+    sector; see FixedDecomposition.shift_energy.
+    """
 
     X: np.ndarray
     eigenvalues: np.ndarray
     tau1: float
     channels: Tuple[OneBodyChannel, ...]
+    shift: Tuple[float, float] = (0.0, 0.0)
+
+    @property
+    def spins(self):
+        """Spins that carry one-body channels: (0,) for aa_only, else (0, 1)."""
+        return tuple(sorted({channel.spin for channel in self.channels}))
 
     @property
     def weight_sum(self):
@@ -247,6 +259,30 @@ class FixedDecomposition:
     def coefficients(self):
         return np.array([c.a_i for c in self.one_body.channels]
                         + [c.a_i for c in self.two_body.channels], dtype=np.float64)
+
+    @property
+    def shift(self):
+        return tuple(float(mu) for mu in self.one_body.shift)
+
+    @property
+    def shift_energy(self):
+        """sum_sigma mu_sigma*N_sigma; requires particle numbers if any mu != 0."""
+        shift = self.shift
+        if not any(shift):
+            return 0.0
+        nelec = self.two_body.nelec
+        if nelec is None:
+            raise ValueError("A nonzero one-body shift requires particle numbers (nelec)")
+        return float(shift[0]*nelec[0] + shift[1]*nelec[1])
+
+    @property
+    def lambda_electronic(self):
+        """Lambda without E0: denom + sum_sigma mu_sigma N_sigma.
+
+        On the (N_up, N_down) sector, (E0+lambda_electronic)*I - H_tot equals
+        sum_i a_i U_i. With zero shift this is denom.
+        """
+        return float(self.denom + self.shift_energy)
 
 
 @dataclass(frozen=True)
@@ -348,6 +384,59 @@ class PartitionCoefficients:
 
 
 @dataclass(frozen=True)
+class ShiftCoefficients:
+    """Exact quadratic profile of the loss in one spin's shift mu_sigma.
+
+    With every other variable fixed,
+        L(m) = const + tau1**2 * (weight*m**2 - 2*moment*m),
+    where weight = sum_k w_k and moment = sum_k w_k*epsilon_k over this spin's
+    one-body channels, w_k = s_k * sum_j ||[x_k x_k^T, A_j]||_F^2 with unit
+    one-body legs and loss-scaled two-body blocks A_j. lower is the closed
+    feasibility bound mu >= max_k epsilon_k - one_body_limit/tau1.
+    """
+
+    spin: int
+    mu: float
+    lower: float
+    weight: float
+    moment: float
+    tau1: float
+
+    def __post_init__(self):
+        for name in ("mu", "lower", "weight", "moment", "tau1"):
+            value = getattr(self, name)
+            if isinstance(value, (bool, np.bool_)) or not isinstance(value, Real) or not np.isfinite(value):
+                raise ValueError(f"{name} must be a finite real scalar")
+        if self.weight < 0 or self.tau1 <= 0:
+            raise ValueError("weight must be nonnegative and tau1 positive")
+
+    @property
+    def optimum(self):
+        """Unconstrained minimizer, a weighted mean of epsilon; mu if flat."""
+        return self.mu if self.weight == 0 else self.moment/self.weight
+
+    @property
+    def update(self):
+        """Exact minimizer on [lower, inf)."""
+        return float(max(self.optimum, self.lower))
+
+    def gradient(self, m=None):
+        m = self.mu if m is None else float(m)
+        return 2.0*self.tau1**2*(self.weight*m-self.moment)
+
+    @property
+    def projected_gradient(self):
+        """Wall-filtered: at the lower wall keep only min(g, 0)."""
+        g = self.gradient()
+        return min(g, 0.0) if self.mu <= self.lower else g
+
+    def change(self, m):
+        """L(m) - L(mu)."""
+        m = float(m)
+        return self.tau1**2*(m-self.mu)*(self.weight*(m+self.mu)-2.0*self.moment)
+
+
+@dataclass(frozen=True)
 class PartitionSweep:
     """Diagnostics after a full sequential sweep; sweep=0 is the input."""
 
@@ -357,6 +446,7 @@ class PartitionSweep:
     loss_decrease: float
     max_step: float
     updates: int
+    shift_change: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -364,7 +454,10 @@ class PartitionOptimizationResult:
     """Fixed-gauge inner solve; arrays are owned read-only snapshots.
 
     Convergence means the infinity norm of the projected t-gradient meets
-    gradient_threshold on the stored closed bounds. It does not certify a
+    gradient_threshold on the stored closed bounds and, when the shifts are
+    optimized, that the last sweep moved every mu_sigma by at most
+    shift_tolerance. loss and initial_loss use loss_kind; initial_loss is
+    taken after mu is initialized to mu*(t0), input_loss before. It does not certify a
     global minimum of the joint partition problem. The final decomposition
     can be passed straight to the step-3 loss functions.
     """
@@ -382,10 +475,23 @@ class PartitionOptimizationResult:
     status: str
     amplitude_limit: Optional[float] = None
     max_abs_t: float = 30.0
+    loss_kind: str = "raw"
+    optimize_shift: bool = False
+    shift_bounds: Optional[Tuple[Optional[float], Optional[float]]] = None
+    shift_gradient: Optional[Tuple[float, float]] = None
+    shift_tolerance: Optional[float] = None
+    input_loss: Optional[float] = None
+    one_body_limit: Optional[float] = None
+    shift_atol: float = 0.0
+    shift_rtol: float = 1e-8
 
     @property
     def t(self):
         return self.decomposition.two_body.t
+
+    @property
+    def shift(self):
+        return self.decomposition.shift
 
     @property
     def sweeps(self):
@@ -489,13 +595,24 @@ def _solver_integer(value, name, minimum):
 
 @dataclass(frozen=True)
 class InnerOptions:
-    """One fixed partition-solver configuration for the entire outer run."""
+    """One fixed partition-solver configuration for the entire outer run.
+
+    optimize_shift=True relaxes (mu_up, mu_down) together with t: mu starts at
+    mu*(t0) and each sweep updates all t's, then mu. one_body_limit (default
+    1-1e-8) is the closed bound 1+d >= 1-one_body_limit on one-body channels.
+    The shift test requires the last sweep to move each mu by at most
+    shift_atol + shift_rtol*(max(epsilon)-min(epsilon)).
+    """
 
     max_sweeps: int = 500
     gradient_atol: float = 1e-11
     gradient_rtol: float = 1e-9
     amplitude_limit: Optional[float] = None
     max_abs_t: float = 30.0
+    optimize_shift: bool = False
+    one_body_limit: Optional[float] = None
+    shift_atol: float = 0.0
+    shift_rtol: float = 1e-8
 
     def __post_init__(self):
         _solver_integer(self.max_sweeps, "max_sweeps", 0)
@@ -506,6 +623,14 @@ class InnerOptions:
             _solver_real(self.amplitude_limit, "amplitude_limit", positive=True)
             if self.amplitude_limit >= 1:
                 raise ValueError("amplitude_limit must be < 1")
+        if not isinstance(self.optimize_shift, (bool, np.bool_)):
+            raise ValueError("optimize_shift must be boolean")
+        if self.one_body_limit is not None:
+            _solver_real(self.one_body_limit, "one_body_limit", positive=True)
+            if self.one_body_limit >= 1:
+                raise ValueError("one_body_limit must be < 1")
+        _solver_real(self.shift_atol, "shift_atol")
+        _solver_real(self.shift_rtol, "shift_rtol")
 
 
 @dataclass(frozen=True)
@@ -531,6 +656,11 @@ def _validate_optimizer_options(options):
     _solver_real(options.gradient_rtol, "gradient_rtol")
     if not isinstance(options.validate_final, (bool,np.bool_)):
         raise ValueError("validate_final must be boolean")
+
+
+LOSS_KINDS = ("raw", "weighted")
+"""raw: sum_{i<j} ||[u_i,u_j]||_F^2.
+weighted: sum_{i<j} a_i*a_j*||[u_i,u_j]||_F^2 with the stored (unnormalized) a_i."""
 
 
 LINE_SEARCHES = ("armijo", "weak_wolfe")
@@ -663,6 +793,7 @@ class OptimizerIteration:
     inner_sweeps: int
     inner_projected_gradient_norm: float
     line_search_trials: int
+    shift: Optional[Tuple[float, float]] = None
 
 
 @dataclass(frozen=True)
@@ -682,6 +813,7 @@ class OuterIteration:
     curvature_update: bool
     memory_size: int
     acceptance: str = ""
+    shift: Optional[Tuple[float, float]] = None
 
 
 @dataclass(frozen=True)

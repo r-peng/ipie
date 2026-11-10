@@ -135,6 +135,9 @@ class OuterOptimizer(ABC):
     def _iteration_record(self, point, index, *, previous=None, step=None):
         """Common scalar record; children may extend it with their own fields."""
         inner = point.gauge_gradient.inner_result
+        # Relaxed shifts are reported; fixed or absent shifts are not.
+        shift = (tuple(float(mu) for mu in inner.shift)
+                 if getattr(inner, "optimize_shift", False) else None)
         return OptimizerIteration(
             index, point.loss, point.gradient_norm, point.tangent_gradient_norm,
             0. if step is None else step.step_size,
@@ -142,6 +145,7 @@ class OuterOptimizer(ABC):
             0. if previous is None else previous.loss-point.loss,
             inner.sweeps, inner.projected_gradient_norm,
             0 if step is None else step.line_search_trials,
+            shift,
         )
 
     def _stationarity(self, point, threshold, tangent_threshold):
@@ -187,7 +191,9 @@ class OuterOptimizer(ABC):
                     f"tangent_tol={tangent_threshold:.4e} "
                     f"step_norm={row.step_norm:.3e} "
                     f"inner_sweeps={row.inner_sweeps} "
-                    f"inner_grad={row.inner_projected_gradient_norm:.3e}",
+                    f"inner_grad={row.inner_projected_gradient_norm:.3e}"
+                    + ("" if getattr(row, "shift", None) is None else
+                       f" mu=({row.shift[0]:+.8e},{row.shift[1]:+.8e})"),
                     flush=True,
                 )
 

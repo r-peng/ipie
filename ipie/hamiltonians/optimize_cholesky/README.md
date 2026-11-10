@@ -1,26 +1,30 @@
 # Cholesky gauge and partition optimization
 
 This package builds an exact density-channel decomposition and minimizes its
-unweighted squared commutator loss. It supports orthogonal Cholesky gauges,
-fixed or relaxed partitions, analytic gauge gradients, and explicit L-BFGS.
+squared commutator loss, either unweighted (`loss_kind="raw"`, default) or
+weighted by the stored Green weights (`loss_kind="weighted"`). It supports
+orthogonal Cholesky gauges, fixed or relaxed partitions, optional relaxed
+spin-resolved one-body shifts (mu_up, mu_down), analytic gauge gradients, and
+explicit L-BFGS.
 NumPy derivatives and L-BFGS are implemented. PyTorch derivatives and GDM are
 reserved options that raise `NotImplementedError`; neither silently falls back.
 
-## Eight production files
+## Nine production files
 
 | File | Responsibility and useful entry points |
 | --- | --- |
 | `models.py` | Data, options, exceptions and result records; `PreparedProblem`, `FixedDecomposition`, `GaugeGradient`, `OuterOptimizationResult` |
 | `problem.py` | Input validation, HDF5 loading, sector selection, orthogonal gauges and eigensystems; `prepare_problem`, `load_problem`, `build_gauge_state` |
 | `channels.py` | Source enumeration, amplitude maps, positive channel weights, rotation matrices; `build_fixed_decomposition` |
-| `loss.py` | Dense and overlap commutator kernels for an existing decomposition; `raw_loss`, `commutator_loss`, `OverlapEvaluator` |
+| `loss.py` | Dense and overlap commutator kernels for an existing decomposition; `raw_loss`, `objective_loss`, `commutator_loss`, `OverlapEvaluator` |
+| `shift.py` | Spin-resolved one-body shifts: bounds, exact quadratic profiles, `with_shift`, `shift_coefficients`, `optimal_shift` |
 | `partitions.py` | Bounds, source-local coefficients, sequential analytic partition updates; `partition_coefficients`, `optimize_partitions` |
 | `gradients.py` | Derivative backend selection, elementary pullbacks, fixed/relaxed gauge derivatives and `GaugeEvaluator` |
 | `optimizers.py` | Exponential objective, solver-neutral parent, explicit L-BFGS child, GDM placeholder and `optimize_gauge` |
 | `__init__.py` | Stable package-level public imports; no numerical implementation |
 
 Read the files in the table's order: models, problem, channels, loss,
-partitions, gradients, then optimizers. Each numerical layer builds on the
+shift, partitions, gradients, then optimizers. Each numerical layer builds on the
 earlier layers. Solver-independent and solver-specific classes share a file
 but retain separate responsibilities. No solver or backend subdirectories are
 needed for the current implementation.
@@ -167,8 +171,9 @@ The returned objects are ready for a future SOR adapter; that adapter and a
 dedicated disk serialization interface are not implemented here.
 
 Stored `a_i` values are positive, unnormalized Green weights. In this code's
-convention, `H=sum_i a_i*(I-U_i)` and `denom*I-H=sum_i a_i*U_i`, with
-`denom=sum_i a_i` and no added constant energy. They are the negatives of the
+convention, with zero shift, `H=sum_i a_i*(I-U_i)` and `denom*I-H=sum_i a_i*U_i`,
+with `denom=sum_i a_i` and no added constant energy. With a shift, use
+`lambda_electronic=denom+sum_s mu_s*N_s` in place of `denom` (on the sector). They are the negatives of the
 coefficients called `a_i` in the original note. Do not normalize the one-body
 and two-body lists independently.
 
@@ -395,15 +400,70 @@ used 1.4-3.9 times as many evaluations, because it keeps making progress
 along the kink surface instead of stopping early. It does not choose basins:
 use several starting gauges when local minima matter.
 
+## Weighted loss and spin-resolved shifts
+
+`loss_kind="weighted"` optimizes
+`L_w = sum_{i<j} a_i*a_j*||[u_i,u_j]||_F^2` with the stored, UNNORMALIZED
+`a_i` (equal to `commutator_loss(..., normalize_weights=False).weighted_comm2`;
+the normalized diagnostic differs by the constant `1/denom**2`). Because
+`a_i*a_j*||[A_i,A_j]||^2 = ||[sqrt(a_i)*A_i, sqrt(a_j)*A_j]||^2`, the weighted
+loss is the raw kernel on blocks whose merged amplitudes are scaled by
+`sqrt(a_i)`; every kernel, the exact `C+A*exp(2t)+B*exp(-2t)` source profile,
+the analytic partition update and all gauge pullbacks are shared. With fixed
+`a_k=1/tau1` and two-body weights, `tau2` drops out of `L_w` at fixed `t`
+(it still sets the feasible intervals).
+
+The shift writes the one-body term as
+`sum_{k,s}(eps_k-mu_s) n_{k,s} + sum_s mu_s N_s`, so `d[k,s]=(mu_s-eps_k)*tau1`
+and `FixedDecomposition.lambda_electronic = denom + mu_up*N_up + mu_down*N_down`
+(add `E0` for `Lambda_total`). A nonzero shift therefore requires `nelec`.
+For `aa_only` only `mu_up` exists. One-body channels commute, so either loss
+is exactly quadratic in each `mu_s` and the spins decouple; the minimizer is
+the weighted mean `sum_k w_k*eps_k/sum_k w_k`, clipped to the one-sided bound
+`mu_s >= max(eps) - one_body_limit/tau1` (default `one_body_limit=1-1e-8`).
+For two orbitals it equals `mean(eps)` at every gauge and partition.
+
+```python
+engine = GaugeEvaluator(problem, tau1=0.03, tau2=0.04, loss_kind="weighted")
+result = optimize_gauge(
+    engine, options=LBFGSOptions(line_search="weak_wolfe", verbosity=1),
+    inner_options=InnerOptions(optimize_shift=True, gradient_atol=1e-12, gradient_rtol=0),
+)
+print(result.loss, result.decomposition.shift, result.decomposition.lambda_electronic)
+```
+
+With `optimize_shift=True` the inner solve sets `mu` to `mu*(t0)` before the
+first residual check (no shift seed exists; the engine's `shift` only needs
+to be feasible), then every sweep updates all `t` sequentially and then each
+`mu` exactly. At every convergence check `mu` is therefore the exact minimizer
+at the current `t`, its gradient is zero (or wall-filtered), and no gradient
+threshold is needed for it. The added shift test requires the last sweep to
+have moved each `mu` by at most `shift_atol + shift_rtol*(max(eps)-min(eps))`
+(defaults `0` and `1e-8`). The relaxed gauge gradient re-checks that the stored
+`mu` is the exact minimizer; `mu`'s bound depends on `h` only, so the envelope
+gradient has no moving-bound term for it. Fixed shifts are passed as
+`GaugeEvaluator(..., shift=(mu_up, mu_down))` or per call (`fixed`, `fixed_z`,
+`decomposition`).
+
+`hybrid` channels stay spin-symmetric when diagonal-source ratios are zero,
+and then `mu_up=mu_down`; `ab_only` (left leg always up) and nonzero diagonal
+ratios break the symmetry. Verbose outer output appends `mu=(...)` when the
+shift is relaxed, and `OuterIteration.shift` records it.
+
 ## Tests and installation
 
-Seven test modules group the same responsibilities as the implementation:
+Nine test modules group the same responsibilities as the implementation:
 `test_problem` combines input/model checks; `test_channels` checks reconstruction;
 `test_loss` compares dense/overlap/SOR losses; `test_partitions` checks analytic
 updates; `test_gradients` includes backend and moving-bound checks; and
 `test_optimizers` combines physical, controlled-quadratic, class and dispatch
 tests; and `test_weak_wolfe` checks the weak-Wolfe search on smooth, kinked
-and physical objectives, plus `near_zero_eigenvalues`. These use small exact systems and independent numerical references.
+and physical objectives, plus `near_zero_eigenvalues`; `test_weighted` checks
+the weighted objective against explicit dense weights, its exact profiles,
+inner solve and gradients; and `test_shift` checks shifted channels, Lambda and
+sector reconstruction, exact quadratic profiles, relaxation order and seed
+independence, the lower bound, and relaxed gradients. These use small exact
+systems and independent numerical references.
 
 ```sh
 python -m unittest ipie.hamiltonians.optimize_cholesky.tests.test_problem -v
@@ -413,6 +473,8 @@ python -m unittest ipie.hamiltonians.optimize_cholesky.tests.test_partitions -v
 python -m unittest ipie.hamiltonians.optimize_cholesky.tests.test_gradients -v
 python -m unittest ipie.hamiltonians.optimize_cholesky.tests.test_optimizers -v
 python -m unittest ipie.hamiltonians.optimize_cholesky.tests.test_weak_wolfe -v
+python -m unittest ipie.hamiltonians.optimize_cholesky.tests.test_weighted -v
+python -m unittest ipie.hamiltonians.optimize_cholesky.tests.test_shift -v
 python -m unittest discover -s ipie/hamiltonians/optimize_cholesky/tests -v
 ```
 

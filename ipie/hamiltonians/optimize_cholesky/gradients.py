@@ -16,7 +16,7 @@ from .models import (
     PreparedProblem,
     TwoBodyDecomposition,
 )
-from .loss import commutator_norm2, OverlapEvaluator
+from .loss import commutator_norm2, OverlapEvaluator, loss_kind_name
 from .partitions import (
     _readonly,
     _partition_intervals,
@@ -40,8 +40,11 @@ from .channels import (
     build_one_body_channels,
     enumerate_sources,
     fixed_partition_amplitudes,
+    one_body_at_shift,
     positive_scale,
+    shift_pair,
 )
+from .shift import check_one_body_shift, shift_bounds, shift_coefficients
 
 
 # Derivative backend, elementary pullbacks, and coordinate maps
@@ -186,24 +189,28 @@ def _coordinates(value, count, name):
     return values.copy()
 
 
-def _loss_pullback(decomposition):
-    """Return raw loss, actual-channel leg adjoints and basis adjoints.
+def _loss_pullback(decomposition, loss_kind="raw"):
+    """Return the loss_kind loss, actual-channel leg adjoints and basis adjoints.
 
     Keep zero legs in each block: a zero leg in a nonzero same-spin block can
     have a nonzero amplitude derivative. Identity-only pairs need no special
-    case beyond the polynomial kernel.
+    case beyond the polynomial kernel. For loss_kind='weighted' the legs are
+    scaled by sqrt(a_i) and the leg adjoints are chained back to the actual d.
     """
-    evaluator = OverlapEvaluator(decomposition)
+    evaluator = OverlapEvaluator(decomposition, loss_kind=loss_kind)
+    root = evaluator.root_scales
     two = decomposition.two_body
+    offset = len(decomposition.one_body.channels)
     blocks = []
-    for channel in decomposition.one_body.channels:
+    for index,channel in enumerate(decomposition.one_body.channels):
         pair = [None,None]
-        pair[channel.spin] = (-1,(channel.mode,),np.array([channel.d]),())
+        pair[channel.spin] = (-1,(channel.mode,),np.array([root[index]*channel.d]),())
         blocks.append(tuple(pair))
     for index,channel in enumerate(two.channels):
         spin_legs = [[],[]]
+        scale = root[offset+index]
         for leg,(spin,mode,d) in enumerate(zip(channel.spins,channel.modes,channel.d)):
-            spin_legs[spin].append((mode,d,leg))
+            spin_legs[spin].append((mode,scale*d,leg))
         blocks.append(tuple(None if not legs else (
             channel.bix,tuple(x[0] for x in legs),np.array([x[1] for x in legs]),
             tuple((index,x[2]) for x in legs)) for legs in spin_legs))
@@ -228,6 +235,9 @@ def _loss_pullback(decomposition):
                     gX[a][:,ma] += evaluator._bases[b][:,mb]@gC.T
                 if b >= 0:
                     gX[b][:,mb] += evaluator._bases[a][:,ma]@gC
+    # d(scaled leg)/d(actual leg) = sqrt(a_i); exactly one for loss_kind='raw'.
+    if evaluator.loss_kind != "raw":
+        g_amplitude *= root[offset:,None]
     return math.fsum(terms),g_amplitude,gX
 
 
@@ -249,6 +259,7 @@ def _validate_state(problem,decomposition):
         raise ValueError("Invalid Cholesky eigensystem dimensions")
     if not np.allclose((X*ell[:,None,:])@np.swapaxes(X,1,2),expected,atol=atol,rtol=rtol):
         raise ValueError("Stored Cholesky eigenpairs do not reconstruct the rotated factors")
+    check_one_body_shift(decomposition.one_body)
 
 
 def _amplitude_pullback(two,g_amplitude,options):
@@ -325,10 +336,10 @@ def _bound_pullback(two,gt,z,amplitude_limit,max_abs_t,options):
 
 
 def _assemble(problem,decomposition,options,mode,*,bounds=None,amplitude_limit=None,
-              max_abs_t=30.,inner_result=None):
+              max_abs_t=30.,inner_result=None,loss_kind="raw"):
     _validate_state(problem,decomposition)
     two = decomposition.two_body
-    loss,gamp,gX = _loss_pullback(decomposition)
+    loss,gamp,gX = _loss_pullback(decomposition,loss_kind)
     gell,gt = _amplitude_pullback(two,gamp,options)
     extra = np.zeros_like(gell)
     z = None
@@ -359,23 +370,27 @@ def _assemble(problem,decomposition,options,mode,*,bounds=None,amplitude_limit=N
         None if z is None else _readonly(z),inner_result)
 
 
-def fixed_partition_gradient(problem,decomposition,*,options=None,backend="numpy"):
-    """d L_raw/dO with physical log ratios t held fixed, including eigh.
+def fixed_partition_gradient(problem,decomposition,*,options=None,backend="numpy",
+                             loss_kind="raw"):
+    """d L/dO with physical log ratios t (and the shift) held fixed, including eigh.
 
-    No partition-bound response is part of this derivative. Trial gauges with
-    the same t must independently satisfy the open amplitude domain.
-    backend='pytorch' is reserved and raises NotImplementedError.
+    loss_kind selects L_raw or the unnormalized L_w. No partition-bound
+    response is part of this derivative. Trial gauges with the same t must
+    independently satisfy the open amplitude domain. The one-body channels
+    do not depend on O. backend='pytorch' is reserved and raises.
     """
     _resolve_derivative_backend(backend)
-    return _assemble(problem,decomposition,_gradient_options(options),"fixed_t")
+    return _assemble(problem,decomposition,_gradient_options(options),"fixed_t",
+                     loss_kind=loss_kind_name(loss_kind))
 
 
 def normalized_partition_gradient(problem,decomposition,*,amplitude_limit=None,
-                                  max_abs_t=30.,options=None,backend="numpy"):
+                                  max_abs_t=30.,options=None,backend="numpy",loss_kind="raw"):
     """Gauge derivative at fixed z in t=(lower+upper)/2+(upper-lower)*z/2.
 
     This supports both maps and capped/asymmetric intervals. It is different
     from a fixed-t derivative even when no partition optimizer is involved.
+    The shift is held fixed; its bound depends on h only, not on O.
     backend='pytorch' is reserved and raises NotImplementedError.
     """
     _resolve_derivative_backend(backend)
@@ -384,7 +399,8 @@ def normalized_partition_gradient(problem,decomposition,*,amplitude_limit=None,
                                  two.partition,two.amplitude_bound,
                                  amplitude_limit=amplitude_limit,max_abs_t=max_abs_t)
     return _assemble(problem,decomposition,_gradient_options(options),"fixed_z",
-                     bounds=bounds,amplitude_limit=amplitude_limit,max_abs_t=max_abs_t)
+                     bounds=bounds,amplitude_limit=amplitude_limit,max_abs_t=max_abs_t,
+                     loss_kind=loss_kind_name(loss_kind))
 
 
 def relaxed_gauge_gradient(problem,result,*,options=None,backend="numpy"):
@@ -403,7 +419,8 @@ def relaxed_gauge_gradient(problem,result,*,options=None,backend="numpy"):
     try:
         derivative = normalized_partition_gradient(
             problem,result.decomposition,amplitude_limit=result.amplitude_limit,
-            max_abs_t=result.max_abs_t,options=options,backend=backend)
+            max_abs_t=result.max_abs_t,options=options,backend=backend,
+            loss_kind=result.loss_kind)
     except (GaugeRegularityError,FloatingPointError,np.linalg.LinAlgError) as exc:
         # A rejected outer trial can still account for the completed inner work.
         exc.inner_result = result
@@ -422,6 +439,15 @@ def relaxed_gauge_gradient(problem,result,*,options=None,backend="numpy"):
         raise InnerConvergenceError("Stored solution fails a fresh partition KKT check",result)
     if not np.isclose(derivative.loss,result.loss,rtol=1e-11,atol=1e-14):
         raise ValueError("Stored inner loss does not match its decomposition")
+    if result.optimize_shift:
+        # Envelope over mu: mu must be the exact (clipped) minimizer at the stored t.
+        # Its bound depends on h only, so no moving-bound term arises for mu.
+        tolerance = result.shift_tolerance+128*np.finfo(float).eps*max(
+            1.,float(np.max(np.abs(result.decomposition.one_body.eigenvalues),initial=0.)))
+        for profile in shift_coefficients(result.decomposition,loss_kind=result.loss_kind,
+                                          one_body_limit=result.one_body_limit):
+            if abs(profile.mu-profile.update) > tolerance:
+                raise InnerConvergenceError("Stored shift is not the exact minimizer at the stored t",result)
     return replace(derivative,mode="relaxed",inner_result=result)
 
 
@@ -430,12 +456,15 @@ class GaugeEvaluator:
 
     Cache fixed h channels/source topology, rotate/eigh once at each trial O,
     then evaluate without n^4 ERI reconstruction. No outer optimizer is run.
+    loss_kind='raw' (default) or 'weighted' selects the objective for every
+    method. shift=(mu_up, mu_down) (default zero) is the fixed one-body shift;
+    a nonzero shift requires problem.nelec.
     Select derivative computation with backend='numpy' (default). The reserved
     backend='pytorch' raises before initialization performs numerical work.
     """
 
     def __init__(self,problem,*,tau1,tau2,partition="balanced_log",amplitude_bound=1.,
-                 options=None,backend="numpy"):
+                 options=None,backend="numpy",loss_kind="raw",shift=None):
         self._backend = _resolve_derivative_backend(backend)
         if not isinstance(problem,PreparedProblem):
             raise TypeError("problem must be a PreparedProblem")
@@ -445,9 +474,11 @@ class GaugeEvaluator:
         if self.amplitude_bound > 1 or partition not in ("balanced_log","anchored_log"):
             raise ValueError("Expected a supported partition map and amplitude_bound<=1")
         self.partition = partition
+        self.loss_kind = loss_kind_name(loss_kind)
         self.options = _gradient_options(options)
         self.sources = enumerate_sources(problem)
-        self.one_body = build_one_body_channels(problem,tau1)
+        # Default one-body channels at the engine's fixed shift (also the start for relaxation).
+        self.one_body = build_one_body_channels(problem,tau1,shift_pair(shift))
         counts = [2 if s.kind == "two_branch" else 4 for s in self.sources]
         endpoints = np.r_[0,np.cumsum(counts)]
         self.source_slices = tuple((int(a),int(b)) for a,b in zip(endpoints[:-1],endpoints[1:]))
@@ -457,6 +488,16 @@ class GaugeEvaluator:
         """Derivative backend chosen at construction (read-only)."""
         return self._backend
 
+    @property
+    def shift(self):
+        """Fixed (mu_up, mu_down) used unless a call supplies or relaxes one."""
+        return self.one_body.shift
+
+    def _one_body(self,shift=None):
+        if shift is None:
+            return self.one_body
+        return one_body_at_shift(self.one_body,shift_pair(shift),self.problem.nelec)
+
     def _gauge(self,O):
         data = self.problem.data
         O = np.eye(data.nchol) if O is None else O
@@ -465,7 +506,7 @@ class GaugeEvaluator:
         ell,X = diagonalize_factors(chol,self.problem.report.options)
         return GaugeState(_readonly(O),_readonly(chol),_readonly(ell),_readonly(X))
 
-    def _decomposition(self,gauge,t):
+    def _decomposition(self,gauge,t,shift=None):
         t,d = fixed_partition_amplitudes(gauge.eigenvalues,self.sources,self.tau2,t,
                                          self.partition,self.amplitude_bound)
         channels = tuple(c for source,amplitude in zip(self.sources,d)
@@ -473,24 +514,25 @@ class GaugeEvaluator:
         two = TwoBodyDecomposition(gauge,self.problem.policy,self.problem.nelec,self.tau2,
                                    self.partition,self.amplitude_bound,self.sources,t,d,
                                    self.source_slices,channels)
-        return FixedDecomposition(self.one_body,two)
+        return FixedDecomposition(self._one_body(shift),two)
 
-    def decomposition(self,O=None,*,t=0.):
-        """Fast channel construction for a trial orthogonal gauge, with fixed t."""
-        return self._decomposition(self._gauge(O),t)
+    def decomposition(self,O=None,*,t=0.,shift=None):
+        """Fast channel construction for a trial orthogonal gauge, with fixed t and shift."""
+        return self._decomposition(self._gauge(O),t,shift)
 
-    def fixed(self,O=None,*,t=0.):
-        """Loss and derivative with t fixed; appropriate for the two-orbital shortcut."""
-        return fixed_partition_gradient(self.problem,self.decomposition(O,t=t),
-                                         options=self.options,backend=self.backend)
+    def fixed(self,O=None,*,t=0.,shift=None):
+        """Loss and derivative with t (and the shift) fixed."""
+        return fixed_partition_gradient(self.problem,self.decomposition(O,t=t,shift=shift),
+                                         options=self.options,backend=self.backend,
+                                         loss_kind=self.loss_kind)
 
     def _bounds(self,gauge,amplitude_limit,max_abs_t):
         return _partition_intervals(gauge.eigenvalues,self.sources,self.tau2,
                                     self.partition,self.amplitude_bound,
                                     amplitude_limit=amplitude_limit,max_abs_t=max_abs_t)
 
-    def fixed_z(self,O=None,*,z=0.,amplitude_limit=None,max_abs_t=30.):
-        """Evaluate a gauge at fixed normalized coordinates z in [-1,1]."""
+    def fixed_z(self,O=None,*,z=0.,amplitude_limit=None,max_abs_t=30.,shift=None):
+        """Evaluate a gauge at fixed normalized coordinates z in [-1,1] and a fixed shift."""
         gauge = self._gauge(O)
         bounds = self._bounds(gauge,amplitude_limit,max_abs_t)
         z = _coordinates(z,len(self.sources),"z")
@@ -498,25 +540,38 @@ class GaugeEvaluator:
             raise ValueError("z must lie in [-1,1]")
         t = bounds[:,0]+(z+1)*(bounds[:,1]-bounds[:,0])/2
         t = np.where(z == 1,bounds[:,1],np.where(z == -1,bounds[:,0],t))
-        return normalized_partition_gradient(self.problem,self._decomposition(gauge,t),
+        return normalized_partition_gradient(self.problem,self._decomposition(gauge,t,shift),
                                               amplitude_limit=amplitude_limit,max_abs_t=max_abs_t,
-                                              options=self.options,backend=self.backend)
+                                              options=self.options,backend=self.backend,
+                                              loss_kind=self.loss_kind)
 
     def relaxed(self,O=None,*,t0=None,max_sweeps=500,gradient_atol=1e-11,
-                gradient_rtol=1e-9,amplitude_limit=None,max_abs_t=30.):
-        """Relax partitions at THIS gauge, then take the moving-bound envelope gradient.
+                gradient_rtol=1e-9,amplitude_limit=None,max_abs_t=30.,
+                optimize_shift=False,one_body_limit=None,shift_atol=0.,shift_rtol=1e-8):
+        """Relax partitions (and optionally the shift) at THIS gauge; envelope gradient.
 
         Warm-start log ratios are projected into the current intervals. With
-        t0=None, use interval midpoints. Every call, including line-search or
-        finite-difference trial gauges, performs its own converged inner solve.
+        t0=None, use interval midpoints. With optimize_shift=True the shift
+        starts at mu*(t0) (no shift seed) and is relaxed together with t; the
+        engine shift is used only if it is feasible, otherwise the lower bound.
+        Every call, including line-search or finite-difference trial gauges,
+        performs its own converged inner solve.
         """
         gauge = self._gauge(O)
         bounds = self._bounds(gauge,amplitude_limit,max_abs_t)
         t = bounds.mean(axis=1) if t0 is None else np.clip(
             _coordinates(t0,len(self.sources),"t0"),bounds[:,0],bounds[:,1])
-        inner = optimize_partitions(self._decomposition(gauge,t),max_sweeps=max_sweeps,
+        shift = None
+        if optimize_shift:
+            lower = shift_bounds(self.one_body,one_body_limit)
+            shift = tuple(mu if low is None else max(mu,low)
+                          for mu,low in zip(self.one_body.shift,lower))
+        inner = optimize_partitions(self._decomposition(gauge,t,shift),max_sweeps=max_sweeps,
                                     gradient_atol=gradient_atol,gradient_rtol=gradient_rtol,
-                                    amplitude_limit=amplitude_limit,max_abs_t=max_abs_t)
+                                    amplitude_limit=amplitude_limit,max_abs_t=max_abs_t,
+                                    loss_kind=self.loss_kind,optimize_shift=optimize_shift,
+                                    one_body_limit=one_body_limit,shift_atol=shift_atol,
+                                    shift_rtol=shift_rtol)
         return relaxed_gauge_gradient(self.problem,inner,options=self.options,backend=self.backend)
 
 

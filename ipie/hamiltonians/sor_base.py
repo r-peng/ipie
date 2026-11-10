@@ -46,9 +46,9 @@ def compute_total_commutativity(ham):
             weighted_comm2 += wij * pair_comm2
             weight += wij
     print('comm2=',comm2)
-    print('weighted_comm2=',weighted_comm2)
-    print('weight=',weight)
-    print('weighted_comm2/weight=',weighted_comm2/weight)
+    print('weighted_comm2=',weighted_comm2*ham.asum**2)
+    #print('weight=',weight)
+    #print('weighted_comm2/weight=',weighted_comm2/weight)
 
 def _parse_mu(mu,ek):
     if mu is None:
