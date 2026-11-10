@@ -50,6 +50,13 @@ def compute_total_commutativity(ham):
     print('weight=',weight)
     print('weighted_comm2/weight=',weighted_comm2/weight)
 
+def _parse_mu(mu,ek):
+    if mu is None:
+        return 0.
+    if mu=='mean':
+        return ek.sum()/ek.size
+    return mu
+
 class SizeGroup:
     def __init__(self):
         self.basis = []
@@ -188,6 +195,8 @@ class SumOfRotationBase:
         assert decomp_type in ['all','aa_only','ab_only']
         self.decomp_type = decomp_type
         self.v0 = np.zeros((2,self.nbasis,self.nbasis))
+        self.mu = np.zeros(2)
+        self.E0 = 0.
 
         self.size_groups = dict() 
         # for cholesky & double factorization:
@@ -196,7 +205,7 @@ class SumOfRotationBase:
         # one with key=self.nbasis
         # one with key=number of auxiliary modes
 
-    def decompose_h1(self,h1,dt,uniform='coefficient',iprint=0):
+    def decompose_h1(self,h1,dt,uniform='coefficient',iprint=0,mu='mean'):
         # for cholesky vectors, pass the effective h'
         if iprint>0:
             print('1-body decomposition: ')
@@ -212,6 +221,13 @@ class SumOfRotationBase:
             ek,vk = np.linalg.eigh(h1+self.v0[0]) 
             if iprint>0:
                 print(f'bands for both spin:',ek)
+            mu = _parse_mu(mu,ek)
+            ek -= mu
+            self.mu[0] = self.mu[1] = mu
+            if iprint>0:
+                print(f'mean of bands =',mu)
+                print(f'shifted bands:',ek)
+
             sg.add_basis(vk,ek,'h1')
             bix = sg.get_basis_index()
             for s in (0,1):
@@ -226,12 +242,18 @@ class SumOfRotationBase:
             ek,vk = np.linalg.eigh(h1+v0) 
             if iprint>0:
                 print(f'spin={s} bands:',ek)
+            mu = _parse_mu(mu,ek)
+            ek -= mu
+            self.mu[s] = mu
+            if iprint>0:
+                print(f'mean of bands =',mu)
+                print(f'shifted bands:',ek)
             sg.add_basis(vk,ek,'h1')
             bix = sg.get_basis_index()
             sg.decompose_1body(bix,s,dt,uniform=uniform,thresh=self.thresh)
         self.size_groups[self.nbasis] = sg
 
-    def parse_decomposition(self,iprint=0):
+    def parse_decomposition(self,nelec,iprint=0):
         self.size_keys = list(self.size_groups.keys())
 
         self.a = []
@@ -289,11 +311,12 @@ class SumOfRotationBase:
         self.denom = self.asum
         self.a /= self.denom
         self.nterms = self.a.size
+        self.E0 = self.mu[0]*nelec[0]+self.mu[1]*nelec[1]
         if iprint>0:
             print(f'asum1={self.asum1},asum2={self.asum2}')
             print('normalization=',xp.fabs(self.a).sum())
             print('number of terms=',self.nterms)
-            #print('a=',self.a)
+            print('E0=',self.E0)
 
     def parse_samples(self,ixs,active=None):
         w_dict = dict()
