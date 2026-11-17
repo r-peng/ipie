@@ -41,13 +41,21 @@ def load_sor_reference():
 
 
 class SORReferenceView:
-    """Read-only view exposing exactly the three fields the reference needs."""
+    """Read-only view exposing exactly the fields the reference needs.
+
+    compute_total_commutativity prints comm2 and weighted_comm2*asum**2. As in
+    a parsed QCSOR, a is normalized by asum=denom; with normalize_weights=False
+    a is unnormalized and asum=1. Either way the printed weighted_comm2 is the
+    unnormalized L_w = sum_{i<j} a_i a_j ||[u_i,u_j]||^2.
+    """
 
     def __init__(self, decomposition, normalize_weights=True):
         self.decomposition = decomposition
         self.nterms = decomposition.nterms
         self.a = decomposition.coefficients.copy()
+        self.asum = 1.0
         if normalize_weights:
+            self.asum = decomposition.denom
             self.a /= decomposition.denom
 
     def get_rotation_matrix(self, index):
@@ -136,11 +144,9 @@ class TotalLossTests(unittest.TestCase):
                         fast = overlap_commutator_loss(decomposition)
                         self.assert_results_equal(dense,fast)
                         reference = sor_diagnostics(decomposition)
-                        for name in ("comm2","weighted_comm2","weight"):
-                            np.testing.assert_allclose(getattr(fast,name),reference[name],
-                                                        atol=2e-14,rtol=2e-11)
-                        np.testing.assert_allclose(fast.weighted_mean,
-                            reference["weighted_comm2/weight"],atol=2e-14,rtol=2e-11)
+                        np.testing.assert_allclose(fast.comm2,reference["comm2"],atol=2e-14,rtol=2e-11)
+                        np.testing.assert_allclose(fast.weighted_comm2_unnormalized,
+                                                   reference["weighted_comm2"],atol=2e-14,rtol=2e-11)
                         self.assertEqual(raw_loss(decomposition),fast.comm2)
                         json.dumps(fast.as_dict(),allow_nan=False)
 
@@ -238,8 +244,10 @@ class TotalLossTests(unittest.TestCase):
         np.testing.assert_allclose(scaled.weighted_comm2,scale**2*raw.weighted_comm2)
         np.testing.assert_allclose(scaled.weighted_mean,raw.weighted_mean)
         reference=sor_diagnostics(decomposition,normalize_weights=False)
-        for name in ("comm2","weighted_comm2","weight"):
-            np.testing.assert_allclose(getattr(raw,name),reference[name],rtol=2e-11,atol=2e-14)
+        np.testing.assert_allclose(raw.comm2,reference["comm2"],rtol=2e-11,atol=2e-14)
+        np.testing.assert_allclose(raw.weighted_comm2,reference["weighted_comm2"],rtol=2e-11,atol=2e-14)
+        np.testing.assert_allclose(raw.weighted_comm2_unnormalized,reference["weighted_comm2"],
+                                   rtol=2e-11,atol=2e-14)
 
     def test_bad_basis_method_and_indices(self):
         _, decomposition=make_decomposition((1,1))
