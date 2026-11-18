@@ -1,14 +1,13 @@
 import numpy as np
 import pickle
+import os
 from ipie.utils.backend import arraylib as xp
 from ipie.utils.linalg import modified_cholesky
-#from ipie.hamiltonians.sor_chol import build_commuting_groups,pack_cholesky
-#from ipie.hamiltonians.sor_chol_opt import optimize_cholesky_gauge 
-#from ipie.hamiltonians.sor_thc import fit_thc_from_eri
-#from ipie.hamiltonians.sor_thc_stage1_comm import fit_thc_from_eri
-#from ipie.hamiltonians.sor_thc_stage1_regularized import fit_thc_from_eri
-#from ipie.hamiltonians.sor_thc_stage2_weighted import fit_thc_from_eri
-#from ipie.hamiltonians.sor_df import optimize_df_commutator,save_grouped 
+from ipie.hamiltonians.optimize_cholesky.io import SavedDecomposition, save_decomposition, load_decomposition
+from ipie.hamiltonians.optimize_cholesky.models import FixedDecomposition,OuterOptions,InnerOptions
+from ipie.hamiltonians.optimize_cholesky.problem import prepare_problem
+from ipie.hamiltonians.optimize_cholesky.gradients import GaugeEvaluator
+from ipie.hamiltonians.optimize_cholesky.optimizers import optimize_gauge
 
 def _get_coeffs(a,g,uniform):
     sqrt_g = np.sqrt(np.fabs(g))
@@ -49,6 +48,13 @@ def compute_total_commutativity(ham):
     print('weighted_comm2=',weighted_comm2*ham.asum**2)
     #print('weight=',weight)
     #print('weighted_comm2/weight=',weighted_comm2/weight)
+
+def pack_cholesky(chol):
+    assert chol.ndim==3
+    grouped = []
+    for L in chol:
+        eps,X = np.linalg.eigh(L)
+        grouped.append({"X":X,"W":np.outer(eps,eps),"isometry":True})
 
 def _parse_mu(mu,ek,s):
     if mu is None:
@@ -410,50 +416,190 @@ class HubbardSOR(SumOfRotationBase):
         sg.decompose_hubbard(bix,dt)
         self.size_groups[self.nbasis] = sg
 
+_POLICY_TO_DECOMP_TYPE = {'hybrid':'all','ab_only':'ab_only','aa_only':'aa_only'}
+
+
+def _optimized_source(source):
+    """Return (FixedDecomposition, metadata) from a path or an optimize_cholesky object.
+
+    Accepts an HDF5 path written by optimize_cholesky.io.save_decomposition, a
+    SavedDecomposition, a FixedDecomposition, or any result exposing
+    .decomposition (outer result, evaluation, gauge gradient, partition result).
+    """
+    if isinstance(source, (str, os.PathLike)):
+        source = load_decomposition(source)
+    if isinstance(source, SavedDecomposition):
+        return source.decomposition, source.metadata
+    if isinstance(source, FixedDecomposition):
+        return source, {}
+    decomposition = getattr(source, 'decomposition', None)
+    if isinstance(decomposition, FixedDecomposition):
+        return decomposition, {}
+    raise TypeError('source must be a path, SavedDecomposition, FixedDecomposition or an '
+                    'optimize_cholesky result exposing .decomposition')
+
+
+def _check_sector(policy,nelec):
+    """hybrid is exact on every (N_up,N_down) sector (H = B + mu.N - sum a U as operators);
+    ab_only only on (1,1); aa_only only on sectors with N_down=0."""
+    if policy=='ab_only' and tuple(nelec)!=(1,1):
+        raise ValueError(f'ab_only decompositions are exact only for nelec=(1,1), not {nelec}')
+    if policy=='aa_only' and nelec[1]!=0:
+        raise ValueError(f'aa_only decompositions are exact only for N_down=0, not {nelec}')
+
 class QCSOR(SumOfRotationBase):
 
-    def initialize_cholesky(self,eri,cmax=None):
-        M = eri.reshape((self.nbasis**2, self.nbasis**2))
+    @classmethod
+    def initialize_cholesky(cls,eri,cmax=None):
+        nbasis = eri.shape[0]
+        M = eri.reshape((nbasis**2, nbasis**2))
         if cmax is None:
-            cmax = self.nbasis**2
-        return modified_cholesky(M, cmax=cmax).reshape(-1, self.nbasis, self.nbasis)
+            cmax = nbasis**2
+        return modified_cholesky(M, cmax=cmax).reshape(-1, nbasis, nbasis)
 
-    def from_cholesky(self,chol=None,eri=None,cmax=None,comm_tol=1e-10,basis_tol=1e-10,fname=None):
-        # set comm_tol to negative to not do regrouping
-        if chol is None:
-            chol = self.initialize_cholesky(eri,cmax=cmax)
+    @classmethod
+    def optimize_from_cholesky(cls,h1e,eri,chol,nelecs,dt1,dt2,source,**kwargs):
+        problem = prepare_problem(h1e,eri,chol,nelec=nelecs)
+    
+        r = problem.data.nchol
+        theta = kwargs.get('theta',0.1)
+        theta = theta*(np.random.rand(r * (r - 1) // 2)*2.-1.)
+    
+        partition = kwargs.get('partition','balanced_log')
+        evaluator = GaugeEvaluator(problem, tau1=dt1, tau2=dt2, partition=partition, backend='numpy')
+    
+        maxiter = kwargs.get('maxiter',100)
+        maxsweep = kwargs.get('maxsweep',100)
+        verbosity = kwargs.get('verbosity',2)
+        result = optimize_gauge(evaluator,
+            solver='lbfgs',
+            theta0=theta,
+            options=OuterOptions(max_iterations=maxiter,verbosity=verbosity, line_search='weak_wolfe'),
+            inner_options=InnerOptions(max_sweeps=maxsweep, gradient_atol=1e-6, gradient_rtol=1e-6,optimize_shift=True),
+    )
+        save_decomposition(source,result,problem=problem)
+        return result
 
-        fit = optimize_cholesky_gauge(chol)
-        chol = fit.chol
+    @classmethod
+    def from_optimized(cls,source,*,drop_identity=False,thresh=1e-6,nelec=None,parse=False,iprint=0):
+        """Build a QCSOR from an optimize_cholesky result or a saved HDF5 file.
 
-        if comm_tol<0.:
-            result = pack_cholesky(chol)
-            C = None
+        The optimized channels replace decompose_h2/decompose_h1 and are copied
+        verbatim (no threshold is applied; thresh is only stored). Afterwards
+        parse_decomposition(nelec) works unchanged. With parse=True it is called
+        here, with nelec defaulting to the particle numbers of the optimization;
+        a sector on which the stored policy is not exact raises ValueError
+        (hybrid: any; ab_only: (1,1); aa_only: N_down=0). See load_optimized for
+        the mapping.
+        """
+        decomposition,metadata = _optimized_source(source)
+        two = decomposition.two_body
+        ham = cls(decomposition.one_body.X.shape[0],thresh=thresh,
+                  decomp_type=_POLICY_TO_DECOMP_TYPE[two.policy])
+        ham.load_optimized((decomposition,metadata),drop_identity=drop_identity,iprint=iprint)
+        if parse:
+            if nelec is None:
+                nelec = two.nelec
+            if nelec is None:
+                raise ValueError('parse=True needs nelec: the optimization stored no particle numbers')
+            nelec = tuple(int(x) for x in nelec)
+            _check_sector(two.policy,nelec)
+            ham.parse_decomposition(nelec,iprint=iprint)
+        return ham
+
+    def load_optimized(self,source,*,drop_identity=False,iprint=0):
+        """Fill this (empty) QCSOR from an optimized decomposition.
+
+        Mapping into one size group of key nbasis:
+          * bix=gamma for every rotated Cholesky factor: basis X_gamma
+            (orthonormal eigenvectors, isometry=True so S=None), integrals
+            W_gamma=outer(ell_gamma,ell_gamma), tag 'thc' (used by local_energy).
+          * then the h eigenbasis with tag 'h1' and integrals epsilon-mu_s: one
+            shared basis if mu_up==mu_down (or aa_only), else one per spin, as in
+            decompose_h1.
+          * every channel copied verbatim as (a_i, p, d). Same-spin and
+            (up,down) channels keep their order; a (down,up) channel is stored
+            under SOR's (0,1) key with p=[beta,alpha], d=[d_R,d_L].
+          * self.h1 = h - 1/2*sum_gamma L_gamma^2 (h' = effective h, unshifted),
+            because trial.build contracts ham.h1 and the 'thc' local energy adds
+            back 1/2*diag(W).D; self.v0 = 1/2*sum_gamma L_gamma^2 (h1+v0 = h).
+          * self.mu = (mu_up, mu_down), so parse_decomposition gives
+            E0 = mu.N and denom = sum a_i, i.e. denom+E0 = lambda_electronic.
+        drop_identity=True omits channels whose amplitudes are all exactly zero
+        (U=I). This is exact: parse_decomposition recomputes denom from the
+        retained terms, lowering Lambda by their weight. Nonzero amplitudes are
+        never thresholded.
+        """
+        if isinstance(source,tuple) and len(source)==2 and isinstance(source[1],dict):
+            decomposition,metadata = source
+            decomposition,_ = _optimized_source(decomposition)
         else:
-            print('buiding commuting groups...')
-            result,C = build_commuting_groups(chol,comm_tol=comm_tol,basis_tol=basis_tol)
-        if fname is not None:
-            with open(fname+".pkl", "wb") as f:
-                pickle.dump({"grouped": result,"commutator_matrix": C, 'chol':chol},f,protocol=pickle.HIGHEST_PROTOCOL)
-        return result,fit
+            decomposition,metadata = _optimized_source(source)
+        one,two = decomposition.one_body,decomposition.two_body
+        gauge = two.gauge
+        n = one.X.shape[0]
+        if self.size_groups:
+            raise ValueError('load_optimized requires an empty QCSOR (no prior decompose_* calls)')
+        if n != self.nbasis:
+            raise ValueError(f'nbasis={self.nbasis} does not match the optimized basis size {n}')
+        expected = _POLICY_TO_DECOMP_TYPE[two.policy]
+        if self.decomp_type != expected:
+            raise ValueError(f"decomp_type='{self.decomp_type}' does not match policy "
+                             f"'{two.policy}' (expected '{expected}')")
 
-    def from_thc(self,eri,rank,comm_lambda=1.,nstarts=4,maxiter=1000,rcond=1e-6,fname=None): 
-        fit = fit_thc_from_eri(eri,rank,comm_lambda=comm_lambda,n_starts=nstarts,maxiter=maxiter,rcond=rcond)
-        result = [{'X':fit.X,'W':fit.W,'isometry':False}]
-        if fname is not None:
-            with open(fname+".pkl", "wb") as f:
-                pickle.dump({"grouped": result,'eri':eri},f,protocol=pickle.HIGHEST_PROTOCOL)
-        return result,fit
+        sg = SizeGroup()
+        nchol = gauge.chol.shape[0]
+        for g in range(nchol):
+            ell = np.array(gauge.eigenvalues[g],dtype=np.float64)
+            sg.add_basis(np.array(gauge.X[g],dtype=np.float64),np.outer(ell,ell),'thc',isometry=True)
+            assert sg.get_basis_index()==g
 
-    def from_df(self,eri,nt,chol=None,comm_lambda=1.,fname=None,cmax=None):
-        if chol is None:
-            chol = self.initialize_cholesky(eri,cmax=cmax)
-        fit = optimize_df_commutator(eri,nt,chol=chol,comm_lambda=comm_lambda)
-        result = save_grouped(fit.U,fit.Z)
-        if fname is not None:
-            with open(fname+".pkl", "wb") as f:
-                pickle.dump({"grouped": result,'eri':eri},f,protocol=pickle.HIGHEST_PROTOCOL)
-        return result,fit
+        shift = tuple(float(m) for m in one.shift)
+        eps = np.array(one.eigenvalues,dtype=np.float64)
+        X1 = np.array(one.X,dtype=np.float64)
+        spins = one.spins
+        if len(spins)==1 or shift[0]==shift[1]:
+            sg.add_basis(X1,eps-shift[spins[0]],'h1')
+            h1_bix = {s:sg.get_basis_index() for s in spins}
+        else:
+            h1_bix = dict()
+            for s in spins:
+                sg.add_basis(X1.copy(),eps-shift[s],'h1')
+                h1_bix[s] = sg.get_basis_index()
+
+        dropped = 0
+        for c in one.channels:
+            if drop_identity and c.d==0.:
+                dropped += 1
+                continue
+            # One-body amplitudes may exceed 1 (single branch); bypass decompose_1body's assert.
+            sg.add_term(h1_bix[c.spin],[c.spin],float(c.a_i),[int(c.mode)],[float(c.d)])
+        for c in two.channels:
+            if drop_identity and c.d[0]==0. and c.d[1]==0.:
+                dropped += 1
+                continue
+            (sl,sr),(pl,pr),(dl,dr) = c.spins,c.modes,c.d
+            if sl==sr or (sl,sr)==(0,1):
+                sg.add_2body_term(int(c.bix),(sl,sr),float(c.a_i),[int(pl),int(pr)],[float(dl),float(dr)])
+            else:  # (down, up) -> SOR's (0,1): leg 0 is always spin up
+                sg.add_2body_term(int(c.bix),(0,1),float(c.a_i),[int(pr),int(pl)],[float(dr),float(dl)])
+        self.size_groups[n] = sg
+
+        L2 = np.einsum('gpr,grq->pq',np.asarray(gauge.chol),np.asarray(gauge.chol))
+        h = (X1*eps) @ X1.T
+        self.h1 = xp.asarray(h-.5*L2)
+        self.v0 = np.tile(.5*L2[None,:,:],(2,1,1))
+        self.mu = np.array(shift,dtype=np.float64)
+        self.optimized_decomposition = decomposition
+        self.optimized_metadata = metadata
+        self.optimized_nelec = two.nelec
+        self.dropped_identity = dropped
+        if iprint>0:
+            print('optimized decomposition: policy=',two.policy,'decomp_type=',self.decomp_type)
+            print('number of bases=',len(sg.basis),'(thc:',nchol,', h1:',len(set(h1_bix.values())),')')
+            print('number of channels=',decomposition.nterms,'dropped identity=',dropped)
+            print('mu=',self.mu,'denom (all channels)=',decomposition.denom)
+        return self
 
     def decompose_h2(self,fname,dt,iprint=0,uniform='coefficient'):
         assert uniform in ['coefficient','rotation']
