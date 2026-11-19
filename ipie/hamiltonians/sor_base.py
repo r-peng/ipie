@@ -538,7 +538,8 @@ class QCSOR(SumOfRotationBase):
         theta = theta*(np.random.rand(r * (r - 1) // 2)*2.-1.)
     
         partition = kwargs.get('partition','balanced_log')
-        evaluator = GaugeEvaluator(problem, tau1=dt1, tau2=dt2, partition=partition, backend='numpy')
+        loss_kind = kwargs.get('loss_kind','weighted')
+        evaluator = GaugeEvaluator(problem, tau1=dt1, tau2=dt2, loss_kind=loss_kind, partition=partition, backend='numpy')
     
         maxiter = kwargs.get('maxiter',100)
         maxsweep = kwargs.get('maxsweep',100)
@@ -668,11 +669,11 @@ class QCSOR(SumOfRotationBase):
             print('mu=',data['mu'],'denom (file)=',data['denom'],'lambda_electronic (file)=',data['lambda_electronic'])
         policy,expected_denom = data['policy'],data['denom']
         dropped_weight = truncation['dropped_weight']
+        if nelec is None:
+            nelec = data['nelec']
         del data,a,p1,d1,p2,d2
 
         if parse:
-            if nelec is None:
-                nelec = data['nelec']
             if nelec is None:
                 raise ValueError('parse=True needs nelec: the optimization stored no particle numbers')
             nelec = tuple(int(x) for x in nelec)
