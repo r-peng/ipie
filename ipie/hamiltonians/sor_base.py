@@ -557,21 +557,36 @@ class QCSOR(SumOfRotationBase):
     def from_file(cls,path,*,nelec=None,parse=True,thresh=1e-6,iprint=0):
         """Build a QCSOR from a file written by optimize_cholesky.io.save_decomposition.
 
-        Array-only: term_info holds numpy slices (views) of the file arrays and no
+        Array-only: term_info holds numpy slices of the file arrays and no
         per-channel Python objects are built. One size group of key nbasis:
           * bix=gamma (0..r-1): factor eigenvectors (isometry, S=None), integrals
             W=outer(ell,ell), tag 'thc' (used by local_energy);
           * bix=r (and r+1 if mu_up!=mu_down): the h eigenbasis, integrals
             eps-mu_s, tag 'h1';
           * term_info keys in file order, so parse_decomposition gives the file's
-            global term order.
-        Sets h1 (h' = h - 1/2 sum L^2), v0, mu, optimized_nelec, dropped_identity
-        and optimized_metadata (the file's attributes, provenance and user
-        metadata). With parse=True (default) parse_decomposition(nelec) is called,
-        with nelec defaulting to the particle numbers of the optimization; a
-        sector on which the stored policy is not exact raises ValueError (hybrid:
-        any; ab_only: (1,1); aa_only: N_down=0), and the parsed denom is checked
-        against the file.
+            global term order (minus any truncated terms).
+
+        Optional truncation (default None: no truncation, exact):
+          * thresh1 drops one-body channel (k,s) if |eps_k - mu_s| < thresh1, i.e.
+            the SHIFTED orbital energy, the term (eps_k-mu_s) n_ks it represents
+            (equivalently |d| < thresh1*tau1);
+          * thresh2 drops two-body channels with |W_ab| = |ell_a ell_b| < thresh2
+            (equivalently |d_L d_R| < thresh2*tau2). All branches of a source share
+            W, so a source is always dropped as a whole.
+        Truncation is not exact: the walk then uses H minus the dropped terms, with
+        Lambda = (kept sum a) + mu.N = ham.denom + ham.E0 after parsing. ham.h1, v0
+        and the W integrals are NOT truncated, so local_energy still measures the
+        full H. Bases are kept even if all of their terms are dropped, so bix stays
+        valid. ham.truncation records the thresholds, counts, dropped weight and
+        largest dropped |eps-mu| and |W|; optimized_metadata['lambda_electronic']
+        is the file's untruncated value.
+
+        Sets h1 (h' = h - 1/2 sum L^2), v0, mu, optimized_nelec, dropped_identity,
+        truncation and optimized_metadata. With parse=True (default)
+        parse_decomposition(nelec) is called, with nelec defaulting to the particle
+        numbers of the optimization; a sector on which the stored policy is not
+        exact raises ValueError (hybrid: any; ab_only: (1,1); aa_only: N_down=0),
+        and the parsed denom is checked against the file minus the dropped weight.
         """
         data = _read_decomposition_file(path)
         n,r = data['nbasis'],data['nchol']
@@ -584,9 +599,43 @@ class QCSOR(SumOfRotationBase):
         for k,eps in enumerate(data['h1_eps']):
             sg.add_basis(data['h1_X'] if k==0 else data['h1_X'].copy(),eps,'h1')
 
-        a,p1,d1,p2,d2 = data['a'],data['p1'],data['d1'],data['p2'],data['d2']
-        T1 = p1.shape[0]
-        for bix,s0,s1,start,stop in data['keys'].tolist():
+        a,p1,d1,p2,d2,keys = data['a'],data['p1'],data['d1'],data['p2'],data['d2'],data['keys']
+        T1,T = p1.shape[0],a.shape[0]
+        truncation = {'thresh':thresh,'dropped_one_body':0,'dropped_two_body':0,
+                      'dropped_weight':0.,'max_dropped_eps':0.,'max_dropped_W':0.}
+        if thresh is not None:
+            # Per-term magnitudes. One-body keys come first and cover [0,T1).
+            one = keys[:,2]<0
+            counts = keys[:,4]-keys[:,3]
+            keep = np.ones(T,dtype=bool)
+            if thresh is not None and T1>0:
+                bix1 = np.repeat(keys[one,0],counts[one])
+                value1 = np.abs(data['h1_eps'][bix1-r,p1])
+                keep[:T1] = value1>=thresh
+                if not keep[:T1].all():
+                    truncation['max_dropped_eps'] = float(value1[~keep[:T1]].max())
+            if thresh is not None and T>T1:
+                bix2 = np.repeat(keys[~one,0],counts[~one])
+                ell = data['chol_ell']
+                value2 = np.abs(ell[bix2,p2[:,0]]*ell[bix2,p2[:,1]])
+                keep[T1:] = value2>=thresh
+                if not keep[T1:].all():
+                    truncation['max_dropped_W'] = float(value2[~keep[T1:]].max())
+            truncation['dropped_one_body'] = int(T1-np.count_nonzero(keep[:T1]))
+            truncation['dropped_two_body'] = int(T-T1-np.count_nonzero(keep[T1:]))
+            if not keep.all():
+                truncation['dropped_weight'] = math.fsum(a[~keep])
+                # New key ranges from the number of kept terms before each old boundary.
+                kept_before = np.concatenate([[0],np.cumsum(keep)])
+                keys = np.column_stack([keys[:,:3],kept_before[keys[:,3]],kept_before[keys[:,4]]])
+                keys = keys[keys[:,4]>keys[:,3]]
+                a,p1,d1 = a[keep],p1[keep[:T1]],d1[keep[:T1]]
+                p2,d2 = p2[keep[T1:]],d2[keep[T1:]]
+                T1 = p1.shape[0]
+                if a.size==0:
+                    raise ValueError('thresh1/thresh2 dropped every term')
+
+        for bix,s0,s1,start,stop in keys.tolist():
             if s1<0:
                 key = (int(bix),(int(s0),))
                 p,d = p1[start:stop].reshape(-1,1),d1[start:stop].reshape(-1,1)
@@ -598,29 +647,41 @@ class QCSOR(SumOfRotationBase):
 
         ham.h1 = xp.asarray(data['h1'])
         ham.v0 = np.array(data['v0'])
-        ham.mu = np.array(data['mu'],dtype=np.float64)
-        ham.optimized_nelec = data['nelec']
-        ham.dropped_identity = data['dropped_identity']
-        ham.optimized_metadata = data['metadata']
+        #ham.mu = np.array(data['mu'],dtype=np.float64)
+        #ham.optimized_nelec = data['nelec']
+        #ham.dropped_identity = data['dropped_identity']
+        #ham.truncation = truncation
+        #ham.optimized_metadata = data['metadata']
+        #ham.optimized_metadata['truncation'] = truncation
         if iprint>0:
             print('optimized decomposition:',os.fspath(path))
             print('policy=',data['policy'],'decomp_type=',ham.decomp_type)
             print('number of bases=',len(sg.basis),'(thc:',r,', h1:',data['h1_eps'].shape[0],')')
-            print('number of terms=',a.size,'dropped identity=',ham.dropped_identity)
-            print('mu=',ham.mu,'denom=',data['denom'],'lambda_electronic=',data['lambda_electronic'])
-        policy,stored_denom = data['policy'],data['denom']
+            print('number of terms=',a.size,'dropped identity=',data['dropped_identity'])
+            if thresh is not None:
+                print('truncation: thresh=',thresh,
+                      'dropped one-body=',truncation['dropped_one_body'],
+                      'dropped two-body=',truncation['dropped_two_body'],
+                      'dropped weight=',truncation['dropped_weight'])
+                print('largest dropped |eps-mu|=',truncation['max_dropped_eps'],
+                      'largest dropped |W|=',truncation['max_dropped_W'])
+            print('mu=',data['mu'],'denom (file)=',data['denom'],'lambda_electronic (file)=',data['lambda_electronic'])
+        policy,expected_denom = data['policy'],data['denom']
+        dropped_weight = truncation['dropped_weight']
         del data,a,p1,d1,p2,d2
 
         if parse:
             if nelec is None:
-                nelec = ham.optimized_nelec
+                nelec = data['nelec']
             if nelec is None:
                 raise ValueError('parse=True needs nelec: the optimization stored no particle numbers')
             nelec = tuple(int(x) for x in nelec)
             _check_sector(policy,nelec)
             ham.parse_decomposition(nelec,iprint=iprint)
-            if not math.isclose(float(ham.denom),stored_denom,rel_tol=1e-12):
-                raise ValueError(f'Parsed denom {float(ham.denom)} disagrees with the file ({stored_denom})')
+            if not math.isclose(float(ham.denom),expected_denom-dropped_weight,
+                                rel_tol=1e-12,abs_tol=1e-12*expected_denom):
+                raise ValueError(f'Parsed denom {float(ham.denom)} disagrees with the file '
+                                 f'({expected_denom} minus dropped weight {dropped_weight})')
         return ham
 
     def decompose_h2(self,fname,dt,iprint=0,uniform='coefficient'):
