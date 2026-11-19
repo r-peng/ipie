@@ -12,7 +12,7 @@ from ipie.hamiltonians.optimize_cholesky.models import (
     LBFGSOptions,
 )
 from ipie.hamiltonians.optimize_cholesky.gradients import GaugeEvaluator
-from ipie.hamiltonians.optimize_cholesky.optimizers import LBFGSOptimizer, optimize_gauge
+from ipie.hamiltonians.optimize_cholesky.optimizers import optimize_gauge
 from ipie.hamiltonians.optimize_cholesky.channels import build_fixed_decomposition
 from ipie.hamiltonians.optimize_cholesky.problem import (
     build_gauge_state,
@@ -70,7 +70,8 @@ class WeakWolfeOptionTests(unittest.TestCase):
         for kwargs in ({"line_search": "wolfe"}, {"wolfe_c2": 1e-4}, {"wolfe_c2": 1.},
                        {"armijo": .5, "wolfe_c2": .4}, {"wolfe_max_step_norm": .5},
                        {"wolfe_max_step_norm": math.inf}):
-            LBFGSOptions(**kwargs)
+            with self.subTest(kwargs=kwargs), self.assertRaises(ValueError):
+                LBFGSOptions(**kwargs)
 
 
 class WeakWolfeControlledTests(unittest.TestCase):
