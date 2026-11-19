@@ -647,7 +647,7 @@ class QCSOR(SumOfRotationBase):
 
         ham.h1 = xp.asarray(data['h1'])
         ham.v0 = np.array(data['v0'])
-        #ham.mu = np.array(data['mu'],dtype=np.float64)
+        ham.mu = np.array(data['mu'],dtype=np.float64)
         #ham.optimized_nelec = data['nelec']
         #ham.dropped_identity = data['dropped_identity']
         #ham.truncation = truncation
