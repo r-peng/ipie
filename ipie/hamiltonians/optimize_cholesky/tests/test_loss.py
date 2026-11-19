@@ -9,20 +9,17 @@ from contextlib import redirect_stdout
 from dataclasses import replace
 from pathlib import Path
 from unittest.mock import patch
-from ipie.hamiltonians.optimize_cholesky import (
-    Channel,
-    FixedDecomposition,
+from ipie.hamiltonians.optimize_cholesky.models import Channel, FixedDecomposition
+from ipie.hamiltonians.optimize_cholesky.loss import (
     OverlapEvaluator,
-    build_fixed_decomposition,
-    build_gauge_state,
     commutator_loss,
     commutator_norm2,
     dense_commutator_loss,
-    get_rotation_matrix,
     overlap_commutator_loss,
-    prepare_problem,
     raw_loss,
 )
+from ipie.hamiltonians.optimize_cholesky.channels import build_fixed_decomposition, get_rotation_matrix
+from ipie.hamiltonians.optimize_cholesky.problem import build_gauge_state, prepare_problem
 from ipie.hamiltonians.optimize_cholesky.tests.test_channels import make_decomposition
 
 
@@ -147,12 +144,13 @@ class TotalLossTests(unittest.TestCase):
                         np.testing.assert_allclose(fast.comm2,reference["comm2"],atol=2e-14,rtol=2e-11)
                         np.testing.assert_allclose(fast.weighted_comm2_unnormalized,
                                                    reference["weighted_comm2"],atol=2e-14,rtol=2e-11)
-                        self.assertEqual(raw_loss(decomposition),fast.comm2)
+                        # raw_loss sums with math.fsum, the diagnostic sequentially.
+                        np.testing.assert_allclose(raw_loss(decomposition),fast.comm2,rtol=1e-14,atol=0)
                         json.dumps(fast.as_dict(),allow_nan=False)
 
     def test_every_pair_and_cache_without_dense_matrix_calls(self):
         _, decomposition = make_decomposition((2,1),partition="anchored_log")
-        evaluator = OverlapEvaluator(decomposition)
+        evaluator = OverlapEvaluator(decomposition,loss_kind="raw")
         n = decomposition.nterms
         for i in range(n):
             for j in range(i+1,n):
@@ -164,7 +162,7 @@ class TotalLossTests(unittest.TestCase):
         self.assertLessEqual(evaluator.overlap_cache_size,r*(r+1)//2)
         with patch("ipie.hamiltonians.optimize_cholesky.loss.get_rotation_matrix",
                    side_effect=AssertionError("overlap evaluator must not build dense rotations")):
-            self.assertGreater(evaluator.evaluate().comm2,0)
+            self.assertGreater(overlap_commutator_loss(decomposition).comm2,0)
 
     def test_opposite_spin_order_and_quadrature(self):
         _, base = make_decomposition((2,1))
@@ -174,9 +172,9 @@ class TotalLossTests(unittest.TestCase):
         X=base.two_body.gauge.X
         up=float(X[0,:,0] @ X[1,:,2]);down=float(X[0,:,1] @ X[1,:,1])
         expected=2*(.2*.4)**2*up**2*(1-up**2)+2*(-.3*.5)**2*down**2*(1-down**2)
-        evaluator=OverlapEvaluator(decomposition)
+        evaluator=OverlapEvaluator(decomposition,loss_kind="raw")
         np.testing.assert_allclose(evaluator.pair_norm2(0,1),expected,atol=1e-16)
-        self.assert_results_equal(evaluator.evaluate(),dense_commutator_loss(decomposition))
+        self.assert_results_equal(overlap_commutator_loss(decomposition),dense_commutator_loss(decomposition))
         disjoint=with_two_channels(base,[Channel(0,(0,0),1.,(0,1),(.2,.3)),
                                          Channel(1,(1,1),2.,(0,1),(.4,.1))])
         self.assertEqual(overlap_commutator_loss(disjoint).comm2,0.)
@@ -186,9 +184,9 @@ class TotalLossTests(unittest.TestCase):
         repeated=Channel(0,(0,0),1.,(0,0),(.2,.3))
         external=Channel(1,(0,0),1.,(1,2),(.1,-.2))
         decomposition=with_two_channels(base,[repeated,external])
-        evaluator=OverlapEvaluator(decomposition)
+        evaluator=OverlapEvaluator(decomposition,loss_kind="raw")
         np.testing.assert_allclose(evaluator.blocks[0][0].kappa,[.2+.3+.2*.3])
-        self.assert_results_equal(evaluator.evaluate(),dense_commutator_loss(decomposition))
+        self.assert_results_equal(overlap_commutator_loss(decomposition),dense_commutator_loss(decomposition))
         same_basis=with_two_channels(base,[repeated,replace(external,bix=0)])
         self.assertEqual(overlap_commutator_loss(same_basis).comm2,0.)
 
@@ -253,12 +251,12 @@ class TotalLossTests(unittest.TestCase):
         _, decomposition=make_decomposition((1,1))
         bad=replace(decomposition,one_body=replace(decomposition.one_body,X=2*decomposition.one_body.X))
         with self.assertRaises(ValueError):
-            OverlapEvaluator(bad)
+            OverlapEvaluator(bad,loss_kind="raw")
         with self.assertRaises(ValueError):
             commutator_loss(decomposition,method="unknown")
         with self.assertRaises(TypeError):
             commutator_loss(decomposition,normalize_weights="yes")
-        evaluator=OverlapEvaluator(decomposition)
+        evaluator=OverlapEvaluator(decomposition,loss_kind="raw")
         with self.assertRaises(IndexError):
             evaluator.pair_norm2(-1,0)
         with self.assertRaises(TypeError):

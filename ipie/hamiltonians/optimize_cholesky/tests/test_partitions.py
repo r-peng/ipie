@@ -6,20 +6,19 @@ import unittest
 import numpy as np
 from unittest.mock import patch
 from scipy.optimize import minimize_scalar
-from ipie.hamiltonians.optimize_cholesky import (
-    PartitionCoefficients,
+from ipie.hamiltonians.optimize_cholesky.models import InnerOptions
+from ipie.hamiltonians.optimize_cholesky.models import PartitionCoefficients
+from ipie.hamiltonians.optimize_cholesky.partitions import (
     analytic_partition_update,
-    build_fixed_decomposition,
-    build_gauge_state,
-    get_rotation_matrix,
     optimize_partitions,
     partition_bounds,
     partition_coefficients,
-    prepare_problem,
     projected_partition_gradient,
-    raw_loss,
     with_partitions,
 )
+from ipie.hamiltonians.optimize_cholesky.channels import build_fixed_decomposition, get_rotation_matrix
+from ipie.hamiltonians.optimize_cholesky.problem import build_gauge_state, prepare_problem
+from ipie.hamiltonians.optimize_cholesky.loss import raw_loss
 from ipie.hamiltonians.optimize_cholesky.tests.test_channels import (
     check_hamiltonian,
     make_decomposition,
@@ -79,7 +78,7 @@ class CoefficientTests(unittest.TestCase):
         for nelec in ((2,1),(1,1),(2,0)):
             for partition in ("balanced_log","anchored_log"):
                 _, decomposition = make_decomposition(nelec,partition=partition)
-                coefficients = partition_coefficients(decomposition)
+                coefficients = partition_coefficients(decomposition,loss_kind="raw")
                 self.assertEqual(len(coefficients),len(decomposition.two_body.sources))
                 for i,c in enumerate(coefficients):
                     with self.subTest(nelec=nelec,partition=partition,source=i):
@@ -102,7 +101,7 @@ class CoefficientTests(unittest.TestCase):
 
     def test_C_is_allowed_to_be_negative_and_minimum_matches_scalar_solver(self):
         _,decomposition = one_source()
-        c = partition_coefficients(decomposition,0)
+        c = partition_coefficients(decomposition,0,loss_kind="raw")
         self.assertLess(c.C,0)
         bounds = partition_bounds(decomposition)[0]
         exact = analytic_partition_update(c,bounds)
@@ -169,25 +168,25 @@ class BoundsTests(unittest.TestCase):
             with self.subTest(options=options),self.assertRaises(ValueError):
                 partition_bounds(decomposition,**options)
         with self.assertRaisesRegex(ValueError,"Initial t"):
-            optimize_partitions(decomposition,max_abs_t=.1)
+            optimize_partitions(decomposition,InnerOptions(max_abs_t=.1),loss_kind="raw")
 
 
 class InnerSolverTests(unittest.TestCase):
     def test_one_sweep_is_sequential_not_a_simultaneous_update(self):
         _,decomposition = make_decomposition((2,1),partition="anchored_log")
         bounds = partition_bounds(decomposition)
-        initial_coefficients = partition_coefficients(decomposition)
+        initial_coefficients = partition_coefficients(decomposition,loss_kind="raw")
         simultaneous = np.array([analytic_partition_update(c,bounds[i])
                                  for i,c in enumerate(initial_coefficients)])
         manual = decomposition
         losses = [raw_loss(manual)]
         for i in range(len(bounds)):
-            c = partition_coefficients(manual,i)
+            c = partition_coefficients(manual,i,loss_kind="raw")
             t = manual.two_body.t.copy()
             t[i] = analytic_partition_update(c,bounds[i])
             manual = with_partitions(manual,t)
             losses.append(raw_loss(manual))
-        result = optimize_partitions(decomposition,max_sweeps=1,gradient_atol=0,gradient_rtol=0)
+        result = optimize_partitions(decomposition,InnerOptions(max_sweeps=1,gradient_atol=0,gradient_rtol=0),loss_kind="raw")
         np.testing.assert_allclose(result.t,manual.two_body.t,atol=2e-15,rtol=2e-14)
         self.assertGreater(np.max(np.abs(result.t-simultaneous)),1e-4)
         self.assertTrue(np.all(np.diff(losses) <= 2e-17))
@@ -202,7 +201,7 @@ class InnerSolverTests(unittest.TestCase):
                     problem,decomposition = make_decomposition(nelec,partition=partition)
                     original_t = decomposition.two_body.t.copy()
                     original_d = decomposition.two_body.amplitudes.copy()
-                    result = optimize_partitions(decomposition,max_sweeps=5)
+                    result = optimize_partitions(decomposition,InnerOptions(max_sweeps=5),loss_kind="raw")
                     final = result.decomposition
                     self.assertLess(result.loss,result.initial_loss)
                     self.assertTrue(np.all(np.diff([h.loss for h in result.history]) <= 1e-16))
@@ -227,14 +226,14 @@ class InnerSolverTests(unittest.TestCase):
 
     def test_convergence_and_warm_start_use_fresh_full_gradient(self):
         _,decomposition = make_decomposition((2,1))
-        result = optimize_partitions(decomposition,max_sweeps=30)
+        result = optimize_partitions(decomposition,InnerOptions(max_sweeps=30),loss_kind="raw")
         self.assertTrue(result.converged)
         self.assertEqual(result.status,"converged")
-        final_coefficients = partition_coefficients(result.decomposition)
+        final_coefficients = partition_coefficients(result.decomposition,loss_kind="raw")
         expected_gradient = [c.gradient for c in final_coefficients]
         np.testing.assert_allclose(result.gradient,expected_gradient,atol=1e-18,rtol=3e-12)
         self.assertLessEqual(result.projected_gradient_norm,result.gradient_threshold)
-        warm = optimize_partitions(result.decomposition,max_sweeps=0)
+        warm = optimize_partitions(result.decomposition,InnerOptions(max_sweeps=0),loss_kind="raw")
         self.assertTrue(warm.converged)
         self.assertEqual(warm.sweeps,0)
 
@@ -243,7 +242,7 @@ class InnerSolverTests(unittest.TestCase):
             problem,decomposition = one_source(partition="anchored_log",eigenvalues=eigenvalues,t=0)
             self.assertEqual(np.prod(decomposition.two_body.amplitudes[0]),0.)
             self.assertGreater(raw_loss(decomposition),0)
-            result = optimize_partitions(decomposition,max_abs_t=.4,gradient_atol=1e-14,gradient_rtol=0)
+            result = optimize_partitions(decomposition,InnerOptions(max_abs_t=.4,gradient_atol=1e-14,gradient_rtol=0),loss_kind="raw")
             self.assertTrue(result.converged)
             self.assertEqual(result.sweeps,1)
             self.assertEqual(result.t[0],result.bounds[0,expected_wall])
@@ -254,7 +253,7 @@ class InnerSolverTests(unittest.TestCase):
 
     def test_zero_balanced_flat_source_retains_its_partition(self):
         _,decomposition = one_source(eigenvalues=(0.,.7),t=2.1)
-        result = optimize_partitions(decomposition)
+        result = optimize_partitions(decomposition,loss_kind="raw")
         self.assertTrue(result.converged)
         self.assertEqual(result.sweeps,0)
         self.assertEqual(result.t[0],2.1)
@@ -267,7 +266,7 @@ class InnerSolverTests(unittest.TestCase):
             problem = prepare_problem(np.zeros((n,n)),np.zeros((n,n,n,n)),
                                       np.zeros((1,n,n)),nelec=nelec)
             decomposition = build_fixed_decomposition(problem,build_gauge_state(problem.data),.1,.1)
-            result = optimize_partitions(decomposition)
+            result = optimize_partitions(decomposition,loss_kind="raw")
             self.assertTrue(result.converged)
             self.assertEqual(result.loss,0.)
             self.assertEqual(result.sweeps,0)
@@ -280,12 +279,12 @@ class InnerSolverTests(unittest.TestCase):
                    side_effect=AssertionError("ERI validation in inner loop")), \
              patch("ipie.hamiltonians.optimize_cholesky.loss.get_rotation_matrix",
                    side_effect=AssertionError("dense rotations in inner loop")):
-            result = optimize_partitions(decomposition,max_sweeps=2)
+            result = optimize_partitions(decomposition,InnerOptions(max_sweeps=2),loss_kind="raw")
         self.assertLess(result.loss,result.initial_loss)
 
     def test_max_sweeps_zero_and_invalid_inputs(self):
         _,decomposition = make_decomposition((2,1))
-        result = optimize_partitions(decomposition,max_sweeps=0)
+        result = optimize_partitions(decomposition,InnerOptions(max_sweeps=0),loss_kind="raw")
         self.assertFalse(result.converged)
         self.assertEqual(result.status,"max_sweeps")
         np.testing.assert_array_equal(result.t,decomposition.two_body.t)
@@ -293,15 +292,15 @@ class InnerSolverTests(unittest.TestCase):
         for kwargs in ({"max_sweeps":True},{"max_sweeps":-1},{"gradient_atol":-1},
                        {"gradient_rtol":np.nan},{"amplitude_limit":0}):
             with self.subTest(kwargs=kwargs),self.assertRaises(ValueError):
-                optimize_partitions(decomposition,**kwargs)
+                optimize_partitions(decomposition,InnerOptions(**kwargs))
         with self.assertRaises(IndexError):
-            partition_coefficients(decomposition,999)
+            partition_coefficients(decomposition,999,loss_kind="raw")
         with self.assertRaises(TypeError):
-            partition_coefficients(decomposition,True)
+            partition_coefficients(decomposition,True,loss_kind="raw")
         two = decomposition.two_body
         bad = replace(decomposition,two_body=replace(two,channels=two.channels[::-1]))
         with self.assertRaisesRegex(ValueError,"Channels disagree"):
-            optimize_partitions(bad)
+            optimize_partitions(bad,loss_kind="raw")
         with self.assertRaises(ValueError):
             with_partitions(decomposition,999.)
 

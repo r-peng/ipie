@@ -6,22 +6,25 @@ import unittest
 import numpy as np
 from scipy.linalg import expm
 
-from ipie.hamiltonians.optimize_cholesky import (
-    GaugeEvaluator,
+from ipie.hamiltonians.optimize_cholesky.models import InnerOptions
+from ipie.hamiltonians.optimize_cholesky.gradients import GaugeEvaluator, check_gauge_direction
+from ipie.hamiltonians.optimize_cholesky.loss import (
     OverlapEvaluator,
-    build_fixed_decomposition,
-    build_gauge_state,
-    check_gauge_direction,
     commutator_loss,
-    enumerate_sources,
-    exponential_gauge,
     objective_loss,
-    optimize_partitions,
     pair_scales,
-    partition_coefficients,
-    prepare_problem,
-    projected_partition_gradient,
     raw_loss,
+)
+from ipie.hamiltonians.optimize_cholesky.channels import build_fixed_decomposition, enumerate_sources
+from ipie.hamiltonians.optimize_cholesky.problem import (
+    build_gauge_state,
+    exponential_gauge,
+    prepare_problem,
+)
+from ipie.hamiltonians.optimize_cholesky.partitions import (
+    optimize_partitions,
+    partition_coefficients,
+    projected_partition_gradient,
     with_partitions,
 )
 from ipie.hamiltonians.optimize_cholesky.tests.test_channels import example_tensors
@@ -63,18 +66,24 @@ class WeightedLossTests(unittest.TestCase):
                     normalized = commutator_loss(decomposition).weighted_comm2
                     np.testing.assert_allclose(normalized*decomposition.denom**2, overlap, rtol=1e-12)
 
+    def test_weighted_is_the_default_objective(self):
+        problem, decomposition = fixture()
+        self.assertEqual(objective_loss(decomposition), objective_loss(decomposition, loss_kind="weighted"))
+        self.assertEqual(OverlapEvaluator(decomposition).loss_kind, "weighted")
+        self.assertEqual(GaugeEvaluator(problem, tau1=.03, tau2=.04).loss_kind, "weighted")
+
     def test_raw_kind_is_the_original_objective(self):
         _, decomposition = fixture()
-        self.assertEqual(objective_loss(decomposition), raw_loss(decomposition))
-        # total() uses math.fsum; the legacy diagnostic sums sequentially.
-        np.testing.assert_allclose(OverlapEvaluator(decomposition).total(), raw_loss(decomposition),
+        self.assertEqual(objective_loss(decomposition,loss_kind="raw"), raw_loss(decomposition))
+        # raw_loss and total() share the scaled-block math.fsum path.
+        np.testing.assert_allclose(OverlapEvaluator(decomposition,loss_kind="raw").total(), raw_loss(decomposition),
                                    rtol=1e-14, atol=0)
-        np.testing.assert_array_equal(pair_scales(decomposition), np.ones(decomposition.nterms))
+        np.testing.assert_array_equal(pair_scales(decomposition,loss_kind="raw"), np.ones(decomposition.nterms))
         np.testing.assert_array_equal(pair_scales(decomposition, "weighted"), decomposition.coefficients)
         with self.assertRaises(ValueError):
             pair_scales(decomposition, "normalized")
-        with self.assertRaises(ValueError):
-            OverlapEvaluator(decomposition, loss_kind="weighted").evaluate()
+        with self.assertRaises(TypeError):  # the loss kind is chosen only for objectives
+            commutator_loss(decomposition, loss_kind="weighted")
 
     def test_weighted_loss_does_not_depend_on_tau2_at_fixed_t(self):
         for partition in ("balanced_log", "anchored_log"):
@@ -100,8 +109,8 @@ class WeightedLossTests(unittest.TestCase):
 
     def test_weighted_inner_solve_is_monotone_and_stationary(self):
         problem, decomposition = fixture()
-        result = optimize_partitions(decomposition, loss_kind="weighted", gradient_atol=1e-12,
-                                     gradient_rtol=0, max_sweeps=500)
+        result = optimize_partitions(decomposition, InnerOptions(gradient_atol=1e-12, gradient_rtol=0,
+                                     max_sweeps=500), loss_kind="weighted")
         self.assertTrue(result.converged)
         self.assertEqual(result.loss_kind, "weighted")
         losses = [row.loss for row in result.history]
@@ -124,7 +133,7 @@ class WeightedLossTests(unittest.TestCase):
                 self.assertLess(check.differences[-1].relative_error, 1e-7)
         engine = GaugeEvaluator(problem, tau1=.03, tau2=.04, loss_kind="weighted")
         check = check_gauge_direction(
-            lambda X: engine.relaxed(X, gradient_atol=1e-13, gradient_rtol=0), O, K, steps=(1e-4, 1e-5))
+            lambda X: engine.relaxed(X, options=InnerOptions(gradient_atol=1e-13, gradient_rtol=0)), O, K, steps=(1e-4, 1e-5))
         self.assertLess(check.differences[-1].relative_error, 1e-6)
 
     def test_two_orbital_balanced_zero_is_the_weighted_inner_optimum(self):

@@ -133,40 +133,77 @@ def enumerate_sources(problem):
     return tuple(sources)
 
 
+# The single branch table. Each source shares one amplitude pair (d_left, d_right)
+# among its channels: channel = (spins, sign*d_left, sign*d_right) with weight
+# _BRANCH_WEIGHT[kind]/tau2. spins=None means the source's own spins.
+_BRANCHES = {
+    "two_branch": ((None, 1.0), (None, -1.0)),
+    "spin_quartet": (((0, 0), 1.0), ((0, 1), -1.0), ((1, 0), -1.0), ((1, 1), 1.0)),
+}
+_BRANCH_WEIGHT = {"two_branch": 0.5, "spin_quartet": 1.0}
+
+
+def _branches(source):
+    if source.kind not in _BRANCHES:
+        raise ValueError(f"Unsupported source kind {source.kind!r}")
+    return _BRANCHES[source.kind]
+
+
+def _branch_signs(source):
+    """Signs of a source's channels, in the canonical branch order."""
+    return np.array([sign for _, sign in _branches(source)])
+
+
+def _source_channels(source, amplitudes, tau2):
+    """A source's channels in the canonical branch order (the only constructor)."""
+    branches = _branches(source)
+    if source.kind == "spin_quartet" and source.modes[0] == source.modes[1]:
+        raise ValueError("A spin quartet needs two distinct modes")
+    left, right = amplitudes
+    weight = _BRANCH_WEIGHT[source.kind]/tau2
+    result = tuple(Channel(source.bix, source.spins if spins is None else spins, weight,
+                           source.modes, (sign*left, sign*right)) for spins, sign in branches)
+    if any(c.spins[0] == c.spins[1] and c.modes[0] == c.modes[1] for c in result):
+        raise ValueError("Source legs must be distinct spin-orbital modes")
+    return result
+
+
+def _source_slices(sources):
+    """(start, stop) of each source's channels in the concatenated channel list."""
+    endpoints = np.r_[0, np.cumsum([len(_branches(source)) for source in sources])]
+    return tuple((int(a), int(b)) for a, b in zip(endpoints[:-1], endpoints[1:]))
+
+
+def _two_body_from_amplitudes(gauge, policy, nelec, tau2, partition, amplitude_bound,
+                              sources, t, amplitudes):
+    """Assemble a TwoBodyDecomposition from per-source log ratios and amplitudes."""
+    channels = tuple(c for source, d in zip(sources, amplitudes)
+                     for c in _source_channels(source, d, tau2))
+    return TwoBodyDecomposition(gauge, policy, nelec, tau2, partition, float(amplitude_bound),
+                                sources, t, amplitudes, _source_slices(sources), channels)
+
+
 def build_two_body_channels(problem, gauge, tau2, t=None, *, partition="balanced_log",
                             amplitude_bound=1.0):
     """Build a reference two-body decomposition at a supplied validated gauge.
 
     t is indexed by enumerate_sources(problem), not by individual channels.
     One "two_branch" source emits two equal-weight +/- branches; an off-diagonal
-    hybrid source emits a shared-amplitude four-spin quartet. The full state
-    is validated here for reference correctness. Future inner-loss kernels
-    should reuse validated state/source data rather than repeat ERI checks.
+    hybrid source emits a shared-amplitude four-spin quartet. The gauge is
+    validated here against the original tensors (reusing the problem's input
+    report). GaugeEvaluator builds the same channels without these checks.
     """
     policy = _problem_policy(problem)
     tau2 = positive_scale(tau2, "tau2")
-    validate_gauge_state(problem.data, gauge, problem.report.options)
+    validate_gauge_state(problem.data, gauge, problem.report.options, input_report=problem.report)
     sources = enumerate_sources(problem)
     ratios, amplitudes = fixed_partition_amplitudes(
         gauge.eigenvalues, sources, tau2, t, partition, amplitude_bound)
     weight = 1.0 / tau2
     if not np.isfinite(weight) or weight <= 0:
         raise ValueError("tau2 gives a nonrepresentable positive channel coefficient")
-    channels, slices = [], []
-    for source, (left, right) in zip(sources, amplitudes):
-        start = len(channels)
-        if source.kind == "two_branch":
-            for sign in (1.0, -1.0):
-                channels.append(Channel(source.bix, source.spins, weight/2,
-                                        source.modes, (sign*left, sign*right)))
-        else:
-            for spins, sign in (((0,0),1.0), ((0,1),-1.0), ((1,0),-1.0), ((1,1),1.0)):
-                channels.append(Channel(source.bix, spins, weight, source.modes,
-                                        (sign*left, sign*right)))
-        slices.append((start, len(channels)))
-    return TwoBodyDecomposition(gauge, policy, problem.nelec, tau2, partition,
-                                float(amplitude_bound), sources, ratios, amplitudes,
-                                tuple(slices), tuple(channels))
+    return _two_body_from_amplitudes(gauge, policy, problem.nelec, tau2, partition,
+                                     amplitude_bound, sources, ratios, amplitudes)
 
 
 def shift_pair(shift):

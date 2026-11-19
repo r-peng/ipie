@@ -8,30 +8,33 @@ import subprocess
 import sys
 from unittest.mock import patch
 from scipy.linalg import expm
-from ipie.hamiltonians.optimize_cholesky import (
+from ipie.hamiltonians.optimize_cholesky.gradients import (
     GaugeEvaluator,
+    check_gauge_direction,
+    commutator_norm2_derivatives,
+    eigh_vjp,
+    exponential_gauge_vjp,
+    fixed_partition_gradient,
+    givens_gauge_vjp,
+    relaxed_gauge_gradient,
+    normalized_partition_gradient,
+)
+from ipie.hamiltonians.optimize_cholesky.models import InnerOptions
+from ipie.hamiltonians.optimize_cholesky.models import (
     GaugeRegularityError,
     GradientOptions,
     InnerConvergenceError,
     PartitionCoefficients,
-    build_fixed_decomposition,
-    build_gauge_state,
-    check_gauge_direction,
-    commutator_norm2,
-    commutator_norm2_derivatives,
-    eigh_vjp,
-    exponential_gauge,
-    exponential_gauge_vjp,
-    fixed_partition_gradient,
-    givens_gauge,
-    givens_gauge_vjp,
-    optimize_partitions,
-    partition_coefficients,
-    prepare_problem,
-    raw_loss,
-    relaxed_gauge_gradient,
-    normalized_partition_gradient,
 )
+from ipie.hamiltonians.optimize_cholesky.channels import build_fixed_decomposition
+from ipie.hamiltonians.optimize_cholesky.problem import (
+    build_gauge_state,
+    exponential_gauge,
+    givens_gauge,
+    prepare_problem,
+)
+from ipie.hamiltonians.optimize_cholesky.loss import commutator_norm2, raw_loss
+from ipie.hamiltonians.optimize_cholesky.partitions import optimize_partitions, partition_coefficients
 from ipie.hamiltonians.optimize_cholesky.tests.test_channels import (
     check_hamiltonian,
     example_tensors,
@@ -52,7 +55,7 @@ def central(function, x, direction, h=1e-6):
 
 def fixture(nelec=(2,1),partition="balanced_log"):
     problem,decomposition = make_decomposition(nelec,partition=partition)
-    evaluator = GaugeEvaluator(problem,tau1=.2,tau2=.04,partition=partition)
+    evaluator = GaugeEvaluator(problem,tau1=.2,tau2=.04,partition=partition,loss_kind="raw")
     return problem,decomposition.two_body.gauge.O,evaluator
 
 
@@ -154,7 +157,7 @@ class FixedGaugeGradientTests(unittest.TestCase):
             for partition in ("balanced_log","anchored_log"):
                 with self.subTest(nelec=nelec,partition=partition):
                     problem,state = make_decomposition(nelec,partition=partition)
-                    result = fixed_partition_gradient(problem,state)
+                    result = fixed_partition_gradient(problem,state,loss_kind="raw")
                     O = state.two_body.gauge.O
                     t = state.two_body.t
                     def dense(angle):
@@ -165,14 +168,14 @@ class FixedGaugeGradientTests(unittest.TestCase):
                     np.testing.assert_allclose(np.sum(result.gradient_O*(K2@O)),fd,atol=2e-11,rtol=2e-7)
                     np.testing.assert_allclose(result.loss,raw_loss(state,method="dense"),atol=3e-17,rtol=1e-11)
                     np.testing.assert_allclose(result.partition_gradient,
-                                               [c.gradient for c in partition_coefficients(state)],atol=5e-18)
+                                               [c.gradient for c in partition_coefficients(state,loss_kind="raw")],atol=5e-18)
                     np.testing.assert_array_equal(result.bound_correction_O,0.)
                     self.assertEqual(result.mode,"fixed_t")
 
     def test_full_gradient_through_noncommuting_three_factor_coordinates(self):
         h,eri,chol = example_tensors(r=3)
         problem = prepare_problem(h,eri,chol,nelec=(2,1))
-        evaluator = GaugeEvaluator(problem,tau1=.03,tau2=.04)
+        evaluator = GaugeEvaluator(problem,tau1=.03,tau2=.04,loss_kind="raw")
         theta = np.array([.17,-.24,.11])
         O = exponential_gauge(theta,3)
         t = np.linspace(-.1,.2,len(evaluator.sources))
@@ -193,13 +196,13 @@ class FixedGaugeGradientTests(unittest.TestCase):
         chol=np.array([np.diag([0.,.7]),[[.3,.2],[.2,-.4]]])
         eri=np.einsum("gpr,gqs->prqs",chol,chol)
         p=prepare_problem(h,eri,chol,nelec=(2,0))
-        anchored=GaugeEvaluator(p,tau1=.1,tau2=.04,partition="anchored_log")
+        anchored=GaugeEvaluator(p,tau1=.1,tau2=.04,partition="anchored_log",loss_kind="raw")
         check=check_gauge_direction(lambda O:anchored.fixed(O,t=.2),np.eye(2),K2,steps=(1e-5,1e-6))
         self.assertLess(check.differences[-1].absolute_error,1e-10)
         check=check_gauge_direction(lambda O:anchored.fixed_z(O,z=.3,max_abs_t=.4),
                                    np.eye(2),K2,steps=(1e-5,1e-6))
         self.assertLess(check.differences[-1].absolute_error,1e-10)
-        balanced=GaugeEvaluator(p,tau1=.1,tau2=.04)
+        balanced=GaugeEvaluator(p,tau1=.1,tau2=.04,loss_kind="raw")
         with self.assertRaisesRegex(GaugeRegularityError,"zero/near-zero"):
             balanced.fixed()
 
@@ -217,7 +220,7 @@ class FixedGaugeGradientTests(unittest.TestCase):
     def test_one_orbital_empty_partition_list(self):
         chol=np.array([[[.3]],[[.4]]])
         p=prepare_problem([[.2]],np.einsum("gpr,gqs->prqs",chol,chol),chol,nelec=(1,0))
-        evaluator=GaugeEvaluator(p,tau1=.1,tau2=.1)
+        evaluator=GaugeEvaluator(p,tau1=.1,tau2=.1,loss_kind="raw")
         for result in (evaluator.fixed(),evaluator.fixed_z(),evaluator.relaxed()):
             self.assertEqual(result.loss,0.)
             np.testing.assert_array_equal(result.gradient_O,0.)
@@ -250,8 +253,8 @@ class MovingBoundTests(unittest.TestCase):
                 with self.subTest(nelec=nelec,partition=partition):
                     problem,O,evaluator=fixture(nelec,partition)
                     rho=1.025*minimum_amplitude_limit(evaluator,O)
-                    center=evaluator.relaxed(O,amplitude_limit=rho,gradient_atol=1e-12,
-                                             gradient_rtol=0,max_sweeps=200)
+                    center=evaluator.relaxed(O,options=InnerOptions(amplitude_limit=rho,gradient_atol=1e-12,
+                                             gradient_rtol=0,max_sweeps=200))
                     t=center.decomposition.two_body.t
                     bounds=center.inner_result.bounds
                     active=(t==bounds[:,0])|(t==bounds[:,1])
@@ -259,8 +262,8 @@ class MovingBoundTests(unittest.TestCase):
                     self.assertGreater(np.max(np.abs(center.partition_gradient[active])),1e-7)
                     self.assertEqual(center.inner_result.amplitude_limit,rho)
                     h=1e-6
-                    kwargs=dict(t0=t,amplitude_limit=rho,gradient_atol=1e-12,
-                                gradient_rtol=0,max_sweeps=200)
+                    kwargs=dict(t0=t,options=InnerOptions(amplitude_limit=rho,gradient_atol=1e-12,
+                                gradient_rtol=0,max_sweeps=200))
                     plus=evaluator.relaxed(expm(h*K2)@O,**kwargs)
                     minus=evaluator.relaxed(expm(-h*K2)@O,**kwargs)
                     fd=(plus.loss-minus.loss)/(2*h)
@@ -277,30 +280,30 @@ class MovingBoundTests(unittest.TestCase):
     def test_interior_relaxed_gradient_and_envelope_term_vanishes(self):
         for partition in ("balanced_log","anchored_log"):
             _,O,evaluator=fixture((2,0),partition)
-            center=evaluator.relaxed(O,gradient_atol=1e-13,gradient_rtol=0)
+            center=evaluator.relaxed(O,options=InnerOptions(gradient_atol=1e-13,gradient_rtol=0))
             self.assertLess(np.linalg.norm(center.bound_correction_O),2e-12)
             call=lambda matrix:evaluator.relaxed(matrix,t0=center.decomposition.two_body.t,
-                                                 gradient_atol=1e-13,gradient_rtol=0)
+                                                 options=InnerOptions(gradient_atol=1e-13,gradient_rtol=0))
             check=check_gauge_direction(call,O,K2,steps=(1e-4,1e-5,1e-6))
             self.assertLess(check.differences[-1].absolute_error,1e-10)
 
     def test_relaxed_constant_cap_has_no_bound_motion(self):
         _,O,evaluator=fixture((2,0),"anchored_log")
-        center=evaluator.relaxed(O,max_abs_t=.05,gradient_atol=1e-13,gradient_rtol=0)
+        center=evaluator.relaxed(O,options=InnerOptions(max_abs_t=.05,gradient_atol=1e-13,gradient_rtol=0))
         t=center.decomposition.two_body.t
         self.assertTrue(np.any(np.abs(t)==.05))
         self.assertGreater(np.max(np.abs(center.partition_gradient)),1e-7)
         np.testing.assert_array_equal(center.bound_correction_O,0.)
         check=check_gauge_direction(
-            lambda matrix:evaluator.relaxed(matrix,t0=t,max_abs_t=.05,
-                                            gradient_atol=1e-13,gradient_rtol=0),
+            lambda matrix:evaluator.relaxed(matrix,t0=t,options=InnerOptions(max_abs_t=.05,
+                                            gradient_atol=1e-13,gradient_rtol=0)),
             O,K2,steps=(1e-5,1e-6))
         self.assertLess(check.differences[-1].absolute_error,1e-10)
 
     def test_two_orbital_balanced_shortcut_for_multiple_gauges(self):
         h,eri,chol=example_tensors(n=2,r=3,seed=37)
         p=prepare_problem(h,eri,chol,nelec=(1,1))
-        evaluator=GaugeEvaluator(p,tau1=.1,tau2=.04)
+        evaluator=GaugeEvaluator(p,tau1=.1,tau2=.04,loss_kind="raw")
         K=np.array([[0.,.2,-.3],[-.2,0.,.4],[.3,-.4,0.]])
         for theta in ((.1,.2,-.1),(-.2,.1,.3)):
             O=exponential_gauge(theta,3)
@@ -313,15 +316,15 @@ class MovingBoundTests(unittest.TestCase):
 
     def test_nonconverged_inner_solve_is_not_returned_as_a_relaxed_gradient(self):
         p,d=make_decomposition((2,0))
-        incomplete=optimize_partitions(d,max_sweeps=0)
+        incomplete=optimize_partitions(d,InnerOptions(max_sweeps=0),loss_kind="raw")
         with self.assertRaises(InnerConvergenceError) as context:
             relaxed_gauge_gradient(p,incomplete)
         self.assertIs(context.exception.result,incomplete)
         with self.assertRaises(InnerConvergenceError):
             relaxed_gauge_gradient(p,replace(incomplete,converged=True))
-        evaluator=GaugeEvaluator(p,tau1=.2,tau2=.04)
+        evaluator=GaugeEvaluator(p,tau1=.2,tau2=.04,loss_kind="raw")
         with self.assertRaises(InnerConvergenceError):
-            evaluator.relaxed(d.two_body.gauge.O,max_sweeps=0)
+            evaluator.relaxed(d.two_body.gauge.O,options=InnerOptions(max_sweeps=0))
 
     def test_bound_switch_and_collapsed_interval_are_explicit(self):
         _,O,evaluator=fixture((2,0))
@@ -348,7 +351,7 @@ class DerivativeBackendTests(unittest.TestCase):
         self.assertEqual(left.loss, right.loss)
         for name in ("gradient_O", "fixed_gradient_O", "bound_correction_O",
                      "tangent_gradient", "generator_gradient", "partition_gradient",
-                     "eigenvalue_gradient", "eigenvector_gradient", "rotated_cholesky_gradient"):
+                     "eigenvalue_gradient"):
             np.testing.assert_array_equal(getattr(left, name), getattr(right, name), err_msg=name)
         np.testing.assert_array_equal(left.decomposition.two_body.amplitudes,
                                       right.decomposition.two_body.amplitudes)
@@ -356,59 +359,60 @@ class DerivativeBackendTests(unittest.TestCase):
     def test_default_and_explicit_numpy_engines_agree_in_all_three_modes(self):
         problem, state = make_decomposition((2, 0))
         O = state.two_body.gauge.O
-        implicit = GaugeEvaluator(problem, tau1=.2, tau2=.04)
-        explicit = GaugeEvaluator(problem, tau1=.2, tau2=.04, backend="numpy")
+        implicit = GaugeEvaluator(problem, tau1=.2, tau2=.04, loss_kind="raw")
+        explicit = GaugeEvaluator(problem, tau1=.2, tau2=.04, backend="numpy", loss_kind="raw")
         self.assertEqual(implicit.backend, "numpy")
         self.assertEqual(explicit.backend, "numpy")
         with self.assertRaises(AttributeError):
             explicit.backend = "pytorch"
         for method, kwargs in (("fixed", {"t": .12}),
                                ("fixed_z", {"z": .2, "max_abs_t": .4}),
-                               ("relaxed", {"gradient_atol": 1e-12, "gradient_rtol": 0})):
+                               ("relaxed", {"options": InnerOptions(gradient_atol=1e-12, gradient_rtol=0)})):
             with self.subTest(method=method):
                 self.assert_same_evaluation(getattr(implicit, method)(O, **kwargs),
                                             getattr(explicit, method)(O, **kwargs))
 
-    def test_standalone_numpy_entrypoints_and_coordinate_pullbacks_agree(self):
+    def test_evaluator_matches_the_checked_public_functions(self):
+        # GaugeEvaluator skips consistency checks; its results must be bitwise
+        # those of the checked public gradient functions on the same input.
         problem, state = make_decomposition((2, 0))
-        for function in (fixed_partition_gradient, normalized_partition_gradient):
-            with self.subTest(function=function.__name__):
-                self.assert_same_evaluation(function(problem, state),
-                                            function(problem, state, backend="numpy"))
-        evaluator = GaugeEvaluator(problem, tau1=.2, tau2=.04, backend="numpy")
-        inner = evaluator.relaxed(state.two_body.gauge.O).inner_result
-        self.assert_same_evaluation(relaxed_gauge_gradient(problem, inner),
-                                    relaxed_gauge_gradient(problem, inner, backend="numpy"))
+        O = state.two_body.gauge.O
+        evaluator = GaugeEvaluator(problem, tau1=.2, tau2=.04, loss_kind="raw")
+        fixed = evaluator.fixed(O, t=.12)
+        self.assert_same_evaluation(fixed, fixed_partition_gradient(problem, fixed.decomposition,
+                                                                    loss_kind="raw"))
+        normalized = evaluator.fixed_z(O, z=.2, max_abs_t=.4)
+        self.assert_same_evaluation(normalized, normalized_partition_gradient(
+            problem, normalized.decomposition, max_abs_t=.4, loss_kind="raw"))
+        relaxed = evaluator.relaxed(O, options=InnerOptions(gradient_atol=1e-12, gradient_rtol=0))
+        self.assert_same_evaluation(relaxed, relaxed_gauge_gradient(problem, relaxed.inner_result))
+
+    def test_backend_is_chosen_only_on_the_evaluator(self):
+        problem, state = make_decomposition((2, 0))
+        inner = GaugeEvaluator(problem, tau1=.2, tau2=.04, loss_kind="raw").relaxed(
+            state.two_body.gauge.O).inner_result
         E = np.array([[.2, -.3], [.4, .1]])
-        reference = np.diag([-1., 1.])
-        np.testing.assert_array_equal(
-            exponential_gauge_vjp([.2], 2, E, reference),
-            exponential_gauge_vjp([.2], 2, E, reference, backend="numpy"))
-        rotations = ((0, 1, .2), (0, 1, -.1))
-        np.testing.assert_array_equal(
-            givens_gauge_vjp(2, rotations, E, reference),
-            givens_gauge_vjp(2, rotations, E, reference, backend="numpy"))
+        for call in (lambda: fixed_partition_gradient(problem, state, backend="numpy"),
+                     lambda: normalized_partition_gradient(problem, state, backend="numpy"),
+                     lambda: relaxed_gauge_gradient(problem, inner, backend="numpy"),
+                     lambda: exponential_gauge_vjp([.2], 2, E, backend="numpy"),
+                     lambda: givens_gauge_vjp(2, ((0, 1, .2),), E, backend="numpy")):
+            with self.assertRaises(TypeError):
+                call()
 
     def test_pytorch_engine_fails_before_any_initialization_work(self):
         problem, _ = make_decomposition((2, 0))
         with patch("ipie.hamiltonians.optimize_cholesky.gradients.build_one_body_channels",
                    side_effect=AssertionError("one-body setup must not run")), \
-             patch("ipie.hamiltonians.optimize_cholesky.gradients.optimize_partitions",
+             patch("ipie.hamiltonians.optimize_cholesky.gradients._solve_partitions",
                    side_effect=AssertionError("inner solver must not run")), \
              patch("numpy.linalg.eigh", side_effect=AssertionError("eigh must not run")):
             with self.assertRaisesRegex(NotImplementedError, "pytorch.*not implemented"):
                 GaugeEvaluator(problem, tau1=.2, tau2=.04, backend="pytorch")
 
-    def test_standalone_rejections_are_early_and_unknown_backends_do_not_fall_back(self):
-        # Invalid numerical inputs ensure backend selection precedes any work.
-        calls = (
-            lambda **kw: fixed_partition_gradient(None, None, **kw),
-            lambda **kw: normalized_partition_gradient(None, None, **kw),
-            lambda **kw: relaxed_gauge_gradient(None, None, **kw),
-            lambda **kw: exponential_gauge_vjp(None, 0, None, **kw),
-            lambda **kw: givens_gauge_vjp(0, None, None, **kw),
-            lambda **kw: GaugeEvaluator(None, tau1=.2, tau2=.04, **kw),
-        )
+    def test_backend_rejection_is_early_and_unknown_backends_do_not_fall_back(self):
+        # An invalid problem ensures backend selection precedes any work.
+        calls = (lambda **kw: GaugeEvaluator(None, tau1=.2, tau2=.04, **kw),)
         for call in calls:
             with self.assertRaises(NotImplementedError):
                 call(backend="pytorch")
@@ -445,7 +449,7 @@ for name, relative in (("ipie", "ipie"), ("ipie.hamiltonians", "ipie/hamiltonian
         parent, attribute = name.rsplit(".", 1)
         setattr(sys.modules[parent], attribute, module)
 
-from ipie.hamiltonians.optimize_cholesky import GaugeEvaluator
+from ipie.hamiltonians.optimize_cholesky.gradients import GaugeEvaluator
 from ipie.hamiltonians.optimize_cholesky.tests.test_channels import make_decomposition
 problem, state = make_decomposition((2, 0))
 evaluator = GaugeEvaluator(problem, tau1=.2, tau2=.04, backend="numpy")

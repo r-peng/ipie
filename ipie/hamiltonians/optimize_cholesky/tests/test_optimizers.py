@@ -5,30 +5,28 @@ import unittest
 import numpy as np
 import math
 from unittest.mock import patch
-from ipie.hamiltonians.optimize_cholesky import (
+from ipie.hamiltonians.optimize_cholesky.models import (
     ExponentialEvaluation,
     GaugeFeasibilityError,
     GaugeRegularityError,
     InnerConvergenceError,
-    OuterOptions,
-    ExponentialGaugeObjective,
-    GaugeEvaluator,
     InnerOptions,
-    exponential_gauge,
-    exponential_gauge_vjp,
-    optimize_gauge,
-    prepare_problem,
-    raw_loss,
-    GDMOptimizer,
-    LBFGSOptimizer,
     LBFGSOptions,
     OptimizerIteration,
     OptimizerOptions,
+)
+from ipie.hamiltonians.optimize_cholesky.optimizers import (
+    ExponentialGaugeObjective,
+    optimize_gauge,
+    GDMOptimizer,
+    LBFGSOptimizer,
     OptimizerStep,
     OuterOptimizer,
 )
-from ipie.hamiltonians.optimize_cholesky.optimizers import _minimize_exponential
-from dataclasses import FrozenInstanceError, asdict, dataclass
+from ipie.hamiltonians.optimize_cholesky.gradients import GaugeEvaluator, exponential_gauge_vjp
+from ipie.hamiltonians.optimize_cholesky.problem import exponential_gauge, prepare_problem
+from ipie.hamiltonians.optimize_cholesky.loss import raw_loss
+from dataclasses import FrozenInstanceError, asdict, dataclass, replace
 from ipie.hamiltonians.optimize_cholesky.tests.test_channels import (
     check_hamiltonian,
     example_tensors,
@@ -43,6 +41,13 @@ def readonly(value):
     result.setflags(write=False)
     return result
 
+
+
+def run_lbfgs(objective, theta0, options=None, callback=None):
+    """LBFGSOptimizer without final validation (the small oracles have no validate)."""
+    options = LBFGSOptions() if options is None else options
+    return LBFGSOptimizer(objective, options=replace(options, validate_final=False)).optimize(
+        theta0, callback=callback)
 
 class QuadraticOracle:
     """Exact f(theta)=.5*(theta-target).T@A@(theta-target), with call records.
@@ -98,10 +103,10 @@ class QuadraticOracle:
 class ControlledOuterDriverTests(unittest.TestCase):
     def test_quadratic_convergence_armijo_and_curvature_memory(self):
         oracle = QuadraticOracle([[4., 1.], [1., 3.]], [.3, -.4])
-        options = OuterOptions(max_iterations=80, memory=4, max_step_norm=.75,
+        options = LBFGSOptions(max_iterations=80, memory=4, max_step_norm=.75,
                                gradient_atol=1e-9, gradient_rtol=0,
                                validate_final=False)
-        result = _minimize_exponential(oracle, [1.2, .8], options)
+        result = run_lbfgs(oracle, [1.2, .8], options)
         self.assertTrue(result.converged)
         self.assertEqual(result.status, "converged")
         np.testing.assert_allclose(result.theta, oracle.target, atol=1e-8, rtol=0)
@@ -133,12 +138,12 @@ class ControlledOuterDriverTests(unittest.TestCase):
 
     def test_zero_iteration_and_evaluation_budgets_keep_valid_initial_state(self):
         for options, status in (
-            (OuterOptions(max_iterations=0), "max_iterations"),
-            (OuterOptions(max_iterations=10, max_evaluations=1), "max_evaluations"),
+            (LBFGSOptions(max_iterations=0), "max_iterations"),
+            (LBFGSOptions(max_iterations=10, max_evaluations=1), "max_evaluations"),
         ):
             with self.subTest(status=status):
                 oracle = QuadraticOracle([[1.]], [3.])
-                result = _minimize_exponential(oracle, [0.], options)
+                result = run_lbfgs(oracle, [0.], options)
                 self.assertFalse(result.converged)
                 self.assertEqual(result.status, status)
                 self.assertEqual(result.iterations, 0)
@@ -149,10 +154,10 @@ class ControlledOuterDriverTests(unittest.TestCase):
 
     def test_evaluation_budget_after_an_accepted_step_returns_that_step(self):
         oracle = QuadraticOracle([[1.]], [3.])
-        options = OuterOptions(max_iterations=10, max_evaluations=2,
+        options = LBFGSOptions(max_iterations=10, max_evaluations=2,
                                max_step_norm=1., gradient_atol=1e-12,
                                gradient_rtol=0)
-        result = _minimize_exponential(oracle, [0.], options)
+        result = run_lbfgs(oracle, [0.], options)
         self.assertFalse(result.converged)
         self.assertEqual(result.status, "max_evaluations")
         self.assertEqual(result.iterations, 1)
@@ -164,10 +169,10 @@ class ControlledOuterDriverTests(unittest.TestCase):
     def test_armijo_rejections_and_failed_line_search_do_not_replace_state(self):
         # The maximum allowed first displacement overshoots this sharp minimum.
         oracle = QuadraticOracle([[1000.]], [.03])
-        options = OuterOptions(max_iterations=3, max_line_search=1,
+        options = LBFGSOptions(max_iterations=3, max_line_search=1,
                                max_step_norm=1., gradient_atol=1e-12,
                                gradient_rtol=0)
-        result = _minimize_exponential(oracle, [0.], options)
+        result = run_lbfgs(oracle, [0.], options)
         self.assertEqual(result.status, "line_search_failed")
         self.assertFalse(result.converged)
         self.assertEqual(result.iterations, 0)
@@ -182,9 +187,9 @@ class ControlledOuterDriverTests(unittest.TestCase):
 
     def test_budget_during_rejected_line_search_preserves_initial_point(self):
         oracle = QuadraticOracle([[1000.]], [.03])
-        options = OuterOptions(max_iterations=3, max_evaluations=2,
+        options = LBFGSOptions(max_iterations=3, max_evaluations=2,
                                max_line_search=10, max_step_norm=1.)
-        result = _minimize_exponential(oracle, [0.], options)
+        result = run_lbfgs(oracle, [0.], options)
         self.assertEqual(result.status, "max_evaluations")
         self.assertEqual(result.iterations, 0)
         self.assertEqual(result.evaluations, 2)
@@ -200,8 +205,8 @@ class ControlledOuterDriverTests(unittest.TestCase):
                     raise exception("controlled invalid large trial")
             with self.subTest(exception=exception.__name__):
                 oracle = QuadraticOracle([[10.]], [.3], failure=failure)
-                result = _minimize_exponential(
-                    oracle, [0.], OuterOptions(max_iterations=25,
+                result = run_lbfgs(
+                    oracle, [0.], LBFGSOptions(max_iterations=25,
                                               gradient_atol=1e-10, gradient_rtol=0))
                 self.assertTrue(result.converged)
                 self.assertGreater(result.failed_evaluations, 0)
@@ -216,8 +221,8 @@ class ControlledOuterDriverTests(unittest.TestCase):
             if count > 2:
                 raise InnerConvergenceError("controlled later failure")
         oracle = QuadraticOracle([[1.]], [3.], failure=failure)
-        result = _minimize_exponential(
-            oracle, [0.], OuterOptions(max_iterations=4, max_line_search=3,
+        result = run_lbfgs(
+            oracle, [0.], LBFGSOptions(max_iterations=4, max_line_search=3,
                                       gradient_atol=1e-12, gradient_rtol=0))
         self.assertEqual(result.status, "line_search_failed")
         self.assertEqual(result.iterations, 1)
@@ -238,7 +243,7 @@ class ControlledOuterDriverTests(unittest.TestCase):
                     raise StopIteration
             with self.subTest(stop_iteration=stop_iteration):
                 oracle = QuadraticOracle([[1.]], [3.])
-                result = _minimize_exponential(oracle, [0.], OuterOptions(), callback)
+                result = run_lbfgs(oracle, [0.], LBFGSOptions(), callback)
                 self.assertEqual(result.status, "callback_stopped")
                 self.assertFalse(result.converged)
                 self.assertEqual(result.iterations, stop_iteration)
@@ -253,7 +258,7 @@ class ControlledOuterDriverTests(unittest.TestCase):
             raise initial_error
         oracle = QuadraticOracle([[1.]], [3.], failure=initial_failure)
         with self.assertRaises(GaugeRegularityError) as caught:
-            _minimize_exponential(oracle, [0.], OuterOptions())
+            run_lbfgs(oracle, [0.], LBFGSOptions())
         self.assertIs(caught.exception, initial_error)
         self.assertEqual(oracle.evaluations, 1)
         for exception in (NotImplementedError, TypeError, AttributeError, ValueError, RuntimeError):
@@ -264,18 +269,18 @@ class ControlledOuterDriverTests(unittest.TestCase):
             with self.subTest(exception=exception.__name__):
                 oracle = QuadraticOracle([[1.]], [3.], failure=failure)
                 with self.assertRaises(exception) as caught:
-                    _minimize_exponential(oracle, [0.], OuterOptions())
+                    run_lbfgs(oracle, [0.], LBFGSOptions())
                 self.assertIs(caught.exception, error)
                 self.assertEqual(oracle.evaluations, 2)
         oracle = QuadraticOracle([[1.]], [3.])
         with self.assertRaises(TypeError):
-            _minimize_exponential(oracle, [0.], OuterOptions(), callback=1)
+            run_lbfgs(oracle, [0.], LBFGSOptions(), callback=1)
         self.assertEqual(oracle.evaluations, 0)
 
     def test_negative_curvature_is_not_retained(self):
         oracle = QuadraticOracle([[-1.]], [0.])
-        result = _minimize_exponential(
-            oracle, [.2], OuterOptions(max_iterations=3, gradient_atol=0,
+        result = run_lbfgs(
+            oracle, [.2], LBFGSOptions(max_iterations=3, gradient_atol=0,
                                       gradient_rtol=0, max_step_norm=.3))
         self.assertEqual(result.status, "max_iterations")
         self.assertFalse(result.converged)
@@ -290,8 +295,8 @@ class ControlledOuterDriverTests(unittest.TestCase):
         # direction. No Hamiltonian, linear-algebra or derivative kernel is mocked.
         with patch("ipie.hamiltonians.optimize_cholesky.optimizers._lbfgs_direction",
                    side_effect=lambda gradient, pairs: gradient.copy()):
-            result = _minimize_exponential(
-                oracle, [0.], OuterOptions(max_iterations=10, gradient_atol=1e-9,
+            result = run_lbfgs(
+                oracle, [0.], LBFGSOptions(max_iterations=10, gradient_atol=1e-9,
                                           gradient_rtol=0))
         self.assertTrue(result.converged)
         self.assertLess(result.loss, result.initial_loss)
@@ -299,8 +304,8 @@ class ControlledOuterDriverTests(unittest.TestCase):
 
     def test_coordinate_gradient_alone_does_not_certify_stationarity(self):
         oracle = QuadraticOracle([[1.]], [0.], tangent_norm=1.)
-        result = _minimize_exponential(
-            oracle, [0.], OuterOptions(gradient_atol=1e-9, gradient_rtol=0))
+        result = run_lbfgs(
+            oracle, [0.], LBFGSOptions(gradient_atol=1e-9, gradient_rtol=0))
         self.assertEqual(result.gradient_norm, 0.)
         self.assertEqual(result.tangent_gradient_norm, 1.)
         self.assertEqual(result.status, "coordinate_stalled")
@@ -309,7 +314,7 @@ class ControlledOuterDriverTests(unittest.TestCase):
 
     def test_zero_dimensional_coordinate_problem_is_evaluated_once(self):
         oracle = QuadraticOracle(np.empty((0, 0)), np.empty(0))
-        result = _minimize_exponential(oracle, np.empty(0), OuterOptions())
+        result = run_lbfgs(oracle, np.empty(0), LBFGSOptions())
         self.assertTrue(result.converged)
         self.assertEqual(result.status, "converged")
         self.assertEqual(result.evaluations, 1)
@@ -321,7 +326,7 @@ class ControlledOuterDriverTests(unittest.TestCase):
 
 def engine_fixture(nelec=(2,0),partition="balanced_log"):
     problem,_ = make_decomposition(nelec,partition=partition)
-    return problem,GaugeEvaluator(problem,tau1=.2,tau2=.04,partition=partition)
+    return problem,GaugeEvaluator(problem,tau1=.2,tau2=.04,partition=partition,loss_kind="raw")
 
 
 class NestedOracleTests(unittest.TestCase):
@@ -391,7 +396,7 @@ class NestedOracleTests(unittest.TestCase):
     def test_post_inner_regularity_failure_retains_inner_work_diagnostics(self):
         _,engine=engine_fixture()
         objective=ExponentialGaugeObjective(engine)
-        with patch("ipie.hamiltonians.optimize_cholesky.gradients.normalized_partition_gradient",
+        with patch("ipie.hamiltonians.optimize_cholesky.gradients._assemble",
                    side_effect=GaugeRegularityError("injected post-inner failure")):
             with self.assertRaises(GaugeRegularityError) as context:
                 objective.evaluate([0.])
@@ -408,7 +413,7 @@ class NestedOracleTests(unittest.TestCase):
                        {"backtrack":1.},{"armijo":0.},{"gradient_atol":np.nan},
                        {"initial_step":0.},{"curvature_rtol":1.},{"validate_final":"yes"}):
             with self.subTest(kwargs=kwargs),self.assertRaises(ValueError):
-                OuterOptions(**kwargs)
+                LBFGSOptions(**kwargs)
         for kwargs in ({"max_sweeps":True},{"gradient_atol":-1},{"amplitude_limit":1.},
                        {"max_abs_t":0.}):
             with self.subTest(kwargs=kwargs),self.assertRaises(ValueError):
@@ -435,8 +440,8 @@ class PhysicalOuterTests(unittest.TestCase):
         chol=np.array([np.diag([1.3,.7]),np.diag([.7,-.5])])
         eri=np.einsum("gpr,gqs->prqs",chol,chol)
         problem=prepare_problem(h,eri,chol,nelec=(1,1))
-        engine=GaugeEvaluator(problem,tau1=.2,tau2=.04)
-        result=optimize_gauge(engine,options=OuterOptions(max_iterations=10,max_step_norm=.5))
+        engine=GaugeEvaluator(problem,tau1=.2,tau2=.04,loss_kind="raw")
+        result=optimize_gauge(engine,options=LBFGSOptions(max_iterations=10,max_step_norm=.5))
         self.assertTrue(result.converged)
         self.assertGreater(result.iterations,0)
         self.assertLess(result.loss,.9*result.initial_loss)
@@ -452,7 +457,7 @@ class PhysicalOuterTests(unittest.TestCase):
                     problem,engine=engine_fixture(nelec,partition)
                     callback_rows=[]
                     result=optimize_gauge(
-                        engine,options=OuterOptions(max_iterations=3,max_step_norm=.3),
+                        engine,options=LBFGSOptions(max_iterations=3,max_step_norm=.3),
                         inner_options=InnerOptions(gradient_atol=1e-12,gradient_rtol=0),
                         callback=callback_rows.append)
                     self.assertLess(result.loss,result.initial_loss)
@@ -486,7 +491,7 @@ class PhysicalOuterTests(unittest.TestCase):
             return original(O,**kwargs)
         with patch.object(engine,"relaxed",side_effect=reject_large):
             result=optimize_gauge(engine,inner_t0=seed,
-                                   options=OuterOptions(max_iterations=1,max_step_norm=.4))
+                                   options=LBFGSOptions(max_iterations=1,max_step_norm=.4))
         self.assertGreater(result.failed_evaluations,0)
         self.assertTrue(any("InnerConvergenceError" in row.reason for row in result.trials))
         self.assertEqual(result.iterations,1)
@@ -506,7 +511,7 @@ class PhysicalOuterTests(unittest.TestCase):
                 raise GaugeRegularityError("injected rejected trial")
             return original(O,**kwargs)
         with patch.object(engine,"relaxed",side_effect=reject_all_trials):
-            result=optimize_gauge(engine,options=OuterOptions(max_iterations=2,max_line_search=3))
+            result=optimize_gauge(engine,options=LBFGSOptions(max_iterations=2,max_line_search=3))
         self.assertFalse(result.converged)
         self.assertEqual(result.status,"line_search_failed")
         self.assertEqual(result.iterations,0)
@@ -522,8 +527,8 @@ class PhysicalOuterTests(unittest.TestCase):
         chol[0]+=.8*np.eye(2)
         eri=np.einsum("gpr,gqs->prqs",chol,chol)
         problem=prepare_problem(h,eri,chol,nelec=(1,1))
-        engine=GaugeEvaluator(problem,tau1=.2,tau2=.04)
-        result=optimize_gauge(engine,options=OuterOptions(max_iterations=3))
+        engine=GaugeEvaluator(problem,tau1=.2,tau2=.04,loss_kind="raw")
+        result=optimize_gauge(engine,options=LBFGSOptions(max_iterations=3))
         self.assertLess(result.loss,.9*result.initial_loss)
         self.assertTrue(all(row.inner_sweeps==0 for row in result.history))
         check_hamiltonian(result.decomposition,h,eri,(1,1))
@@ -531,7 +536,7 @@ class PhysicalOuterTests(unittest.TestCase):
     def test_physical_stationarity_is_checked_at_a_singular_exponential_chart(self):
         h,eri,chol=example_tensors(n=3,r=3,seed=29)
         problem=prepare_problem(h,eri,chol,nelec=(2,1))
-        engine=GaugeEvaluator(problem,tau1=.2,tau2=.04)
+        engine=GaugeEvaluator(problem,tau1=.2,tau2=.04,loss_kind="raw")
         objective=ExponentialGaugeObjective(engine)
         center=objective.evaluate(np.zeros(3))
         axis=np.cross(center.gradient_theta,[1.,0.,0.])
@@ -539,7 +544,7 @@ class PhysicalOuterTests(unittest.TestCase):
             axis=np.cross(center.gradient_theta,[0.,1.,0.])
         theta=2*math.pi*axis/np.linalg.norm(axis)
         result=optimize_gauge(engine,theta0=theta,
-                               options=OuterOptions(max_iterations=3,gradient_atol=1e-9,gradient_rtol=0))
+                               options=LBFGSOptions(max_iterations=3,gradient_atol=1e-9,gradient_rtol=0))
         self.assertFalse(result.converged)
         self.assertEqual(result.status,"coordinate_stalled")
         self.assertEqual(result.iterations,0)
@@ -553,7 +558,7 @@ class PhysicalOuterTests(unittest.TestCase):
         chol=np.array([np.diag([-.3,.7])])
         eri=np.einsum("gpr,gqs->prqs",chol,chol)
         problem=prepare_problem(h,eri,chol,nelec=(1,1))
-        engine=GaugeEvaluator(problem,tau1=.1,tau2=.04)
+        engine=GaugeEvaluator(problem,tau1=.1,tau2=.04,loss_kind="raw")
         result=optimize_gauge(engine,reference=[[-1.]])
         self.assertTrue(result.converged)
         self.assertEqual(result.iterations,0)
@@ -626,7 +631,7 @@ def physical_engine():
     chol = np.array([np.diag([1.3, .7]), np.diag([.7, -.5])])
     eri = np.einsum("gpr,gqs->prqs", chol, chol)
     return GaugeEvaluator(prepare_problem(h, eri, chol, nelec=(1, 1)),
-                          tau1=.2, tau2=.04)
+                          tau1=.2, tau2=.04, loss_kind="raw")
 
 
 class SolverClassTests(unittest.TestCase):
@@ -683,8 +688,6 @@ class SolverClassTests(unittest.TestCase):
         self.assertIsInstance(promoted, LBFGSOptions)
         self.assertEqual(promoted.max_iterations, 3)
         self.assertEqual(promoted.memory, 10)
-        # Original OuterOptions third positional argument was memory.
-        legacy = OuterOptions(4, 80, 3, validate_final=False)
         converted = LBFGSOptimizer(objective, options=legacy).options
         self.assertEqual(asdict(converted), asdict(legacy))
         explicit = LBFGSOptions(memory=7, validate_final=False)
@@ -708,7 +711,7 @@ class SolverClassTests(unittest.TestCase):
             direct = LBFGSOptimizer(objective, options=options).optimize()
         self.assertEqual(validate.call_count, 1)
         self.assertIs(validate.call_args.args[0], direct.evaluation)
-        wrapped = optimize_gauge(engine, options=OuterOptions(**asdict(options)))
+        wrapped = optimize_gauge(engine, options=legacy)
         self.assertTrue(direct.converged)
         self.assertGreater(direct.iterations, 0)
         np.testing.assert_array_equal(direct.theta, wrapped.theta)
@@ -762,7 +765,7 @@ class SolverClassTests(unittest.TestCase):
 
 # Public solver-selection entry point
 
-import ipie.hamiltonians.optimize_cholesky as optimization
+import ipie.hamiltonians.optimize_cholesky.optimizers as optimization
 
 class SolverDispatchTests(unittest.TestCase):
     def test_default_and_explicit_lbfgs_are_identical(self):

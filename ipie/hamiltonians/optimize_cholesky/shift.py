@@ -125,7 +125,7 @@ def shift_profiles(blocks, overlap, one_body, root_scales, lower):
     return tuple(result)
 
 
-def shift_coefficients(decomposition, *, loss_kind="raw", one_body_limit=None):
+def shift_coefficients(decomposition, *, loss_kind="weighted", one_body_limit=None):
     """Standalone exact mu profiles at a fixed decomposition (all t fixed)."""
     if not isinstance(decomposition, FixedDecomposition):
         raise TypeError("decomposition must be a FixedDecomposition")
@@ -136,7 +136,7 @@ def shift_coefficients(decomposition, *, loss_kind="raw", one_body_limit=None):
                           shift_bounds(decomposition.one_body, one_body_limit))
 
 
-def optimal_shift(decomposition, *, loss_kind="raw", one_body_limit=None):
+def optimal_shift(decomposition, *, loss_kind="weighted", one_body_limit=None):
     """(mu_up, mu_down) minimizing the loss at fixed t; absent spins keep their value."""
     shift = list(shift_pair(decomposition.one_body.shift))
     for profile in shift_coefficients(decomposition, loss_kind=loss_kind,

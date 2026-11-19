@@ -33,18 +33,14 @@ import unittest
 import numpy as np
 
 from ipie.hamiltonians.bitstring_utils import get_all_configs_u11
-from ipie.hamiltonians.optimize_cholesky import (
-    GaugeEvaluator,
-    InnerOptions,
-    LBFGSOptions,
-    build_fixed_decomposition,
-    build_gauge_state,
-    commutator_loss,
-    optimize_gauge,
-    optimize_partitions,
-    prepare_problem,
-    with_shift,
-)
+from ipie.hamiltonians.optimize_cholesky.gradients import GaugeEvaluator
+from ipie.hamiltonians.optimize_cholesky.models import InnerOptions, LBFGSOptions
+from ipie.hamiltonians.optimize_cholesky.channels import build_fixed_decomposition
+from ipie.hamiltonians.optimize_cholesky.problem import build_gauge_state, prepare_problem
+from ipie.hamiltonians.optimize_cholesky.loss import commutator_loss
+from ipie.hamiltonians.optimize_cholesky.optimizers import optimize_gauge
+from ipie.hamiltonians.optimize_cholesky.partitions import optimize_partitions
+from ipie.hamiltonians.optimize_cholesky.shift import with_shift
 from ipie.hamiltonians.optimize_cholesky.tests.test_channels import (
     check_norm,
     example_tensors,
@@ -371,7 +367,7 @@ class FileFormatTests(TemporaryFiles, unittest.TestCase):
 
     def test_partition_result_records_its_settings(self):
         _, decomposition = fixture((2, 1))
-        inner = optimize_partitions(decomposition, loss_kind="weighted", optimize_shift=True, max_sweeps=500)
+        inner = optimize_partitions(decomposition, InnerOptions(optimize_shift=True, max_sweeps=500), loss_kind="weighted")
         attrs = file_attrs(self.saved(inner, name="inner.h5"))
         self.assertEqual(attrs["provenance"]["source_type"], "PartitionOptimizationResult")
         self.assertEqual(attrs["provenance"]["inner"]["status"], inner.status)
@@ -484,9 +480,10 @@ class QCSORFromFileTests(TemporaryFiles, unittest.TestCase):
                 with redirect_stdout(buffer):
                     compute_total_commutativity(ham)
                 printed = dict(line.split("=", 1) for line in buffer.getvalue().split("\n") if "=" in line)
-                reference = commutator_loss(decomposition, loss_kind="weighted")
+                reference = commutator_loss(decomposition)
                 np.testing.assert_allclose(float(printed["comm2"]), reference.comm2, rtol=1e-11)
-                np.testing.assert_allclose(float(printed["weighted_comm2"]), reference.objective, rtol=1e-11)
+                np.testing.assert_allclose(float(printed["weighted_comm2"]), reference.weighted_comm2_unnormalized,
+                                           rtol=1e-11)
 
     def test_local_energy_inputs_and_spin_resolved_bases(self):
         for shift, expected in (((.05, .05), 1), ((.05, -.03), 2)):

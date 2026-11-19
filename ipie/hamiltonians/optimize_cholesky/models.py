@@ -2,6 +2,7 @@
 
 from dataclasses import asdict, dataclass
 import math
+import warnings
 from numbers import Integral, Real
 from typing import Optional, Tuple
 
@@ -302,14 +303,11 @@ class CommutatorLoss:
     weighted_mean                  weighted_comm2/weight; None if weight=0
     weighted_comm2_unnormalized    L_w = sum_{i<j} a_i a_j ||[u_i,u_j]||_F^2, always with
                                    the stored a_i, independent of weights_normalized
-    loss_kind, objective           the selected objective: comm2 for 'raw',
-                                   weighted_comm2_unnormalized for 'weighted'
 
     The normalized weighted_comm2 equals L_w/denom**2; weighted_mean is the
     same in both normalizations. weighted_mean=None means weight=0, e.g. a
-    one-channel decomposition with no unordered pairs. The three appended
-    fields default to None/'raw' so records built with the original six
-    positional fields remain valid.
+    one-channel decomposition with no unordered pairs. The optimized
+    objective alone comes from loss.objective_loss.
     """
 
     comm2: float
@@ -319,15 +317,6 @@ class CommutatorLoss:
     pair_count: int
     weights_normalized: bool
     weighted_comm2_unnormalized: Optional[float] = None
-    loss_kind: str = "raw"
-    objective: Optional[float] = None
-
-    def __post_init__(self):
-        if not isinstance(self.loss_kind, str) or self.loss_kind not in LOSS_KINDS:
-            raise ValueError(f"loss_kind must be one of {LOSS_KINDS}; got {self.loss_kind!r}")
-        expected = self.comm2 if self.loss_kind == "raw" else self.weighted_comm2_unnormalized
-        if self.objective is not None and expected is not None and self.objective != expected:
-            raise ValueError("objective must equal the field selected by loss_kind")
 
     def as_dict(self):
         return asdict(self)
@@ -502,7 +491,7 @@ class PartitionOptimizationResult:
     status: str
     amplitude_limit: Optional[float] = None
     max_abs_t: float = 30.0
-    loss_kind: str = "raw"
+    loss_kind: str = "weighted"
     optimize_shift: bool = False
     shift_bounds: Optional[Tuple[Optional[float], Optional[float]]] = None
     shift_gradient: Optional[Tuple[float, float]] = None
@@ -588,9 +577,6 @@ class GaugeGradient:
     bound_correction_O: np.ndarray
     partition_gradient: np.ndarray
     eigenvalue_gradient: np.ndarray
-    eigenvector_gradient: np.ndarray
-    rotated_cholesky_gradient: np.ndarray
-    normalized_partitions: Optional[np.ndarray] = None
     inner_result: Optional[PartitionOptimizationResult] = None
 
 
@@ -741,38 +727,6 @@ class LBFGSOptions(OptimizerOptions):
 
 
 @dataclass(frozen=True)
-class OuterOptions:
-    """Legacy L-BFGS configuration; new code can use LBFGSOptions.
-
-    The original field order and constructor remain available. This legacy
-    record is accepted by LBFGSOptimizer and optimize_gauge, and converted
-    into LBFGSOptions. The solver-independent parent uses OptimizerOptions.
-    """
-
-    max_iterations: int = 100
-    max_evaluations: int = 1000
-    memory: int = 10
-    gradient_atol: float = 1e-8
-    gradient_rtol: float = 1e-6
-    initial_step: float = 1.0
-    backtrack: float = 0.5
-    armijo: float = 1e-4
-    max_line_search: int = 25
-    min_step: float = 1e-12
-    max_step_norm: float = 1.0
-    curvature_rtol: float = 1e-10
-    validate_final: bool = True
-    verbosity: int = 0
-    line_search: str = "armijo"
-    wolfe_c2: float = 0.9
-    wolfe_max_step_norm: float = math.pi
-
-    def __post_init__(self):
-        _validate_optimizer_options(self)
-        _validate_lbfgs_options(self)
-
-
-@dataclass(frozen=True)
 class ExponentialEvaluation:
     """Matching parameters, reduced loss, gradient and converged inner snapshot."""
 
@@ -819,23 +773,12 @@ class OptimizerIteration:
 
 
 @dataclass(frozen=True)
-class OuterIteration:
-    """L-BFGS accepted-state diagnostics, retaining the step-6 record layout."""
+class OuterIteration(OptimizerIteration):
+    """L-BFGS accepted-state diagnostics: the common record plus L-BFGS fields."""
 
-    iteration: int
-    loss: float
-    gradient_norm: float
-    tangent_gradient_norm: float
-    step_size: float
-    step_norm: float
-    loss_decrease: float
-    inner_sweeps: int
-    inner_projected_gradient_norm: float
-    line_search_trials: int
-    curvature_update: bool
-    memory_size: int
+    curvature_update: bool = False
+    memory_size: int = 0
     acceptance: str = ""
-    shift: Optional[Tuple[float, float]] = None
 
 
 @dataclass(frozen=True)

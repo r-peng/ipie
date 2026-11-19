@@ -4,10 +4,12 @@ import json
 import unittest
 import numpy as np
 import tempfile
-from ipie.hamiltonians.optimize_cholesky import (
+from ipie.hamiltonians.optimize_cholesky.models import (
     Channel,
     TensorData,
     ValidationOptions,
+)
+from ipie.hamiltonians.optimize_cholesky.problem import (
     build_gauge_state,
     prepare_problem,
     validate_inputs,

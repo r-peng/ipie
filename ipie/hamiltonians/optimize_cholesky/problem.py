@@ -150,15 +150,17 @@ def validate_inputs(data, options=None):
     return _require_report(ValidationReport(checks, options))
 
 
-def validate_gauge_state(data, state, options=None):
+def validate_gauge_state(data, state, options=None, *, input_report=None):
     """Check a state against original tensors, independently of its diagnostics.
 
     Verifies O.T@O, the specified rotation, eigen reconstruction and X.T@X,
     rotated ERIs versus supplied ERIs, direct ERI gauge invariance, and
     invariance of sum_gamma L_gamma@L_gamma. Degeneracies are allowed.
+    input_report: the validate_inputs report of the same data (for example
+    PreparedProblem.report); when given, the input checks are not repeated.
     """
     options = _options(options)
-    original_report = validate_inputs(data, options)
+    original_report = validate_inputs(data, options) if input_report is None else input_report
     _, eri, original = _tensor_arrays(data, options)
     r, n, _ = original.shape
     O = _gauge_array(state.O, r, options)

@@ -12,14 +12,14 @@ C + A exp(2t) + B exp(-2t) form.
 
 from dataclasses import replace
 import math
-from numbers import Integral, Real
+from numbers import Integral
 
 import numpy as np
 
-from .channels import fixed_partition_amplitudes, positive_scale
+from .channels import _source_channels, fixed_partition_amplitudes, positive_scale
 from .models import (
-    Channel, 
-    FixedDecomposition, 
+    FixedDecomposition,
+    InnerOptions, 
     PartitionCoefficients, 
     GaugeFeasibilityError,
     PartitionOptimizationResult, 
@@ -27,6 +27,7 @@ from .models import (
 )
 from .loss import OverlapEvaluator, commutator_norm2, loss_kind_name
 from .problem import _real_array
+from .channels import shift_pair
 from .shift import (
     check_one_body_shift,
     one_body_limit_value,
@@ -40,24 +41,6 @@ from .shift import (
 def _readonly(array):
     result = np.array(array, dtype=np.float64, copy=True)
     result.setflags(write=False)
-    return result
-
-
-def _source_channels(source, amplitudes, tau2):
-    """Canonical branch order used by build_two_body_channels."""
-    left, right = amplitudes
-    if source.kind == "two_branch":
-        branches = ((source.spins, 1.0), (source.spins, -1.0))
-        weight = 0.5/tau2
-    elif source.kind == "spin_quartet" and source.modes[0] != source.modes[1]:
-        branches = (((0,0), 1.0), ((0,1), -1.0), ((1,0), -1.0), ((1,1), 1.0))
-        weight = 1.0/tau2
-    else:
-        raise ValueError("Unsupported source kind/modes for partition optimization")
-    result = tuple(Channel(source.bix, spins, weight, source.modes,
-                           (sign*left, sign*right)) for spins, sign in branches)
-    if any(c.spins[0] == c.spins[1] and c.modes[0] == c.modes[1] for c in result):
-        raise ValueError("Source legs must be distinct spin-orbital modes")
     return result
 
 
@@ -94,6 +77,11 @@ def with_partitions(decomposition, t):
     the original input/ERI checks. The input snapshot is never modified.
     """
     _validate_partition_state(decomposition)
+    return _with_partitions(decomposition, t)
+
+
+def _with_partitions(decomposition, t):
+    """with_partitions without re-checking the input decomposition."""
     two = decomposition.two_body
     ratios, amplitudes = fixed_partition_amplitudes(
         two.gauge.eigenvalues, two.sources, two.tau2, t,
@@ -208,15 +196,22 @@ def projected_partition_gradient(t, gradient, bounds):
 class _PartitionWorkspace:
     """Private mutable amplitudes/blocks; public input/evaluator stay fixed."""
 
-    def __init__(self, decomposition, loss_kind="raw"):
-        t, amplitudes = _validate_partition_state(decomposition)
+    def __init__(self, decomposition, loss_kind="weighted", *, check=True):
+        """check=False trusts the decomposition (built by GaugeEvaluator)."""
+        if check:
+            t, amplitudes = _validate_partition_state(decomposition)
+            shift = check_one_body_shift(decomposition.one_body)
+        else:
+            t, amplitudes = decomposition.two_body.t, decomposition.two_body.amplitudes
+            shift = shift_pair(decomposition.one_body.shift)
         self.decomposition = decomposition
         self.two = decomposition.two_body
         self.one_body = decomposition.one_body
-        self.shift = list(check_one_body_shift(self.one_body))
+        self.shift = list(shift)
         self.shift_changed = False
-        self.t, self.amplitudes = t.copy(), amplitudes.copy()
-        self.evaluator = OverlapEvaluator(decomposition, loss_kind=loss_kind)
+        self.t = np.array(t, dtype=np.float64, copy=True)
+        self.amplitudes = np.array(amplitudes, dtype=np.float64, copy=True)
+        self.evaluator = OverlapEvaluator(decomposition, loss_kind=loss_kind, check=check)
         self.loss_kind = self.evaluator.loss_kind
         self.root_scales = self.evaluator.root_scales
         self.blocks = list(self.evaluator.blocks)
@@ -305,11 +300,11 @@ class _PartitionWorkspace:
         self.shift_changed = True
 
     def snapshot(self):
-        result = with_partitions(self.decomposition, self.t)
+        result = _with_partitions(self.decomposition, self.t)
         return with_shift(result, tuple(self.shift)) if self.shift_changed else result
 
 
-def partition_coefficients(decomposition, source_index=None, *, loss_kind="raw"):
+def partition_coefficients(decomposition, source_index=None, *, loss_kind="weighted"):
     """A_i,B_i,C_i for one source, or a tuple for all sources.
 
     Other t's are held at their CURRENT values. The sums include every
@@ -328,24 +323,24 @@ def partition_coefficients(decomposition, source_index=None, *, loss_kind="raw")
     return workspace.coefficients(source_index)
 
 
-def _tolerance(value, name):
-    if isinstance(value, (bool, np.bool_)) or not isinstance(value, Real) or not np.isfinite(value) or value < 0:
-        raise ValueError(f"{name} must be a finite nonnegative real scalar")
-    return float(value)
+def _inner_options(options):
+    if options is None:
+        return InnerOptions()
+    if not isinstance(options, InnerOptions):
+        raise TypeError("options must be InnerOptions")
+    return options
 
 
-def optimize_partitions(decomposition, *, max_sweeps=100,
-                        gradient_atol=1e-10, gradient_rtol=1e-8,
-                        amplitude_limit=None, max_abs_t=30.0, loss_kind="raw",
-                        optimize_shift=False, one_body_limit=None,
-                        shift_atol=0.0, shift_rtol=1e-8):
+def optimize_partitions(decomposition, options=None, *, loss_kind="weighted"):
     """Sequential exact coordinate updates, at a fixed Cholesky gauge.
 
-    loss_kind selects L_raw ('raw') or the unnormalized L_w ('weighted').
-    Stop only when ||projected_gradient_t||_inf <= gradient_atol +
-    gradient_rtol*initial_projected_gradient_norm, evaluated AFTER a full
-    sweep with every other coordinate at its latest value. max_sweeps=0
-    checks the input without updating it. Loss changes are diagnostics.
+    options: InnerOptions (defaults when None), the same settings the outer
+    optimizer uses. loss_kind selects the unnormalized L_w ('weighted', default)
+    or L_raw ('raw'). Stop only when ||projected_gradient_t||_inf <=
+    gradient_atol + gradient_rtol*initial_projected_gradient_norm, evaluated
+    AFTER a full sweep with every other coordinate at its latest value.
+    max_sweeps=0 checks the input without updating it. Loss changes are
+    diagnostics.
 
     optimize_shift=True also relaxes (mu_up, mu_down). mu is first set to its
     exact minimizer mu*(t0) (so no mu seed enters), and each sweep updates all
@@ -357,24 +352,33 @@ def optimize_partitions(decomposition, *, max_sweeps=100,
     requires particle numbers on the decomposition.
 
     A maximum-sweep exit returns converged=False, status='max_sweeps'; it
-    is not silently treated as convergence. This is a reference coordinate
-    solver, not an outer gauge optimizer.
+    is not silently treated as convergence. The decomposition is checked once
+    here; GaugeEvaluator, which builds its own, skips the check.
     """
-    if isinstance(max_sweeps, (bool, np.bool_)) or not isinstance(max_sweeps, Integral) or max_sweeps < 0:
-        raise ValueError("max_sweeps must be a nonnegative integer")
-    atol = _tolerance(gradient_atol, "gradient_atol")
-    rtol = _tolerance(gradient_rtol, "gradient_rtol")
+    options = _inner_options(options)
     loss_kind = loss_kind_name(loss_kind)
-    if not isinstance(optimize_shift, (bool, np.bool_)):
-        raise ValueError("optimize_shift must be boolean")
-    optimize_shift = bool(optimize_shift)
+    _validate_partition_state(decomposition)
+    check_one_body_shift(decomposition.one_body)
+    return _solve_partitions(decomposition, options, loss_kind)
+
+
+def _solve_partitions(decomposition, options, loss_kind):
+    """optimize_partitions on a trusted decomposition with checked options."""
+    max_sweeps = options.max_sweeps
+    atol, rtol = float(options.gradient_atol), float(options.gradient_rtol)
+    amplitude_limit, max_abs_t = options.amplitude_limit, options.max_abs_t
+    optimize_shift, one_body_limit = bool(options.optimize_shift), options.one_body_limit
+    shift_atol, shift_rtol = options.shift_atol, options.shift_rtol
     rho1 = one_body_limit_value(one_body_limit)
     lower = shift_bounds(decomposition.one_body, rho1)
     shift_tol = shift_tolerance(decomposition.one_body.eigenvalues, shift_atol, shift_rtol)
     if optimize_shift and decomposition.two_body.nelec is None:
         raise ValueError("optimize_shift requires particle numbers: pass nelec to prepare_problem")
-    bounds = partition_bounds(decomposition, amplitude_limit=amplitude_limit, max_abs_t=max_abs_t)
-    workspace = _PartitionWorkspace(decomposition, loss_kind)
+    two = decomposition.two_body
+    bounds = _partition_intervals(two.gauge.eigenvalues, two.sources, two.tau2, two.partition,
+                                  two.amplitude_bound, amplitude_limit=amplitude_limit,
+                                  max_abs_t=max_abs_t)
+    workspace = _PartitionWorkspace(decomposition, loss_kind, check=False)
     if np.any(workspace.t < bounds[:,0]) or np.any(workspace.t > bounds[:,1]):
         raise ValueError("Initial t lies outside the optimizer bounds; use feasible initial partitions "
                          "or increase amplitude_limit/max_abs_t")

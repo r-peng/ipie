@@ -7,25 +7,24 @@ import unittest
 
 import numpy as np
 
-from ipie.hamiltonians.optimize_cholesky import (
+from ipie.hamiltonians.optimize_cholesky.models import (
     ExponentialEvaluation,
-    GaugeEvaluator,
     GaugeRegularityError,
-    LBFGSOptimizer,
     LBFGSOptions,
-    OuterOptions,
-    build_fixed_decomposition,
+)
+from ipie.hamiltonians.optimize_cholesky.gradients import GaugeEvaluator
+from ipie.hamiltonians.optimize_cholesky.optimizers import LBFGSOptimizer, optimize_gauge
+from ipie.hamiltonians.optimize_cholesky.channels import build_fixed_decomposition
+from ipie.hamiltonians.optimize_cholesky.problem import (
     build_gauge_state,
     near_zero_eigenvalues,
-    optimize_gauge,
     prepare_problem,
 )
-from ipie.hamiltonians.optimize_cholesky.optimizers import _minimize_exponential
 from ipie.hamiltonians.optimize_cholesky.tests.test_channels import (
     check_hamiltonian,
     example_tensors,
 )
-from ipie.hamiltonians.optimize_cholesky.tests.test_optimizers import QuadraticOracle, readonly
+from ipie.hamiltonians.optimize_cholesky.tests.test_optimizers import QuadraticOracle, readonly, run_lbfgs
 
 
 WOLFE = dict(line_search="weak_wolfe", validate_final=False)
@@ -69,14 +68,13 @@ class WeakWolfeOptionTests(unittest.TestCase):
         self.assertEqual(LBFGSOptions().line_search, "armijo")
         self.assertEqual(LBFGSOptions().wolfe_c2, .9)
         self.assertEqual(LBFGSOptions().wolfe_max_step_norm, math.pi)
-        legacy = OuterOptions(4, 80, 3, line_search="weak_wolfe", wolfe_c2=.5, validate_final=False)
         converted = LBFGSOptimizer(QuadraticOracle([[1.]], [2.]), options=legacy).options
         self.assertEqual(asdict(converted), asdict(legacy))
         self.assertEqual((converted.max_iterations, converted.max_evaluations, converted.memory), (4, 80, 3))
         for kwargs in ({"line_search": "wolfe"}, {"wolfe_c2": 1e-4}, {"wolfe_c2": 1.},
                        {"armijo": .5, "wolfe_c2": .4}, {"wolfe_max_step_norm": .5},
                        {"wolfe_max_step_norm": math.inf}):
-            for constructor in (LBFGSOptions, OuterOptions):
+            for constructor in (LBFGSOptions, ):
                 with self.subTest(constructor=constructor.__name__, kwargs=kwargs), \
                         self.assertRaises(ValueError):
                     constructor(**kwargs)
@@ -87,7 +85,7 @@ class WeakWolfeControlledTests(unittest.TestCase):
         oracle = QuadraticOracle([[4., 1.], [1., 3.]], [.3, -.4])
         options = LBFGSOptions(max_iterations=80, memory=4, max_step_norm=.75,
                                gradient_atol=1e-9, gradient_rtol=0, **WOLFE)
-        result = _minimize_exponential(oracle, [1.2, .8], options)
+        result = run_lbfgs(oracle, [1.2, .8], options)
         self.assertEqual(result.status, "converged")
         np.testing.assert_allclose(result.theta, oracle.target, atol=1e-8, rtol=0)
         self.assertTrue(all(row.curvature_update for row in result.history[1:]))
@@ -107,7 +105,7 @@ class WeakWolfeControlledTests(unittest.TestCase):
 
     def test_kinked_minimizer_is_reached_where_gradient_tests_cannot_pass(self):
         oracle = kinked_oracle()
-        result = _minimize_exponential(oracle, [.7, -.4], LBFGSOptions(max_iterations=200, **WOLFE))
+        result = run_lbfgs(oracle, [.7, -.4], LBFGSOptions(max_iterations=200, **WOLFE))
         self.assertLess(result.loss, 1e-8)
         self.assertLess(abs(result.theta[0]), 1e-8)
         self.assertAlmostEqual(result.theta[1], .5, delta=1e-4)
@@ -131,7 +129,7 @@ class WeakWolfeControlledTests(unittest.TestCase):
         fmin = (x1-.5)**2 + .05*x1**2
         for start in ([.9, -.6], [-.5, 1.2], [1.5, .2]):
             with self.subTest(start=start):
-                result = _minimize_exponential(FunctionOracle(f, g, 2), start,
+                result = run_lbfgs(FunctionOracle(f, g, 2), start,
                                                LBFGSOptions(max_iterations=300, **WOLFE))
                 self.assertLess(result.loss-fmin, 1e-9)
                 np.testing.assert_allclose(result.theta, [x1**2, x1], atol=1e-4)
@@ -143,7 +141,7 @@ class WeakWolfeControlledTests(unittest.TestCase):
             with self.subTest(cap=cap):
                 oracle = QuadraticOracle([[.002]], [10.])
                 options = LBFGSOptions(max_iterations=1, wolfe_c2=.5, wolfe_max_step_norm=cap, **WOLFE)
-                result = _minimize_exponential(oracle, [0.], options)
+                result = run_lbfgs(oracle, [0.], options)
                 np.testing.assert_allclose([trial.step_size for trial in result.trials], alphas)
                 self.assertEqual([trial.accepted for trial in result.trials].count(True), 1)
                 self.assertEqual(result.history[1].acceptance, acceptance)
@@ -154,7 +152,7 @@ class WeakWolfeControlledTests(unittest.TestCase):
         oracle = QuadraticOracle([[.002]], [10.])
         options = LBFGSOptions(max_iterations=1, max_line_search=2, wolfe_c2=.5,
                                wolfe_max_step_norm=20., **WOLFE)
-        result = _minimize_exponential(oracle, [0.], options)
+        result = run_lbfgs(oracle, [0.], options)
         self.assertEqual([trial.reason for trial in result.trials],
                          ["insufficient_curvature", "armijo_only"])
         self.assertEqual(result.history[1].acceptance, "armijo_only")
@@ -165,7 +163,7 @@ class WeakWolfeControlledTests(unittest.TestCase):
             if theta[0] > .75:
                 raise GaugeRegularityError("controlled invalid large trial")
         oracle = QuadraticOracle([[1.]], [.6], failure=failure)
-        result = _minimize_exponential(oracle, [0.], LBFGSOptions(max_iterations=40, gradient_atol=1e-10,
+        result = run_lbfgs(oracle, [0.], LBFGSOptions(max_iterations=40, gradient_atol=1e-10,
                                                                   gradient_rtol=0, **WOLFE))
         self.assertEqual(result.status, "converged")
         np.testing.assert_allclose(result.theta, [.6], atol=1e-9)
@@ -177,7 +175,7 @@ class WeakWolfeControlledTests(unittest.TestCase):
 
     def test_no_decreasing_trial_fails_without_replacing_state(self):
         oracle = QuadraticOracle([[1000.]], [.03])
-        result = _minimize_exponential(oracle, [0.], LBFGSOptions(max_iterations=3, max_line_search=1,
+        result = run_lbfgs(oracle, [0.], LBFGSOptions(max_iterations=3, max_line_search=1,
                                                                   **WOLFE))
         self.assertEqual(result.status, "line_search_failed")
         self.assertIn("Weak-Wolfe", result.message)
@@ -186,7 +184,7 @@ class WeakWolfeControlledTests(unittest.TestCase):
 
     def test_budget_during_search_preserves_initial_point(self):
         oracle = QuadraticOracle([[1000.]], [.03])
-        result = _minimize_exponential(oracle, [0.], LBFGSOptions(max_iterations=3, max_evaluations=2,
+        result = run_lbfgs(oracle, [0.], LBFGSOptions(max_iterations=3, max_evaluations=2,
                                                                   max_line_search=10, **WOLFE))
         self.assertEqual(result.status, "max_evaluations")
         self.assertEqual(result.iterations, 0)
@@ -221,9 +219,9 @@ class WeakWolfePhysicalTests(unittest.TestCase):
         chol[0] += .8*np.eye(2)
         eri = np.einsum("gpr,gqs->prqs", chol, chol)
         problem = prepare_problem(h, eri, chol, nelec=(1, 1))
-        engine = GaugeEvaluator(problem, tau1=.2, tau2=.04)
-        armijo = optimize_gauge(engine, options=OuterOptions(max_iterations=4))
-        wolfe = optimize_gauge(engine, options=OuterOptions(max_iterations=4, line_search="weak_wolfe"))
+        engine = GaugeEvaluator(problem, tau1=.2, tau2=.04, loss_kind="raw")
+        armijo = optimize_gauge(engine, options=LBFGSOptions(max_iterations=4))
+        wolfe = optimize_gauge(engine, options=LBFGSOptions(max_iterations=4, line_search="weak_wolfe"))
         self.assertLess(wolfe.loss, .9*wolfe.initial_loss)
         self.assertEqual(wolfe.initial_loss, armijo.initial_loss)
         self.assertTrue(all(row.acceptance in ("weak_wolfe", "armijo_only", "expansion_capped")

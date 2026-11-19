@@ -16,7 +16,6 @@ from .models import (
     InnerOptions,
     LBFGSOptions,
     OuterIteration,
-    OuterOptions,
     OuterOptimizationResult,
 )
 from .gradients import exponential_gauge_vjp, GaugeEvaluator
@@ -264,9 +263,6 @@ class OuterOptimizer(ABC):
 
 # Fixed exponential objective and cached nested evaluations
 
-_TRIAL_ERRORS = RECOVERABLE_TRIAL_ERRORS
-
-
 class ExponentialGaugeObjective:
     """Reduced value/gradient oracle with one immutable coordinate reference.
 
@@ -336,19 +332,18 @@ class ExponentialGaugeObjective:
         inner = None
         try:
             O = exponential_gauge(theta,self.nchol,self.reference)
-            derivative = self.evaluator.relaxed(O,t0=self.inner_t0,**asdict(self.inner_options))
+            derivative = self.evaluator.relaxed(O,t0=self.inner_t0,options=self.inner_options)
             inner = derivative.inner_result
             if inner is None or not inner.converged:
                 raise InnerConvergenceError("Outer objective requires a converged inner snapshot",inner)
-            gradient = exponential_gauge_vjp(theta,self.nchol,derivative.gradient_O,
-                                              self.reference,backend=self.evaluator.backend)
+            gradient = exponential_gauge_vjp(theta,self.nchol,derivative.gradient_O,self.reference)
             if (not np.isfinite(derivative.loss) or not np.isfinite(gradient).all()
                     or not np.isfinite(derivative.tangent_gradient).all()):
                 raise FloatingPointError("Nonfinite outer value or coordinate gradient")
             point = ExponentialEvaluation(_readonly(theta),_readonly(gradient),derivative)
             if not math.isfinite(point.tangent_gradient_norm):
                 raise FloatingPointError("Nonfinite physical tangent-gradient norm")
-        except _TRIAL_ERRORS as exc:
+        except RECOVERABLE_TRIAL_ERRORS as exc:
             self.failed_evaluations += 1
             if inner is None:
                 inner = getattr(exc,"inner_result",None)
@@ -368,9 +363,9 @@ class ExponentialGaugeObjective:
 
     def validate(self,point):
         """Full final gauge/ERI check, called outside the optimizer loops."""
-        return validate_gauge_state(
-            self.evaluator.problem.data,point.decomposition.two_body.gauge,
-            self.evaluator.problem.report.options)
+        problem = self.evaluator.problem
+        return validate_gauge_state(problem.data,point.decomposition.two_body.gauge,
+                                    problem.report.options,input_report=problem.report)
 
 
 
@@ -396,9 +391,9 @@ def _coerce_lbfgs_options(options):
         return LBFGSOptions()
     if isinstance(options, LBFGSOptions):
         return options
-    if isinstance(options, (OptimizerOptions, OuterOptions)):
+    if isinstance(options, OptimizerOptions):
         return LBFGSOptions(**asdict(options))
-    raise TypeError("options must be LBFGSOptions, OptimizerOptions or legacy OuterOptions")
+    raise TypeError("options must be LBFGSOptions or OptimizerOptions")
 
 
 def _lbfgs_direction(gradient, pairs):
@@ -695,24 +690,13 @@ class GDMOptimizer(OuterOptimizer):
 
 # Solver selection and compatibility entry points
 
-def _minimize_exponential(objective,theta0,options,callback=None):
-    """Legacy private driver; final validation remains the caller's responsibility.
-
-    Kept for the step-6 controlled tests and existing private callers. New
-    code should construct LBFGSOptimizer and use optimize() directly.
-    """
-    options = replace(_coerce_lbfgs_options(options),validate_final=False)
-    return LBFGSOptimizer(objective,options=options).optimize(theta0,callback=callback)
-
-
-
 def optimize_gauge(evaluator,*,theta0=None,reference=None,inner_t0=None,
                     inner_options=None,options=None,callback=None,solver="lbfgs"):
     """Select an outer solver; L-BFGS uses fixed-exponential nested relaxation.
 
     New code can construct ExponentialGaugeObjective and LBFGSOptimizer
-    explicitly. options accepts LBFGSOptions, common OptimizerOptions or the
-    legacy OuterOptions. solver='gdm' is reserved and raises NotImplementedError
+    explicitly. options accepts LBFGSOptions or common OptimizerOptions. 
+    solver='gdm' is reserved and raises NotImplementedError
     before objective construction. Solver selection lives outside the parent.
 
     callback(record) receives initial/accepted scalar diagnostics. Raising

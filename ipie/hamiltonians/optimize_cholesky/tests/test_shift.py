@@ -8,26 +8,32 @@ from scipy.linalg import expm
 from scipy.optimize import minimize_scalar
 
 from ipie.hamiltonians.bitstring_utils import get_all_configs_u11
-from ipie.hamiltonians.optimize_cholesky import (
+from ipie.hamiltonians.optimize_cholesky.gradients import (
     GaugeEvaluator,
+    check_gauge_direction,
+    relaxed_gauge_gradient,
+)
+from ipie.hamiltonians.optimize_cholesky.models import InnerOptions
+from ipie.hamiltonians.optimize_cholesky.models import (
     InnerConvergenceError,
     InnerOptions,
     LBFGSOptions,
-    build_fixed_decomposition,
+)
+from ipie.hamiltonians.optimize_cholesky.channels import build_fixed_decomposition, build_one_body_channels
+from ipie.hamiltonians.optimize_cholesky.problem import (
     build_gauge_state,
-    build_one_body_channels,
-    check_gauge_direction,
     exponential_gauge,
-    objective_loss,
-    optimal_shift,
-    optimize_gauge,
-    optimize_partitions,
     prepare_problem,
-    relaxed_gauge_gradient,
+)
+from ipie.hamiltonians.optimize_cholesky.loss import objective_loss
+from ipie.hamiltonians.optimize_cholesky.shift import (
+    optimal_shift,
     shift_bounds,
     shift_coefficients,
     with_shift,
 )
+from ipie.hamiltonians.optimize_cholesky.optimizers import optimize_gauge
+from ipie.hamiltonians.optimize_cholesky.partitions import optimize_partitions
 from ipie.hamiltonians.optimize_cholesky.tests.test_channels import (
     check_norm,
     example_tensors,
@@ -68,7 +74,7 @@ class ShiftChannelTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             build_one_body_channels(up_only, .03, (.3, .1))
         with self.assertRaises(ValueError):
-            GaugeEvaluator(no_counts, tau1=.03, tau2=.04, shift=(.1, 0.))
+            GaugeEvaluator(no_counts, tau1=.03, tau2=.04, shift=(.1, 0.), loss_kind="raw")
 
     def test_lambda_includes_mu_n_and_reconstructs_each_sector(self):
         h, eri, chol = example_tensors()
@@ -170,7 +176,7 @@ class ShiftProfileTests(unittest.TestCase):
 
 
 def with_partitions_t(decomposition, t):
-    from ipie.hamiltonians.optimize_cholesky import with_partitions
+    from ipie.hamiltonians.optimize_cholesky.partitions import with_partitions
     return with_partitions(decomposition, t)
 
 
@@ -179,8 +185,8 @@ class ShiftRelaxationTests(unittest.TestCase):
         for loss_kind in LOSSES:
             with self.subTest(loss_kind=loss_kind):
                 _, decomposition = fixture()
-                result = optimize_partitions(decomposition, loss_kind=loss_kind, optimize_shift=True,
-                                             gradient_atol=1e-12, gradient_rtol=0, max_sweeps=500)
+                result = optimize_partitions(decomposition, InnerOptions(optimize_shift=True, gradient_atol=1e-12,
+                                             gradient_rtol=0, max_sweeps=500), loss_kind=loss_kind)
                 self.assertTrue(result.converged)
                 self.assertTrue(result.optimize_shift)
                 self.assertLessEqual(result.initial_loss, result.input_loss)
@@ -198,9 +204,9 @@ class ShiftRelaxationTests(unittest.TestCase):
 
     def test_the_input_shift_is_not_a_seed(self):
         _, decomposition = fixture()
-        first = optimize_partitions(decomposition, loss_kind="weighted", optimize_shift=True, max_sweeps=500)
-        second = optimize_partitions(with_shift(decomposition, (.2, -.1)), loss_kind="weighted",
-                                     optimize_shift=True, max_sweeps=500)
+        first = optimize_partitions(decomposition, InnerOptions(optimize_shift=True, max_sweeps=500), loss_kind="weighted")
+        second = optimize_partitions(with_shift(decomposition, (.2, -.1)),
+                                     InnerOptions(optimize_shift=True, max_sweeps=500), loss_kind="weighted")
         self.assertEqual(first.sweeps, second.sweeps)
         np.testing.assert_allclose(first.t, second.t, rtol=0, atol=1e-14)
         np.testing.assert_allclose(first.shift, second.shift, rtol=0, atol=1e-14)
@@ -213,12 +219,12 @@ class ShiftRelaxationTests(unittest.TestCase):
         gauge = build_gauge_state(problem.data, exponential_gauge([0.37], 2))
         decomposition = build_fixed_decomposition(problem, gauge, 1.0, .04, .1)
         lower = shift_bounds(decomposition.one_body, .05)
-        result = optimize_partitions(decomposition, optimize_shift=True, one_body_limit=.05,
-                                     gradient_atol=1e-12, gradient_rtol=0, max_sweeps=500)
+        result = optimize_partitions(decomposition, InnerOptions(optimize_shift=True, one_body_limit=.05,
+                                     gradient_atol=1e-12, gradient_rtol=0, max_sweeps=500), loss_kind="raw")
         self.assertTrue(result.converged)
         self.assertEqual(result.shift, lower)
         self.assertEqual(result.shift_gradient, (0., 0.))
-        for p in shift_coefficients(result.decomposition, one_body_limit=.05):
+        for p in shift_coefficients(result.decomposition, one_body_limit=.05, loss_kind="raw"):
             self.assertGreater(p.gradient(), 0.)       # descent would leave the domain
             self.assertLess(p.optimum, p.lower)
         self.assertTrue(all(c.d >= -.05-1e-15 for c in result.decomposition.one_body.channels))
@@ -228,11 +234,11 @@ class ShiftRelaxationTests(unittest.TestCase):
         problem = prepare_problem(h, eri, chol)
         decomposition = build_fixed_decomposition(problem, build_gauge_state(problem.data), .03, .04)
         with self.assertRaises(ValueError):
-            optimize_partitions(decomposition, optimize_shift=True)
+            optimize_partitions(decomposition, InnerOptions(optimize_shift=True), loss_kind="raw")
 
     def test_up_only_sector_relaxes_only_mu_up(self):
         _, decomposition = fixture((2, 0))
-        result = optimize_partitions(decomposition, loss_kind="weighted", optimize_shift=True, max_sweeps=500)
+        result = optimize_partitions(decomposition, InnerOptions(optimize_shift=True, max_sweeps=500), loss_kind="weighted")
         self.assertTrue(result.converged)
         self.assertIsNone(result.shift_bounds[1])
         self.assertEqual(result.shift[1], 0.)
@@ -245,7 +251,7 @@ class ShiftRelaxationTests(unittest.TestCase):
         O = exponential_gauge([0.37], 2)
         K = np.array([[0., 1.], [-1., 0.]])
         check = check_gauge_direction(
-            lambda X: engine.relaxed(X, gradient_atol=1e-13, gradient_rtol=0, optimize_shift=True),
+            lambda X: engine.relaxed(X, options=InnerOptions(gradient_atol=1e-13, gradient_rtol=0, optimize_shift=True)),
             O, K, steps=(1e-4, 1e-5))
         self.assertLess(check.differences[-1].relative_error, 1e-6)
 
@@ -253,7 +259,7 @@ class ShiftRelaxationTests(unittest.TestCase):
         h, eri, chol = example_tensors()
         problem = prepare_problem(h, eri, chol, nelec=(2, 1))
         engine = GaugeEvaluator(problem, tau1=.03, tau2=.04, loss_kind="weighted")
-        good = engine.relaxed(exponential_gauge([0.37], 2), optimize_shift=True).inner_result
+        good = engine.relaxed(exponential_gauge([0.37], 2), options=InnerOptions(optimize_shift=True)).inner_result
         stale = with_shift(good.decomposition, tuple(mu+.01 for mu in good.shift))
         bad = replace(good, decomposition=stale, loss=objective_loss(stale, loss_kind="weighted"))
         with self.assertRaises(InnerConvergenceError):
@@ -269,7 +275,7 @@ class ShiftRelaxationTests(unittest.TestCase):
         self.assertEqual(result.history[-1].shift, result.decomposition.shift)
         self.assertTrue(result.partition_result.optimize_shift)
         self.assertTrue(all(m.passed for m in result.validation_report.checks.values()))
-        legacy = optimize_gauge(GaugeEvaluator(problem, tau1=.03, tau2=.04),
+        legacy = optimize_gauge(GaugeEvaluator(problem, tau1=.03, tau2=.04, loss_kind="raw"),
                                 options=LBFGSOptions(max_iterations=1))
         self.assertIsNone(legacy.history[-1].shift)
 

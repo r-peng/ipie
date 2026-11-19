@@ -240,9 +240,8 @@ cache holds matching theta, loss, gradient and inner snapshot. Do not mutate
 the underlying engine configuration while using an objective.
 
 `OptimizerOptions` contains common budgets, stopping and final validation.
-`LBFGSOptions` adds memory and line-search settings. Legacy `OuterOptions`, its
-positional field order, and existing default `optimize_gauge(...)` calls remain
-supported. `solver="lbfgs"` is the default. `solver="gdm"` raises
+`LBFGSOptions` adds memory and line-search settings. 
+`solver="lbfgs"` is the default. `solver="gdm"` raises
 `NotImplementedError` before objective construction; `GDMOptimizer` is also a
 concrete placeholder whose `optimize` raises before evaluation. No geometric
 GDM algorithm or Q-Chem-equivalent implementation is provided yet.
@@ -344,7 +343,7 @@ balanced map shows the same `|ell|` already at fixed `t`. For two orbitals with
 Nuclear norms reward rank-deficient factors, so minimizers typically lie ON
 kinks, where the gradient does not vanish and gradient tests cannot pass.
 
-`line_search="weak_wolfe"` (in `LBFGSOptions` or legacy `OuterOptions`) uses the
+`line_search="weak_wolfe"` (in `LBFGSOptions`) uses the
 Lewis-Overton bracketing search intended for such objectives. A trial is
 accepted when
 
@@ -374,7 +373,7 @@ which must be `<= wolfe_c2` for the curvature test to pass.
 ```python
 from ipie.hamiltonians.optimize_cholesky import near_zero_eigenvalues
 result = optimize_gauge(engine, theta0=theta,
-                        options=OuterOptions(max_iterations=200, line_search="weak_wolfe"),
+                        options=LBFGSOptions(max_iterations=200, line_search="weak_wolfe"),
                         inner_options=InnerOptions(max_sweeps=500, gradient_atol=1e-12,
                                                    gradient_rtol=0))
 print(result.status, result.loss)

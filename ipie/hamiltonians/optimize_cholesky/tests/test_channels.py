@@ -5,18 +5,20 @@ import itertools
 import unittest
 import numpy as np
 from ipie.hamiltonians.bitstring_utils import get_all_configs_u11, string_act
-from ipie.hamiltonians.optimize_cholesky import (
-    Channel,
+from ipie.hamiltonians.optimize_cholesky.models import Channel
+from ipie.hamiltonians.optimize_cholesky.channels import (
     build_fixed_decomposition,
-    build_gauge_state,
     build_one_body_channels,
     build_two_body_channels,
     enumerate_sources,
-    exponential_gauge,
     get_rotation_matrix,
+    two_body_rotation_matrix,
+)
+from ipie.hamiltonians.optimize_cholesky.problem import (
+    build_gauge_state,
+    exponential_gauge,
     givens_gauge,
     prepare_problem,
-    two_body_rotation_matrix,
 )
 
 
