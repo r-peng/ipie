@@ -21,7 +21,6 @@ reserved options that raise `NotImplementedError`; neither silently falls back.
 | `partitions.py` | Bounds, source-local coefficients, sequential analytic partition updates; `partition_coefficients`, `optimize_partitions` |
 | `gradients.py` | Derivative backend selection, elementary pullbacks, fixed/relaxed gauge derivatives and `GaugeEvaluator` |
 | `optimizers.py` | Exponential objective, solver-neutral parent, explicit L-BFGS child, GDM placeholder and `optimize_gauge` |
-| `__init__.py` | Stable package-level public imports; no numerical implementation |
 
 Read the files in the table's order: models, problem, channels, loss,
 shift, partitions, gradients, then optimizers. Each numerical layer builds on the

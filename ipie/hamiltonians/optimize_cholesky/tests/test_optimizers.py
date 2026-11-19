@@ -26,7 +26,7 @@ from ipie.hamiltonians.optimize_cholesky.optimizers import (
 from ipie.hamiltonians.optimize_cholesky.gradients import GaugeEvaluator, exponential_gauge_vjp
 from ipie.hamiltonians.optimize_cholesky.problem import exponential_gauge, prepare_problem
 from ipie.hamiltonians.optimize_cholesky.loss import raw_loss
-from dataclasses import FrozenInstanceError, asdict, dataclass, replace
+from dataclasses import FrozenInstanceError, dataclass, replace
 from ipie.hamiltonians.optimize_cholesky.tests.test_channels import (
     check_hamiltonian,
     example_tensors,
@@ -688,8 +688,6 @@ class SolverClassTests(unittest.TestCase):
         self.assertIsInstance(promoted, LBFGSOptions)
         self.assertEqual(promoted.max_iterations, 3)
         self.assertEqual(promoted.memory, 10)
-        converted = LBFGSOptimizer(objective, options=legacy).options
-        self.assertEqual(asdict(converted), asdict(legacy))
         explicit = LBFGSOptions(memory=7, validate_final=False)
         self.assertIs(LBFGSOptimizer(objective, options=explicit).options, explicit)
         with self.assertRaises(TypeError):
@@ -711,7 +709,7 @@ class SolverClassTests(unittest.TestCase):
             direct = LBFGSOptimizer(objective, options=options).optimize()
         self.assertEqual(validate.call_count, 1)
         self.assertIs(validate.call_args.args[0], direct.evaluation)
-        wrapped = optimize_gauge(engine, options=legacy)
+        wrapped = optimize_gauge(engine, options=options)
         self.assertTrue(direct.converged)
         self.assertGreater(direct.iterations, 0)
         np.testing.assert_array_equal(direct.theta, wrapped.theta)

@@ -2,7 +2,6 @@
 
 from dataclasses import asdict, dataclass
 import math
-import warnings
 from numbers import Integral, Real
 from typing import Optional, Tuple
 
@@ -717,7 +716,7 @@ class LBFGSOptions(OptimizerOptions):
     min_step: float = 1e-12
     max_step_norm: float = 1.0
     curvature_rtol: float = 1e-10
-    line_search: str = "armijo"
+    line_search: str = "weak_wolfe"
     wolfe_c2: float = 0.9
     wolfe_max_step_norm: float = math.pi
 

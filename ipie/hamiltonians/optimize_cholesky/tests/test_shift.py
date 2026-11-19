@@ -13,7 +13,6 @@ from ipie.hamiltonians.optimize_cholesky.gradients import (
     check_gauge_direction,
     relaxed_gauge_gradient,
 )
-from ipie.hamiltonians.optimize_cholesky.models import InnerOptions
 from ipie.hamiltonians.optimize_cholesky.models import (
     InnerConvergenceError,
     InnerOptions,

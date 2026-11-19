@@ -527,7 +527,7 @@ class QCSOR(SumOfRotationBase):
         overwrite and metadata are passed to save_decomposition.
         """
         from ipie.hamiltonians.optimize_cholesky.io import save_decomposition
-        from ipie.hamiltonians.optimize_cholesky.models import OuterOptions,InnerOptions
+        from ipie.hamiltonians.optimize_cholesky.models import LBFGSOptions,InnerOptions
         from ipie.hamiltonians.optimize_cholesky.problem import prepare_problem
         from ipie.hamiltonians.optimize_cholesky.gradients import GaugeEvaluator
         from ipie.hamiltonians.optimize_cholesky.optimizers import optimize_gauge
@@ -547,7 +547,7 @@ class QCSOR(SumOfRotationBase):
         result = optimize_gauge(evaluator,
             solver='lbfgs',
             theta0=theta,
-            options=OuterOptions(max_iterations=maxiter,verbosity=verbosity, line_search='weak_wolfe'),
+            options=LBFGSOptions(max_iterations=maxiter,verbosity=verbosity, line_search='weak_wolfe'),
             inner_options=InnerOptions(max_sweeps=maxsweep, gradient_atol=1e-6, gradient_rtol=1e-6,optimize_shift=True),
     )
         save_decomposition(source,result,drop_identity=kwargs.get('drop_identity',False),
