@@ -235,8 +235,10 @@ def _one_body_from_eigensystem(X, ell, tau1, shift, spins, nelec):
     for s in spins:
         ds = (shift[s] - ell) * tau1
         if not np.isfinite(ds).all() or np.any(1.0 + ds <= 0):
+            ds = ds[ds<-1.]
             raise ValueError("One-body amplitudes require 1-(epsilon-mu)*tau1 > 0; "
-                             "choose smaller tau1 or a larger shift")
+                             "choose smaller tau1 or a larger shift"
+                             f"current failed modes={ds}")
         channels.extend(OneBodyChannel(s, weight, k, float(d)) for k, d in enumerate(ds))
     return OneBodyDecomposition(X, ell, tau1, tuple(channels), shift)
 

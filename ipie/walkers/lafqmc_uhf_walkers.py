@@ -334,7 +334,7 @@ class UHFWalkers(BaseWalkers):
                         Dba = xp.einsum('wpi,iq->wpq',XCS[1][bix],BX[0][bix])
                         E2 -= .5*xp.einsum('ab,wab,wba->w',W,Dab,Dba)
                         E2 -= .5*xp.einsum('ab,wab,wba->w',W,Dba,Dab)
-        return E1+E2,E1,E2
+        return E1+E2+ham.E0,E1,E2
 
     def _measure_sign(self,hamiltonian,trial):
         self.compute_density(hamiltonian,trial,set_buff=False)

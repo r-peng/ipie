@@ -56,16 +56,6 @@ def pack_cholesky(chol):
         grouped.append({"X":X,"W":np.outer(eps,eps),"isometry":True})
     return grouped
 
-def _parse_mu(mu,ek,s):
-    if mu is None:
-        return 0.
-    if mu=='mean':
-        return ek.sum()/ek.size
-    try:
-        return mu[s]
-    except TypeError:
-        return mu
-
 class SizeGroup:
     def __init__(self):
         self.basis = []
@@ -214,28 +204,31 @@ class SumOfRotationBase:
         # one with key=self.nbasis
         # one with key=number of auxiliary modes
 
-    def decompose_h1(self,h1,dt,uniform='coefficient',iprint=0,mu='mean'):
+    def decompose_h1(self,h1,dt,uniform='coefficient',iprint=0):
         # for cholesky vectors, pass the effective h'
         if iprint>0:
             print('1-body decomposition: ')
             print('a=',1./dt)
         assert uniform in ['coefficient','rotation']
-        self.h1 = xp.asarray(h1)
 
         if self.nbasis not in self.size_groups:
             self.size_groups[self.nbasis] = SizeGroup()
         sg = self.size_groups[self.nbasis]
 
-        if np.linalg.norm(self.v0[0]-self.v0[1])<self.thresh:
-            ek,vk = np.linalg.eigh(h1+self.v0[0]) 
+        same_spin = True
+        if isinstance(h1,(list,tuple)):
+            same_spin = False
+        else:
+            h1 = [h1,h1]
+        h1 = np.stack(h1,axis=0)
+        self.h1 = xp.asarray(h1)
+
+        if np.linalg.norm(self.v0[0]-self.v0[1])>self.thresh:
+            same_spin = False
+        if same_spin:
+            ek,vk = np.linalg.eigh(h1[0]+self.v0[0]) 
             if iprint>0:
                 print(f'bands for both spin:',ek)
-            mu = _parse_mu(mu,ek,0)
-            ek -= mu
-            self.mu[0] = self.mu[1] = mu
-            if iprint>0:
-                print(f'mean of bands =',mu)
-                print(f'shifted bands:',ek)
 
             sg.add_basis(vk,ek,'h1')
             bix = sg.get_basis_index()
@@ -248,15 +241,9 @@ class SumOfRotationBase:
             if s==1 and self.decomp_type=='aa_only':
                 continue
 
-            ek,vk = np.linalg.eigh(h1+v0) 
+            ek,vk = np.linalg.eigh(h1[s]+v0) 
             if iprint>0:
                 print(f'spin={s} bands:',ek)
-            mu = _parse_mu(mu,ek,s)
-            ek -= mu
-            self.mu[s] = mu
-            if iprint>0:
-                print(f'mean of bands =',mu)
-                print(f'shifted bands:',ek)
             sg.add_basis(vk,ek,'h1')
             bix = sg.get_basis_index()
             sg.decompose_1body(bix,s,dt,uniform=uniform,thresh=self.thresh)
@@ -304,7 +291,7 @@ class SumOfRotationBase:
                     E2_chunks.append(ixs)
                 p = xp.asarray(terms['p'])
                 d = xp.asarray(terms['d'])
-                assert len(d[d<-1.+self.thresh])==0
+                assert len(d[d<-1.])==0
 
                 sg.term_info[term_key] = {'p':p,'d':d,'ix':xp.asarray(ixs)}
                 # at this point not sure what saved ixs is for 
@@ -334,7 +321,7 @@ class SumOfRotationBase:
         self.denom = self.asum
         self.a /= self.denom
         self.nterms = self.a.size
-        self.E0 = self.mu[0]*nelec[0]+self.mu[1]*nelec[1]
+        self.E0 += self.mu[0]*nelec[0]+self.mu[1]*nelec[1]
         if iprint>0:
             print(f'asum1={self.asum1},asum2={self.asum2}')
             print('normalization=',xp.fabs(self.a).sum())
@@ -508,8 +495,45 @@ def _read_decomposition_file(path):
     require(np.all(np.isfinite(data['a'])&(data['a']>0)),'weights must be finite and positive')
     return data
 
+def compute_cholesky_shift(chol):
+    # computes cholesky shifts as medians of bands
+    ell = np.linalg.eigvalsh(chol)                          # (r, n)
+    c = np.median(ell, axis=1)
+    c[np.abs(c) < 1e-10*np.abs(ell).max()] = 0.0            # medians that are only roundoff
+    return ell,c
+
+def compute_h1e_shift(h1e,eri,chol,nelec,dt1,dt2):
+    from ipie.hamiltonians.optimize_cholesky.problem import prepare_problem, build_gauge_state
+    from ipie.hamiltonians.optimize_cholesky.channels import build_fixed_decomposition
+    from ipie.hamiltonians.optimize_cholesky.shift import optimal_shift
+    problem = prepare_problem(h1e, eri, chol, nelec=nelec)      # bare h; nelec=None for decomp_type='all'
+    dec = build_fixed_decomposition(problem, build_gauge_state(problem.data), dt1, dt2, 0.0)
+    mu = optimal_shift(dec, loss_kind="weighted")                # (mu_up, mu_down)
+    return mu
 
 class QCSOR(SumOfRotationBase):
+
+    def make_shift(self,h1e,eri,chol,nelec,dt1,dt2,iprint=0):
+        ell,c = compute_cholesky_shift(chol)
+        if iprint>0:
+            print('cholesky bands =',ell)
+            print('shift =',c)
+        n = h1e.shape[0]
+        N = sum(nelec)
+        Lp  = chol - c[:, None, None]*np.eye(n)
+        h_t = h1e + N*np.einsum("g,gpq->pq", c, chol)     # h1e is the bare h
+        if iprint>0:
+            w = np.linalg.eigvalsh(h_t)
+            print('shifted h1e band =',w)
+        self.E0 += 0.5*N**2*np.sum(c**2)                    # add to energies measured with (h_t, Lp)
+        eri_new = np.einsum("gpr,gqs->prqs", Lp, Lp)
+        self.mu = compute_h1e_shift(h_t,eri_new,Lp,nelec,dt1,dt2)
+        h_t -= 0.5 * np.einsum("prrs->ps",eri)
+        if np.fabs(self.mu[0]-self.mu[1])<1e-16:
+            h_t -= self.mu[0]*np.eye(n)
+        else:
+            h_t = h_t - self.mu[0]*np.eye(n), h_t - self.mu[1]*np.eye(n)
+        return h_t,Lp
 
     @classmethod
     def initialize_cholesky(cls,eri,cmax=None):
@@ -570,11 +594,11 @@ class QCSOR(SumOfRotationBase):
             global term order (minus any truncated terms).
 
         Optional truncation (default None: no truncation, exact):
-          * thresh1 drops one-body channel (k,s) if |eps_k - mu_s| < thresh1, i.e.
+          * thresh drops one-body channel (k,s) if |eps_k - mu_s| < thresh, i.e.
             the SHIFTED orbital energy, the term (eps_k-mu_s) n_ks it represents
-            (equivalently |d| < thresh1*tau1);
-          * thresh2 drops two-body channels with |W_ab| = |ell_a ell_b| < thresh2
-            (equivalently |d_L d_R| < thresh2*tau2). All branches of a source share
+            (equivalently |d| < thresh*tau1);
+          * thresh drops two-body channels with |W_ab| = |ell_a ell_b| < thresh
+            (equivalently |d_L d_R| < thresh*tau2). All branches of a source share
             W, so a source is always dropped as a whole.
         Truncation is not exact: the walk then uses H minus the dropped terms, with
         Lambda = (kept sum a) + mu.N = ham.denom + ham.E0 after parsing. ham.h1, v0
@@ -636,7 +660,7 @@ class QCSOR(SumOfRotationBase):
                 p2,d2 = p2[keep[T1:]],d2[keep[T1:]]
                 T1 = p1.shape[0]
                 if a.size==0:
-                    raise ValueError('thresh1/thresh2 dropped every term')
+                    raise ValueError('thresh dropped every term')
 
         for bix,s0,s1,start,stop in keys.tolist():
             if s1<0:
