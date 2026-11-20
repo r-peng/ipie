@@ -194,7 +194,6 @@ class SumOfRotationBase:
         assert decomp_type in ['all','aa_only','ab_only']
         self.decomp_type = decomp_type
         self.v0 = np.zeros((2,self.nbasis,self.nbasis))
-        self.mu = np.zeros(2)
         self.E0 = 0.
 
         self.size_groups = dict() 
@@ -321,7 +320,6 @@ class SumOfRotationBase:
         self.denom = self.asum
         self.a /= self.denom
         self.nterms = self.a.size
-        self.E0 += self.mu[0]*nelec[0]+self.mu[1]*nelec[1]
         if iprint>0:
             print(f'asum1={self.asum1},asum2={self.asum2}')
             print('normalization=',xp.fabs(self.a).sum())
@@ -513,27 +511,45 @@ def compute_h1e_shift(h1e,eri,chol,nelec,dt1,dt2):
 
 class QCSOR(SumOfRotationBase):
 
-    def make_shift(self,h1e,eri,chol,nelec,dt1,dt2,iprint=0):
+    def make_shift(self,h1e,eri,chol,nelec,dt1,dt2,iprint=0,fname=None):
         ell,c = compute_cholesky_shift(chol)
         if iprint>0:
             print('cholesky bands =',ell)
             print('shift =',c)
+        ell -= c[:,None]
+        if iprint>0:
+            print('shifted min =',ell[:,0])
+            print('shifted max =',ell[:,-1])
+
         n = h1e.shape[0]
         N = sum(nelec)
         Lp  = chol - c[:, None, None]*np.eye(n)
-        h_t = h1e + N*np.einsum("g,gpq->pq", c, chol)     # h1e is the bare h
+        h_t = h1e + N*np.einsum("g,gpq->pq", c, Lp)     # h1e is the bare h
         if iprint>0:
             w = np.linalg.eigvalsh(h_t)
             print('shifted h1e band =',w)
         self.E0 += 0.5*N**2*np.sum(c**2)                    # add to energies measured with (h_t, Lp)
         eri_new = np.einsum("gpr,gqs->prqs", Lp, Lp)
-        self.mu = compute_h1e_shift(h_t,eri_new,Lp,nelec,dt1,dt2)
+
+        mu = compute_h1e_shift(h_t,eri_new,Lp,nelec,dt1,dt2)
+        self.E0 += mu[0]*nelec[0]+mu[1]*nelec[1]
         h_t -= 0.5 * np.einsum("prrs->ps",eri)
-        if np.fabs(self.mu[0]-self.mu[1])<1e-16:
-            h_t -= self.mu[0]*np.eye(n)
+        if np.fabs(mu[0]-mu[1])<1e-16:
+            h_t -= mu[0]*np.eye(n)
         else:
-            h_t = h_t - self.mu[0]*np.eye(n), h_t - self.mu[1]*np.eye(n)
+            h_t = h_t - mu[0]*np.eye(n), h_t - mu[1]*np.eye(n)
+        if fname is not None:
+            np.savez_compressed(fname,h1e_eff=h_t,chol=Lp,eri=eri_new,dt1=dt1,dt2=dt2,E0=self.E0)
         return h_t,Lp
+
+    def load_shift(self,fname):
+        data = np.load(fname+'.npz')
+        h1e_eff = data['h1e_eff']
+        chol = data['chol']
+        dt1 = data['dt1']
+        dt2 = data['dt2']
+        self.E0 = data['E0']
+        return h1e_eff,chol,dt1,dt2
 
     @classmethod
     def initialize_cholesky(cls,eri,cmax=None):
@@ -726,7 +742,9 @@ class QCSOR(SumOfRotationBase):
             if isinstance(fname,np.ndarray):
                 grouped = pack_cholesky(fname)
 
-        a = 1./np.sqrt(dt)
+        #a = 1./np.sqrt(dt)
+        #if isinstance(dt,float):
+        #    dt = dt*np.ones(len(grouped))
         for i,result in enumerate(grouped):
             X = result['X']
             W = result['W']
@@ -737,9 +755,9 @@ class QCSOR(SumOfRotationBase):
             sg = self.size_groups[nbasis]
             sg.add_basis(X,W,'thc',isometry=isometry)
             bix = sg.get_basis_index()
-            if iprint>0:
+            if iprint>1:
                 print('basis index=',bix)
-                #print(W)
+                print(W)
             S = np.eye(nbasis) if isometry else sg.overlaps[-1]
             if self.decomp_type=='ab_only':
                 self.v0 += .5*(np.dot(X,np.dot(W*S,X.T)))[None,:,:]
