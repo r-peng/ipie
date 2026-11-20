@@ -1,4 +1,4 @@
-"""Dense and overlap reference commutator loss."""
+"""The mode-space commutator loss against dense matrices and sor_base's diagnostics."""
 
 import ast
 import io
@@ -10,15 +10,17 @@ from dataclasses import replace
 from pathlib import Path
 from unittest.mock import patch
 from ipie.hamiltonians.optimize_cholesky.models import Channel, FixedDecomposition
-from ipie.hamiltonians.optimize_cholesky.loss import (
-    OverlapEvaluator,
-    commutator_loss,
+from ipie.hamiltonians.optimize_cholesky.loss import commutator_loss, raw_loss
+from ipie.hamiltonians.optimize_cholesky.tests.pair_reference import (
     commutator_norm2,
     dense_commutator_loss,
-    overlap_commutator_loss,
-    raw_loss,
+    dense_pair,
 )
-from ipie.hamiltonians.optimize_cholesky.channels import build_fixed_decomposition, get_rotation_matrix
+from ipie.hamiltonians.optimize_cholesky.channels import (
+    build_fixed_decomposition,
+    get_rotation_matrix,
+    with_channels,
+)
 from ipie.hamiltonians.optimize_cholesky.problem import build_gauge_state, prepare_problem
 from ipie.hamiltonians.optimize_cholesky.tests.test_channels import make_decomposition
 
@@ -70,18 +72,8 @@ def sor_diagnostics(decomposition, normalize_weights=True):
     return result
 
 
-def dense_pair(decomposition, i, j):
-    result = 0.0
-    for left, right in zip(get_rotation_matrix(decomposition, i),
-                           get_rotation_matrix(decomposition, j)):
-        if left is not None and right is not None:
-            result += np.linalg.norm(left @ right - right @ left, "fro")**2
-    return float(result)
-
-
 def with_two_channels(decomposition, channels):
-    return FixedDecomposition(replace(decomposition.one_body, channels=()),
-                              replace(decomposition.two_body, channels=tuple(channels)))
+    return with_channels(decomposition, one_body=(), two_body=channels)
 
 
 class KernelTests(unittest.TestCase):
@@ -138,31 +130,24 @@ class TotalLossTests(unittest.TestCase):
                     with self.subTest(nelec=nelec,partition=partition,rotated=rotated):
                         _, decomposition = make_decomposition(nelec,partition=partition,rotated=rotated)
                         dense = dense_commutator_loss(decomposition)
-                        fast = overlap_commutator_loss(decomposition)
+                        fast = commutator_loss(decomposition)
                         self.assert_results_equal(dense,fast)
                         reference = sor_diagnostics(decomposition)
                         np.testing.assert_allclose(fast.comm2,reference["comm2"],atol=2e-14,rtol=2e-11)
                         np.testing.assert_allclose(fast.weighted_comm2_unnormalized,
                                                    reference["weighted_comm2"],atol=2e-14,rtol=2e-11)
-                        # raw_loss sums with math.fsum, the diagnostic sequentially.
                         np.testing.assert_allclose(raw_loss(decomposition),fast.comm2,rtol=1e-14,atol=0)
                         json.dumps(fast.as_dict(),allow_nan=False)
 
-    def test_every_pair_and_cache_without_dense_matrix_calls(self):
+    def test_sum_of_every_dense_pair_without_dense_matrix_calls(self):
         _, decomposition = make_decomposition((2,1),partition="anchored_log")
-        evaluator = OverlapEvaluator(decomposition,loss_kind="raw")
         n = decomposition.nterms
-        for i in range(n):
-            for j in range(i+1,n):
-                np.testing.assert_allclose(evaluator.pair_norm2(i,j),dense_pair(decomposition,i,j),
-                                            atol=2e-15,rtol=2e-10)
-                np.testing.assert_allclose(evaluator.pair_norm2(i,j),evaluator.pair_norm2(j,i),
-                                            atol=2e-15,rtol=2e-10)
-        r = decomposition.two_body.gauge.X.shape[0]
-        self.assertLessEqual(evaluator.overlap_cache_size,r*(r+1)//2)
-        with patch("ipie.hamiltonians.optimize_cholesky.loss.get_rotation_matrix",
-                   side_effect=AssertionError("overlap evaluator must not build dense rotations")):
-            self.assertGreater(overlap_commutator_loss(decomposition).comm2,0)
+        pairs = [dense_pair(decomposition,i,j) for i in range(n) for j in range(i+1,n)]
+        np.testing.assert_allclose(sum(pairs), dense_pair(decomposition,1,0)+sum(pairs[1:]), rtol=1e-15)
+        with patch("ipie.hamiltonians.optimize_cholesky.channels.get_rotation_matrix",
+                   side_effect=AssertionError("the mode-space loss must not build dense rotations")):
+            np.testing.assert_allclose(raw_loss(decomposition), sum(pairs), atol=2e-15, rtol=2e-12)
+            self.assertGreater(commutator_loss(decomposition).comm2,0)
 
     def test_opposite_spin_order_and_quadrature(self):
         _, base = make_decomposition((2,1))
@@ -172,29 +157,32 @@ class TotalLossTests(unittest.TestCase):
         X=base.two_body.gauge.X
         up=float(X[0,:,0] @ X[1,:,2]);down=float(X[0,:,1] @ X[1,:,1])
         expected=2*(.2*.4)**2*up**2*(1-up**2)+2*(-.3*.5)**2*down**2*(1-down**2)
-        evaluator=OverlapEvaluator(decomposition,loss_kind="raw")
-        np.testing.assert_allclose(evaluator.pair_norm2(0,1),expected,atol=1e-16)
-        self.assert_results_equal(overlap_commutator_loss(decomposition),dense_commutator_loss(decomposition))
+        np.testing.assert_allclose(raw_loss(decomposition),expected,atol=1e-16)
+        self.assert_results_equal(commutator_loss(decomposition),dense_commutator_loss(decomposition))
         disjoint=with_two_channels(base,[Channel(0,(0,0),1.,(0,1),(.2,.3)),
                                          Channel(1,(1,1),2.,(0,1),(.4,.1))])
-        self.assertEqual(overlap_commutator_loss(disjoint).comm2,0.)
+        # Exactly commuting channels: zero up to the roundoff of the orthonormal bases.
+        self.assertLessEqual(commutator_loss(disjoint).comm2,1e-15)
 
     def test_same_basis_channels_commute_and_repeated_modes_merge(self):
         _, base=make_decomposition((2,1))
         repeated=Channel(0,(0,0),1.,(0,0),(.2,.3))
         external=Channel(1,(0,0),1.,(1,2),(.1,-.2))
         decomposition=with_two_channels(base,[repeated,external])
-        evaluator=OverlapEvaluator(decomposition,loss_kind="raw")
-        np.testing.assert_allclose(evaluator.blocks[0][0].kappa,[.2+.3+.2*.3])
-        self.assert_results_equal(overlap_commutator_loss(decomposition),dense_commutator_loss(decomposition))
+        # Two legs on one spin and one mode act as one projector: (1+d0 P)(1+d1 P) = 1+(d0+d1+d0 d1) P.
+        x = decomposition.two_body.gauge.X[0][:, 0]
+        up, down = get_rotation_matrix(decomposition, 0)
+        self.assertIsNone(down)
+        np.testing.assert_allclose(up, np.eye(x.size) + (.2+.3+.2*.3)*np.outer(x, x), rtol=0, atol=1e-15)
+        self.assert_results_equal(commutator_loss(decomposition),dense_commutator_loss(decomposition))
         same_basis=with_two_channels(base,[repeated,replace(external,bix=0)])
-        self.assertEqual(overlap_commutator_loss(same_basis).comm2,0.)
+        self.assertLessEqual(commutator_loss(same_basis).comm2,1e-15)
 
     def test_zero_channels_keep_all_pair_weights(self):
         h=np.zeros((2,2));chol=np.zeros((2,2,2));eri=np.zeros((2,2,2,2))
         p=prepare_problem(h,eri,chol,nelec=(1,1))
         decomposition=build_fixed_decomposition(p,build_gauge_state(p.data),.03,.04)
-        result=overlap_commutator_loss(decomposition)
+        result=commutator_loss(decomposition)
         self.assertEqual(result.comm2,0.)
         self.assertEqual(result.weighted_mean,0.)
         a=decomposition.coefficients/decomposition.denom
@@ -207,7 +195,7 @@ class TotalLossTests(unittest.TestCase):
         h=np.array([[.2]]);chol=np.zeros((1,1,1));eri=np.zeros((1,1,1,1))
         p=prepare_problem(h,eri,chol,nelec=(1,0))
         decomposition=build_fixed_decomposition(p,build_gauge_state(p.data),.1,.1)
-        result=overlap_commutator_loss(decomposition)
+        result=commutator_loss(decomposition)
         self.assertEqual(result.comm2,0.)
         self.assertEqual(result.weight,0.)
         self.assertIsNone(result.weighted_mean)
@@ -223,16 +211,15 @@ class TotalLossTests(unittest.TestCase):
             for partition in ("balanced_log","anchored_log"):
                 d=build_fixed_decomposition(p,build_gauge_state(p.data),.03,.04,.17,
                                             partition=partition)
-                self.assert_results_equal(dense_commutator_loss(d),overlap_commutator_loss(d))
+                self.assert_results_equal(dense_commutator_loss(d),commutator_loss(d))
 
     def test_coefficient_scaling_and_raw_weight_diagnostics(self):
         _, decomposition=make_decomposition((2,1))
         scale=7.
-        changed=FixedDecomposition(
-            replace(decomposition.one_body,channels=tuple(replace(c,a_i=scale*c.a_i)
-                                                         for c in decomposition.one_body.channels)),
-            replace(decomposition.two_body,channels=tuple(replace(c,a_i=scale*c.a_i)
-                                                         for c in decomposition.two_body.channels)))
+        changed=with_channels(
+            decomposition,
+            one_body=[replace(c,a_i=scale*c.a_i) for c in decomposition.one_body.channels],
+            two_body=[replace(c,a_i=scale*c.a_i) for c in decomposition.two_body.channels])
         original=commutator_loss(decomposition)
         self.assert_results_equal(original,commutator_loss(changed))
         raw=commutator_loss(decomposition,normalize_weights=False)
@@ -247,29 +234,26 @@ class TotalLossTests(unittest.TestCase):
         np.testing.assert_allclose(raw.weighted_comm2_unnormalized,reference["weighted_comm2"],
                                    rtol=2e-11,atol=2e-14)
 
-    def test_bad_basis_method_and_indices(self):
+    def test_bad_basis_and_arguments(self):
         _, decomposition=make_decomposition((1,1))
         bad=replace(decomposition,one_body=replace(decomposition.one_body,X=2*decomposition.one_body.X))
         with self.assertRaises(ValueError):
-            OverlapEvaluator(bad,loss_kind="raw")
+            raw_loss(bad)
         with self.assertRaises(ValueError):
-            commutator_loss(decomposition,method="unknown")
+            commutator_loss(bad)
+        with self.assertRaises(TypeError):
+            commutator_loss(decomposition,method="dense")     # the dense method moved to the tests
         with self.assertRaises(TypeError):
             commutator_loss(decomposition,normalize_weights="yes")
-        evaluator=OverlapEvaluator(decomposition,loss_kind="raw")
-        with self.assertRaises(IndexError):
-            evaluator.pair_norm2(-1,0)
-        with self.assertRaises(TypeError):
-            evaluator.pair_norm2(0.5,0)
 
 
 def run_reference_checks():
     for nelec in ((2,1),(1,1),(2,0)):
         problem,decomposition=make_decomposition(nelec)
         dense=dense_commutator_loss(decomposition)
-        fast=overlap_commutator_loss(decomposition)
+        fast=commutator_loss(decomposition)
         reference=sor_diagnostics(decomposition)
-        print(f"{problem.policy:8s} raw_dense={dense.comm2:.12e} raw_overlap={fast.comm2:.12e} "
+        print(f"{problem.policy:8s} raw_dense={dense.comm2:.12e} raw_modes={fast.comm2:.12e} "
               f"raw_sor={reference['comm2']:.12e} diff={abs(dense.comm2-fast.comm2):.3e} "
               f"weighted_mean={fast.weighted_mean:.12e}")
 

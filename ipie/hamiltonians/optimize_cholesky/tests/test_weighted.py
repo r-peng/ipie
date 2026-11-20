@@ -9,7 +9,6 @@ from scipy.linalg import expm
 from ipie.hamiltonians.optimize_cholesky.models import InnerOptions
 from ipie.hamiltonians.optimize_cholesky.gradients import GaugeEvaluator, check_gauge_direction
 from ipie.hamiltonians.optimize_cholesky.loss import (
-    OverlapEvaluator,
     commutator_loss,
     objective_loss,
     pair_scales,
@@ -28,6 +27,7 @@ from ipie.hamiltonians.optimize_cholesky.partitions import (
     with_partitions,
 )
 from ipie.hamiltonians.optimize_cholesky.tests.test_channels import example_tensors
+from ipie.hamiltonians.optimize_cholesky.tests.pair_reference import dense_objective_loss
 
 
 POLICIES = ((2, 1), (1, 1), (2, 0))
@@ -58,7 +58,7 @@ class WeightedLossTests(unittest.TestCase):
                 with self.subTest(nelec=nelec, partition=partition):
                     _, decomposition = fixture(nelec, partition=partition)
                     overlap = objective_loss(decomposition, loss_kind="weighted")
-                    dense = objective_loss(decomposition, loss_kind="weighted", method="dense")
+                    dense = dense_objective_loss(decomposition, "weighted")
                     diagnostic = commutator_loss(decomposition, normalize_weights=False).weighted_comm2
                     np.testing.assert_allclose(overlap, dense, rtol=1e-12, atol=0)
                     np.testing.assert_allclose(overlap, diagnostic, rtol=1e-12, atol=0)
@@ -69,15 +69,13 @@ class WeightedLossTests(unittest.TestCase):
     def test_weighted_is_the_default_objective(self):
         problem, decomposition = fixture()
         self.assertEqual(objective_loss(decomposition), objective_loss(decomposition, loss_kind="weighted"))
-        self.assertEqual(OverlapEvaluator(decomposition).loss_kind, "weighted")
         self.assertEqual(GaugeEvaluator(problem, tau1=.03, tau2=.04).loss_kind, "weighted")
 
     def test_raw_kind_is_the_original_objective(self):
         _, decomposition = fixture()
         self.assertEqual(objective_loss(decomposition,loss_kind="raw"), raw_loss(decomposition))
-        # raw_loss and total() share the scaled-block math.fsum path.
-        np.testing.assert_allclose(OverlapEvaluator(decomposition,loss_kind="raw").total(), raw_loss(decomposition),
-                                   rtol=1e-14, atol=0)
+        np.testing.assert_allclose(dense_objective_loss(decomposition, "raw"), raw_loss(decomposition),
+                                   rtol=1e-12, atol=0)
         np.testing.assert_array_equal(pair_scales(decomposition,loss_kind="raw"), np.ones(decomposition.nterms))
         np.testing.assert_array_equal(pair_scales(decomposition, "weighted"), decomposition.coefficients)
         with self.assertRaises(ValueError):

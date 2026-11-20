@@ -15,10 +15,11 @@ from .models import (
     PartitionOptimizationResult,
     PreparedProblem,
 )
-from .loss import commutator_norm2, OverlapEvaluator, loss_kind_name
+from .loss import ModeSpace, loss_kind_name, loss_pullback
 from .partitions import (
     _readonly,
     _partition_intervals,
+    interval_logs,
     _partition_limits,
     _inner_options,
     _solve_partitions,
@@ -26,15 +27,15 @@ from .partitions import (
     projected_partition_gradient,
 )
 from .problem import (
-    exponential_gauge,
     givens_gauge,
     skew_from_parameters,
+    _dimension,
+    _options,
     _real_array,
     _gauge_array,
 )
 from dataclasses import replace
 from .channels import (
-    _branch_signs,
     _two_body_from_amplitudes,
     build_one_body_channels,
     enumerate_sources,
@@ -42,6 +43,7 @@ from .channels import (
     one_body_at_shift,
     positive_scale,
     shift_pair,
+    source_eigenvalues,
 )
 from .shift import check_one_body_shift, shift_bounds, shift_coefficients
 
@@ -78,26 +80,6 @@ def _gradient_options(options):
     return options
 
 
-def commutator_norm2_derivatives(d, e, overlap):
-    """Return (norm2, d_norm2/dd, d_norm2/de, d_norm2/dC).
-
-    Differentiate the polynomial norm formula, not its roundoff clamp. The
-    overlap pullback must include BOTH bases. Blocks may contain zero legs.
-    """
-    d, e, C = (_real_array(x, n) for x, n in ((d,"d"),(e,"e"),(overlap,"overlap")))
-    value = commutator_norm2(d, e, C)
-    R = (C*e[None,:]) @ C.T
-    S = C.T @ (d[:,None]*C)
-    with np.errstate(over="raise", invalid="raise"):
-        gd = 4*d*((C*C) @ (e*e))-4*((R*R) @ d)
-        ge = 4*e*((C*C).T @ (d*d))-4*((S*S) @ e)
-        gC = 4*(d*d)[:,None]*C*(e*e)[None,:]
-        gC -= 8*((d[:,None]*R)*d[None,:]) @ (C*e[None,:])
-    if not all(np.isfinite(x).all() for x in (gd,ge,gC)):
-        raise FloatingPointError("Nonfinite overlap-norm derivative")
-    return value, _readonly(gd), _readonly(ge), _readonly(gC)
-
-
 def eigh_vjp(eigenvalues, eigenvectors, grad_values, grad_vectors, *, options=None):
     """Symmetric-matrix pullback for one simple real eigensystem.
 
@@ -113,19 +95,13 @@ def eigh_vjp(eigenvalues, eigenvectors, grad_values, grad_vectors, *, options=No
         raise ValueError("Expected eigenvalue vectors and square eigenvector/adjoint matrices")
     if not np.allclose(X.T@X,np.eye(ell.size),atol=1e-12,rtol=1e-10):
         raise ValueError("Eigenvectors must be orthonormal")
-    gap = ell[None,:]-ell[:,None]
-    mask = ~np.eye(ell.size,dtype=bool)
-    tolerance = options.gap_atol+options.gap_rtol*np.max(np.abs(ell),initial=0.)
-    if np.any(np.abs(gap[mask]) <= tolerance):
+    gaps = _eigengaps(ell[None])
+    try:
+        _check_eigengaps(ell[None],options,gaps)
+    except GaugeRegularityError:
         raise GaugeRegularityError("Repeated or near-degenerate Cholesky eigenvalues; "
-                                   "the simple-eigenpair gradient is not defined reliably")
-    inverse = np.zeros_like(gap)
-    np.divide(1.,gap,out=inverse,where=mask)
-    term = (X.T@gX)*inverse
-    result = X@(np.diag(ge)+(term+term.T)/2)@X.T
-    if not np.isfinite(result).all():
-        raise FloatingPointError("Nonfinite symmetric-eigh derivative")
-    return _readonly((result+result.T)/2)
+                                   "the simple-eigenpair gradient is not defined reliably") from None
+    return _readonly(_eigh_pullback(ell[None],X[None],ge[None],gX[None],gaps)[0])
 
 
 def exponential_gauge_vjp(theta, nchol, gradient_O, reference=None):
@@ -133,13 +109,15 @@ def exponential_gauge_vjp(theta, nchol, gradient_O, reference=None):
 
     O=expm(S(theta))@reference. Uses the exact Frechet adjoint; the local
     skew generator gradient is not the global theta gradient away from zero.
+    O itself is not recomputed: the caller already formed it once for this
+    gauge, so only theta, reference and gradient_O are checked here.
     """
-    O = exponential_gauge(theta,nchol,reference)
+    r = _dimension(nchol)
+    ref = np.eye(r) if reference is None else _gauge_array(reference,r,_options(None))
+    S = skew_from_parameters(theta,r)
     E = _real_array(gradient_O,"gradient_O")
-    if E.shape != O.shape:
+    if E.shape != (r,r):
         raise ValueError("gradient_O must have shape (nchol,nchol)")
-    ref = np.eye(nchol) if reference is None else np.asarray(reference,dtype=float)
-    S = skew_from_parameters(theta,nchol)
     adjoint = expm_frechet(S.T,E@ref.T,compute_expm=False)
     rows, cols = np.triu_indices(nchol,1)
     return _readonly(adjoint[rows,cols]-adjoint[cols,rows])
@@ -182,56 +160,13 @@ def _coordinates(value, count, name):
     return values.copy()
 
 
-def _loss_pullback(decomposition, loss_kind="weighted", check=True):
-    """Return the loss_kind loss, actual-channel leg adjoints and basis adjoints.
+def _loss_pullback(decomposition, loss_kind="weighted", check=True, space=None):
+    """The loss_kind loss, channel-leg adjoints (T,2) and basis adjoints dL/dX (r,n,n).
 
-    Keep zero legs in each block: a zero leg in a nonzero same-spin block can
-    have a nonzero amplitude derivative. Identity-only pairs need no special
-    case beyond the polynomial kernel. For loss_kind='weighted' the legs are
-    scaled by sqrt(a_i) and the leg adjoints are chained back to the actual d.
+    Mode-space evaluation (loss.loss_pullback); the leg adjoints are with
+    respect to the actual channel amplitudes d.
     """
-    evaluator = OverlapEvaluator(decomposition, loss_kind=loss_kind, check=check)
-    root = evaluator.root_scales
-    two = decomposition.two_body
-    offset = len(decomposition.one_body.channels)
-    blocks = []
-    for index,channel in enumerate(decomposition.one_body.channels):
-        pair = [None,None]
-        pair[channel.spin] = (-1,(channel.mode,),np.array([root[index]*channel.d]),())
-        blocks.append(tuple(pair))
-    for index,channel in enumerate(two.channels):
-        spin_legs = [[],[]]
-        scale = root[offset+index]
-        for leg,(spin,mode,d) in enumerate(zip(channel.spins,channel.modes,channel.d)):
-            spin_legs[spin].append((mode,scale*d,leg))
-        blocks.append(tuple(None if not legs else (
-            channel.bix,tuple(x[0] for x in legs),np.array([x[1] for x in legs]),
-            tuple((index,x[2]) for x in legs)) for legs in spin_legs))
-    g_amplitude = np.zeros((len(two.channels),2))
-    gX = np.zeros_like(two.gauge.X)
-    terms = []
-    for i,left_pair in enumerate(blocks):
-        for right_pair in blocks[i+1:]:
-            for left,right in zip(left_pair,right_pair):
-                if left is None or right is None or left[0] == right[0]:
-                    continue  # Shared-basis diagonal blocks commute for every gauge.
-                a,ma,d,legs_a = left
-                b,mb,e,legs_b = right
-                C = evaluator._overlap(a,b)[np.ix_(ma,mb)]
-                value,gd,ge,gC = commutator_norm2_derivatives(d,e,C)
-                terms.append(value)
-                for key,value in zip(legs_a,gd):
-                    g_amplitude[key] += value
-                for key,value in zip(legs_b,ge):
-                    g_amplitude[key] += value
-                if a >= 0:
-                    gX[a][:,ma] += evaluator._bases[b][:,mb]@gC.T
-                if b >= 0:
-                    gX[b][:,mb] += evaluator._bases[a][:,ma]@gC
-    # d(scaled leg)/d(actual leg) = sqrt(a_i); exactly one for loss_kind='raw'.
-    if evaluator.loss_kind != "raw":
-        g_amplitude *= root[offset:,None]
-    return math.fsum(terms),g_amplitude,gX
+    return loss_pullback(decomposition, loss_kind, check, space)
 
 
 def _validate_state(problem,decomposition):
@@ -255,30 +190,119 @@ def _validate_state(problem,decomposition):
     check_one_body_shift(decomposition.one_body)
 
 
-def _amplitude_pullback(two,g_amplitude,options):
-    gell = np.zeros_like(two.gauge.eigenvalues)
-    gt = np.zeros(len(two.sources))
-    for i,(source,(start,stop)) in enumerate(zip(two.sources,two.source_slices)):
-        signs = _branch_signs(source)
-        gleft,gright = np.sum(signs[:,None]*g_amplitude[start:stop],axis=0)
-        left,right = two.amplitudes[i]
-        gt[i] = gleft*left-gright*right
-        g,(p,q) = source.bix,source.modes
-        ell = two.gauge.eigenvalues[g]
-        if two.partition == "balanced_log":
-            tolerance = options.zero_atol+options.zero_rtol*np.max(np.abs(ell),initial=0.)
-            if abs(ell[p]) <= tolerance or abs(ell[q]) <= tolerance:
-                raise GaugeRegularityError(
-                    f"Source {i}, factor {g}: balanced amplitudes meet a zero/near-zero "
-                    "eigenvalue; a smooth sign branch is required")
-            common = .5*(gleft*left+gright*right)
-            gell[g,p] += common/ell[p]
-            gell[g,q] += common/ell[q]
-        else:
-            # Direct derivatives also cover a simple zero eigenvalue.
-            gell[g,p] += gleft*math.exp(.5*math.log(two.tau2)+two.t[i])
-            gell[g,q] -= gright*math.exp(.5*math.log(two.tau2)-two.t[i])
-    return gell,gt
+def _check_zero_eigenvalues(eigenvalues,sources,partition,options):
+    """balanced_log needs |ell| above zero_atol+zero_rtol*max|ell_g| on every source mode.
+
+    Depends on the gauge eigenvalues only, so GaugeEvaluator runs it before any
+    inner work. Anchored amplitudes are differentiable at a simple zero.
+    """
+    if partition != "balanced_log" or len(sources) == 0:
+        return
+    ell = np.asarray(eigenvalues,dtype=np.float64)
+    tolerance = options.zero_atol+options.zero_rtol*np.max(np.abs(ell),axis=1,initial=0.)
+    small = np.abs(ell) <= tolerance[:,None]
+    bad = small[sources.bix,sources.modes[:,0]] | small[sources.bix,sources.modes[:,1]]
+    if np.any(bad):
+        i = int(np.flatnonzero(bad)[0])
+        raise GaugeRegularityError(
+            f"Source {i}, factor {int(sources.bix[i])}: balanced amplitudes meet a zero/near-zero "
+            "eigenvalue; a smooth sign branch is required")
+
+
+def _eigengaps(eigenvalues):
+    """gap[g,a,b] = ell[g,b]-ell[g,a] and the off-diagonal mask."""
+    ell = np.asarray(eigenvalues,dtype=np.float64)
+    return ell[:,None,:]-ell[:,:,None],~np.eye(ell.shape[1],dtype=bool)
+
+
+def _check_eigengaps(eigenvalues,options,gaps=None):
+    """Every factor needs simple eigenvalues: |gap| > gap_atol+gap_rtol*max|ell_g|.
+
+    The same test as eigh_vjp, for all factors at once; the first failing
+    factor is reported.
+    """
+    ell = np.asarray(eigenvalues,dtype=np.float64)
+    gap,mask = _eigengaps(ell) if gaps is None else gaps
+    tolerance = options.gap_atol+options.gap_rtol*np.max(np.abs(ell),axis=1,initial=0.)
+    bad = np.any((np.abs(gap) <= tolerance[:,None,None]) & mask,axis=(1,2))
+    if np.any(bad):
+        g = int(np.flatnonzero(bad)[0])
+        raise GaugeRegularityError(f"Factor {g}: Repeated or near-degenerate Cholesky eigenvalues; "
+                                   "the simple-eigenpair gradient is not defined reliably")
+
+
+def check_gauge_regularity(gauge,sources,partition,options=None):
+    """The smooth-derivative checks that depend on the gauge only, in the order _assemble applies them.
+
+    Balanced zero eigenvalues first, then eigengaps. GaugeEvaluator calls this
+    right after diagonalizing a trial gauge, so a singular trial is rejected
+    before the inner solve instead of after it.
+    """
+    options = _gradient_options(options)
+    _check_zero_eigenvalues(gauge.eigenvalues,sources,partition,options)
+    _check_eigengaps(gauge.eigenvalues,options)
+
+
+def _eigh_pullback(eigenvalues,eigenvectors,grad_values,grad_vectors,gaps=None):
+    """eigh_vjp for all factors at once, without input checks (eigengaps already checked)."""
+    X = eigenvectors
+    Xt = np.swapaxes(X,1,2)
+    gap,mask = _eigengaps(eigenvalues) if gaps is None else gaps
+    inverse = np.zeros_like(gap)
+    np.divide(1.,gap,out=inverse,where=mask)
+    term = (Xt@grad_vectors)*inverse
+    middle = (term+np.swapaxes(term,1,2))/2
+    diagonal = np.arange(X.shape[1])
+    middle[:,diagonal,diagonal] += grad_values
+    result = X@middle@Xt
+    if not np.isfinite(result).all():
+        raise FloatingPointError("Nonfinite symmetric-eigh derivative")
+    return (result+np.swapaxes(result,1,2))/2
+
+
+def _interleaved(index_columns,weight_columns,active=None,size=0):
+    """bincount of per-source contributions, accumulated in source order.
+
+    Column k of row i is the k-th contribution of source i, as the per-source
+    loop added them; inactive entries are skipped.
+    """
+    index = np.stack(index_columns,axis=1).reshape(-1)
+    weight = np.stack(weight_columns,axis=1).reshape(-1)
+    if active is not None:
+        keep = np.stack(active,axis=1).reshape(-1)
+        index,weight = index[keep],weight[keep]
+    return np.bincount(index,weights=weight,minlength=size)
+
+
+def _amplitude_pullback(two,g_amplitude,options,checked=False):
+    """(dL/d ell, dL/dt) from the channel-leg adjoints, for every source at once.
+
+    checked=True means the balanced zero-eigenvalue test already ran.
+    """
+    ell = np.asarray(two.gauge.eigenvalues,dtype=np.float64)
+    r,n = ell.shape
+    sources = two.sources
+    count = len(sources)
+    if not checked:
+        _check_zero_eigenvalues(ell,sources,two.partition,options)
+    signed = sources.channel_sign[:,None]*g_amplitude
+    gleft = np.bincount(sources.channel_source,weights=signed[:,0],minlength=count)
+    gright = np.bincount(sources.channel_source,weights=signed[:,1],minlength=count)
+    left,right = two.amplitudes[:,0],two.amplitudes[:,1]
+    gt = gleft*left-gright*right
+    flat_p = sources.bix*n+sources.modes[:,0]
+    flat_q = sources.bix*n+sources.modes[:,1]
+    if two.partition == "balanced_log":
+        ell_p,ell_q = ell.reshape(-1)[flat_p],ell.reshape(-1)[flat_q]
+        common = .5*(gleft*left+gright*right)
+        gell = _interleaved((flat_p,flat_q),(common/ell_p,common/ell_q),size=r*n)
+    else:
+        # Direct derivatives also cover a simple zero eigenvalue.
+        half_log_tau = .5*math.log(two.tau2)
+        t = np.asarray(two.t,dtype=np.float64)
+        gell = _interleaved((flat_p,flat_q),(gleft*np.exp(half_log_tau+t),-(gright*np.exp(half_log_tau-t))),
+                            size=r*n)
+    return gell.reshape(r,n),gt
 
 
 def _normalized_state(two,bounds,options):
@@ -292,63 +316,67 @@ def _normalized_state(two,bounds,options):
 
 
 def _bound_pullback(two,gt,z,amplitude_limit,max_abs_t,options):
-    """Eigenvalue adjoint of gt*(c'(O)+z*h'(O)), t=c+h*z."""
+    """Eigenvalue adjoint of gt*(c'(O)+z*h'(O)), t=c+h*z, for every source at once.
+
+    Interval ends that are the amplitude bound move with the eigenvalues; ends
+    at the t cap do not. An end within bound_switch_atol of the cap is a tie
+    (GaugeRegularityError, first source reported, lower end before upper end).
+    """
     rho,cap = _partition_limits(two.amplitude_bound,amplitude_limit,max_abs_t)
-    log_rho = math.log(rho)
-    result = np.zeros_like(two.gauge.eigenvalues)
-    for i,source in enumerate(two.sources):
-        g,(p,q) = source.bix,source.modes
-        left,right = two.gauge.eigenvalues[g,p],two.gauge.eigenvalues[g,q]
+    ell = np.asarray(two.gauge.eigenvalues,dtype=np.float64)
+    r,n = ell.shape
+    sources = two.sources
+    lower_amp,upper_amp = interval_logs(ell,sources,two.tau2,two.partition,math.log(rho))
+    lower_weight,upper_weight = gt*(1-z)/2,gt*(1+z)/2
+    lower_on,upper_on = lower_weight != 0,upper_weight != 0
+    lower_tie = lower_on & (np.abs(lower_amp+cap) <= options.bound_switch_atol)
+    upper_tie = upper_on & (np.abs(upper_amp-cap) <= options.bound_switch_atol)
+    if np.any(lower_tie | upper_tie):
+        i = int(np.flatnonzero(lower_tie | upper_tie)[0])
+        end = "lower" if lower_tie[i] else "upper"
+        raise GaugeRegularityError(f"Source {i}: {end} amplitude bound ties the finite t cap")
+    lower_on &= lower_amp > -cap
+    upper_on &= upper_amp < cap
+    left,right = source_eigenvalues(ell,sources)
+    flat_p = sources.bix*n+sources.modes[:,0]
+    flat_q = sources.bix*n+sources.modes[:,1]
+    with np.errstate(divide="ignore",invalid="ignore"):
         if two.partition == "balanced_log":
-            base = .5*(math.log(abs(left))+math.log(abs(right))+math.log(two.tau2))
-            log_left = log_right = base
+            result = _interleaved(
+                (flat_p,flat_q,flat_p,flat_q),
+                (.5*lower_weight/left,.5*lower_weight/right,-(.5*upper_weight/left),-(.5*upper_weight/right)),
+                (lower_on,lower_on,upper_on,upper_on),r*n)
         else:
-            log_left = -np.inf if left == 0 else math.log(abs(left))+.5*math.log(two.tau2)
-            log_right = -np.inf if right == 0 else math.log(abs(right))+.5*math.log(two.tau2)
-        lower_amp,upper_amp = log_right-log_rho,log_rho-log_left
-        lower_weight,upper_weight = gt[i]*(1-z[i])/2,gt[i]*(1+z[i])/2
-        if lower_weight != 0:
-            if abs(lower_amp+cap) <= options.bound_switch_atol:
-                raise GaugeRegularityError(f"Source {i}: lower amplitude bound ties the finite t cap")
-            if lower_amp > -cap:
-                if two.partition == "balanced_log":
-                    result[g,p] += .5*lower_weight/left
-                    result[g,q] += .5*lower_weight/right
-                else:
-                    result[g,q] += lower_weight/right
-        if upper_weight != 0:
-            if abs(upper_amp-cap) <= options.bound_switch_atol:
-                raise GaugeRegularityError(f"Source {i}: upper amplitude bound ties the finite t cap")
-            if upper_amp < cap:
-                if two.partition == "balanced_log":
-                    result[g,p] -= .5*upper_weight/left
-                    result[g,q] -= .5*upper_weight/right
-                else:
-                    result[g,p] -= upper_weight/left
-    return result
+            result = _interleaved((flat_q,flat_p),(lower_weight/right,-(upper_weight/left)),
+                                  (lower_on,upper_on),r*n)
+    return result.reshape(r,n)
 
 
 def _assemble(problem,decomposition,options,mode,*,bounds=None,amplitude_limit=None,
-              max_abs_t=30.,inner_result=None,loss_kind="weighted",check=True):
-    """Loss and gauge derivative; check=False trusts a GaugeEvaluator decomposition."""
+              max_abs_t=30.,inner_result=None,loss_kind="weighted",check=True,regular=False,
+              space=None):
+    """Loss and gauge derivative; check=False trusts a GaugeEvaluator decomposition.
+
+    regular=True means check_gauge_regularity already passed at this gauge
+    (GaugeEvaluator runs it before any inner work); otherwise the zero-eigenvalue
+    and eigengap tests run here, in the order the per-factor code used.
+    """
     if check:
         _validate_state(problem,decomposition)
     two = decomposition.two_body
-    loss,gamp,gX = _loss_pullback(decomposition,loss_kind,check)
-    gell,gt = _amplitude_pullback(two,gamp,options)
+    loss,gamp,gX = _loss_pullback(decomposition,loss_kind,check,space)
+    gell,gt = _amplitude_pullback(two,gamp,options,checked=regular)
     extra = np.zeros_like(gell)
     z = None
     if bounds is not None:
         z = _normalized_state(two,bounds,options)
         extra = _bound_pullback(two,gt,z,amplitude_limit,max_abs_t,options)
-    gL,extraL = [],[]
-    for g in range(len(gell)):
-        try:
-            gL.append(eigh_vjp(two.gauge.eigenvalues[g],two.gauge.X[g],gell[g],gX[g],options=options))
-        except GaugeRegularityError as exc:
-            raise GaugeRegularityError(f"Factor {g}: {exc}") from exc
-        extraL.append((two.gauge.X[g]*extra[g])@two.gauge.X[g].T)
-    gL,extraL = np.array(gL),np.array(extraL)
+    ell,X = two.gauge.eigenvalues,two.gauge.X
+    gaps = _eigengaps(ell)
+    if not regular:
+        _check_eigengaps(ell,options,gaps)
+    gL = _eigh_pullback(ell,X,gell,gX,gaps)
+    extraL = (X*extra[:,None,:])@np.swapaxes(X,1,2)
     original = problem.data.chol.reshape(problem.data.nchol,-1)
     fixed = gL.reshape(problem.data.nchol,-1)@original.T
     correction = extraL.reshape(problem.data.nchol,-1)@original.T
@@ -393,18 +421,21 @@ def normalized_partition_gradient(problem,decomposition,*,amplitude_limit=None,
                      loss_kind=loss_kind_name(loss_kind))
 
 
-def _relaxed_gradient(problem,result,options):
+def _relaxed_gradient(problem,result,options,regular=False,space=None):
     """Envelope gradient of a converged inner solve on a trusted decomposition.
 
     No consistency re-checks: the inner solver has just verified its own
     stopping test. relaxed_gauge_gradient adds them for supplied results.
+    regular=True: check_gauge_regularity already passed at this gauge; space:
+    the ModeSpace of the result's bases, if already built.
     """
     if not result.converged:
         raise InnerConvergenceError("Relaxed gradient requires a converged partition solve",result)
     try:
         derivative = _assemble(problem,result.decomposition,options,"fixed_z",
                                bounds=result.bounds,amplitude_limit=result.amplitude_limit,
-                               max_abs_t=result.max_abs_t,loss_kind=result.loss_kind,check=False)
+                               max_abs_t=result.max_abs_t,loss_kind=result.loss_kind,check=False,
+                               regular=regular,space=space)
     except (GaugeRegularityError,FloatingPointError,np.linalg.LinAlgError) as exc:
         # A rejected outer trial can still account for the completed inner work.
         exc.inner_result = result
@@ -467,6 +498,10 @@ class GaugeEvaluator:
     a nonzero shift requires problem.nelec.
     Select derivative computation with backend='numpy' (default). The reserved
     backend='pytorch' raises before initialization performs numerical work.
+    fixed, fixed_z and relaxed run check_gauge_regularity right after the
+    trial gauge is diagonalized, so near-degenerate factor eigenvalues (and,
+    for balanced_log, near-zero ones) raise GaugeRegularityError before any
+    inner sweep or loss evaluation.
     """
 
     def __init__(self,problem,*,tau1,tau2,partition="balanced_log",amplitude_bound=1.,
@@ -509,6 +544,12 @@ class GaugeEvaluator:
         ell,X = np.linalg.eigh(chol)
         return GaugeState(_readonly(O),_readonly(chol),_readonly(ell),_readonly(X))
 
+    def _regular_gauge(self,O):
+        """_gauge plus check_gauge_regularity: a singular trial fails before any inner work."""
+        gauge = self._gauge(O)
+        check_gauge_regularity(gauge,self.sources,self.partition,self.options)
+        return gauge
+
     def _decomposition(self,gauge,t,shift=None):
         t,d = fixed_partition_amplitudes(gauge.eigenvalues,self.sources,self.tau2,t,
                                          self.partition,self.amplitude_bound)
@@ -522,8 +563,8 @@ class GaugeEvaluator:
 
     def fixed(self,O=None,*,t=0.,shift=None):
         """Loss and derivative with t (and the shift) fixed."""
-        return _assemble(self.problem,self.decomposition(O,t=t,shift=shift),self.options,
-                         "fixed_t",loss_kind=self.loss_kind,check=False)
+        return _assemble(self.problem,self._decomposition(self._regular_gauge(O),t,shift),self.options,
+                         "fixed_t",loss_kind=self.loss_kind,check=False,regular=True)
 
     def _bounds(self,gauge,amplitude_limit,max_abs_t):
         return _partition_intervals(gauge.eigenvalues,self.sources,self.tau2,
@@ -532,7 +573,7 @@ class GaugeEvaluator:
 
     def fixed_z(self,O=None,*,z=0.,amplitude_limit=None,max_abs_t=30.,shift=None):
         """Evaluate a gauge at fixed normalized coordinates z in [-1,1] and a fixed shift."""
-        gauge = self._gauge(O)
+        gauge = self._regular_gauge(O)
         bounds = self._bounds(gauge,amplitude_limit,max_abs_t)
         z = _coordinates(z,len(self.sources),"z")
         if np.any(np.abs(z)>1):
@@ -541,7 +582,7 @@ class GaugeEvaluator:
         t = np.where(z == 1,bounds[:,1],np.where(z == -1,bounds[:,0],t))
         return _assemble(self.problem,self._decomposition(gauge,t,shift),self.options,"fixed_z",
                          bounds=bounds,amplitude_limit=amplitude_limit,max_abs_t=max_abs_t,
-                         loss_kind=self.loss_kind,check=False)
+                         loss_kind=self.loss_kind,check=False,regular=True)
 
     def relaxed(self,O=None,*,t0=None,options=None):
         """Relax partitions (and optionally the shift) at THIS gauge; envelope gradient.
@@ -555,7 +596,7 @@ class GaugeEvaluator:
         gauges, performs its own converged inner solve.
         """
         options = _inner_options(options)
-        gauge = self._gauge(O)
+        gauge = self._regular_gauge(O)
         bounds = self._bounds(gauge,options.amplitude_limit,options.max_abs_t)
         t = bounds.mean(axis=1) if t0 is None else np.clip(
             _coordinates(t0,len(self.sources),"t0"),bounds[:,0],bounds[:,1])
@@ -564,8 +605,10 @@ class GaugeEvaluator:
             lower = shift_bounds(self.one_body,options.one_body_limit)
             shift = tuple(mu if low is None else max(mu,low)
                           for mu,low in zip(self.one_body.shift,lower))
-        inner = _solve_partitions(self._decomposition(gauge,t,shift),options,self.loss_kind)
-        return _relaxed_gradient(self.problem,inner,self.options)
+        # One mode space per trial gauge: the inner solve and the envelope gradient share it.
+        space = ModeSpace(gauge.X,self.one_body.X)
+        inner = _solve_partitions(self._decomposition(gauge,t,shift),options,self.loss_kind,space)
+        return _relaxed_gradient(self.problem,inner,self.options,regular=True,space=space)
 
 
 def check_gauge_direction(evaluator,O,K,*,steps=(1e-3,3e-4,1e-4,3e-5,1e-5)):

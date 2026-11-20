@@ -35,7 +35,7 @@ import numpy as np
 from ipie.hamiltonians.bitstring_utils import get_all_configs_u11
 from ipie.hamiltonians.optimize_cholesky.gradients import GaugeEvaluator
 from ipie.hamiltonians.optimize_cholesky.models import InnerOptions, LBFGSOptions
-from ipie.hamiltonians.optimize_cholesky.channels import build_fixed_decomposition
+from ipie.hamiltonians.optimize_cholesky.channels import build_fixed_decomposition, with_channels
 from ipie.hamiltonians.optimize_cholesky.problem import build_gauge_state, prepare_problem
 from ipie.hamiltonians.optimize_cholesky.loss import commutator_loss
 from ipie.hamiltonians.optimize_cholesky.optimizers import optimize_gauge
@@ -49,6 +49,7 @@ from ipie.hamiltonians.optimize_cholesky.tests.test_channels import (
     slater2MB,
 )
 from ipie.hamiltonians.optimize_cholesky.tests.test_weighted import fixture
+from ipie.hamiltonians.optimize_cholesky.tests.tolerance import assert_close
 
 try:
     import h5py
@@ -196,9 +197,9 @@ def reference_qcsor(decomposition, *, drop_identity=False, nelec=None):
 def filtered_decomposition(decomposition, keep_one, keep_two):
     """The decomposition with channel lists filtered by predicates on the channel objects."""
     one, two = decomposition.one_body, decomposition.two_body
-    return replace(decomposition,
-                   one_body=replace(one, channels=tuple(c for c in one.channels if keep_one(c))),
-                   two_body=replace(two, channels=tuple(c for c in two.channels if keep_two(c))))
+    return with_channels(decomposition,
+                         one_body=[c for c in one.channels if keep_one(c)],
+                         two_body=[c for c in two.channels if keep_two(c)])
 
 
 def channel_magnitudes(decomposition):
@@ -246,34 +247,41 @@ class TemporaryFiles:
 
 
 def assert_same_qcsor(test, ref, new):
-    """Identical terms in identical global order, bases, h1 and v0 (Lambda is tested separately)."""
+    """The same terms in the same global order, bases, h1 and v0 (Lambda is tested separately).
+
+    Layout (term order, keys, modes, global indices, dtypes, shapes) is compared
+    exactly; weights, amplitudes, bases and integrals to the 1e-12 standard.
+    """
     test.assertEqual(ref.nterms, new.nterms)
-    np.testing.assert_array_equal(ref.a, new.a)
-    test.assertEqual(float(ref.denom), float(new.denom))
+    assert_close(new.a, ref.a, label="a")
+    assert_close(float(new.denom), float(ref.denom), label="denom")
     np.testing.assert_array_equal(ref.E1_ixs, new.E1_ixs)
     np.testing.assert_array_equal(ref.E2_ixs, new.E2_ixs)
     test.assertEqual(ref.ix2key, new.ix2key)
-    np.testing.assert_array_equal(np.asarray(ref.h1), np.asarray(new.h1))
-    np.testing.assert_array_equal(ref.v0, new.v0)
+    assert_close(np.asarray(new.h1), np.asarray(ref.h1), label="h1")
+    assert_close(new.v0, ref.v0, label="v0")
     test.assertEqual(list(ref.size_groups), list(new.size_groups))
     for key in ref.size_groups:
         a, b = ref.size_groups[key], new.size_groups[key]
-        np.testing.assert_array_equal(a.basis, b.basis)
+        assert_close(b.basis, a.basis, label="basis")
         test.assertEqual(a.integral_tags, b.integral_tags)
         test.assertEqual(a.overlaps, b.overlaps)
         for x, y in zip(a.integrals, b.integrals):
-            np.testing.assert_array_equal(x, y)
+            assert_close(y, x, label="integrals")
         test.assertEqual(list(a.term_info), list(b.term_info))
         for term_key in a.term_info:
             for name in ("p", "d", "ix"):
                 x, y = a.term_info[term_key][name], b.term_info[term_key][name]
                 test.assertEqual((x.dtype, x.shape), (y.dtype, y.shape))
-                np.testing.assert_array_equal(x, y)
+                if name == "d":
+                    assert_close(y, x, label=f"d{term_key}")
+                else:
+                    np.testing.assert_array_equal(x, y)
     for ix in range(ref.nterms):
         for u, v in zip(ref.get_rotation_matrix(ix), new.get_rotation_matrix(ix)):
             test.assertEqual(u is None, v is None)
             if u is not None:
-                np.testing.assert_array_equal(u, v)
+                assert_close(v, u, label=f"rotation {ix}")
 
 
 def assert_same_terms_per_key(test, ref, new):
@@ -284,19 +292,22 @@ def assert_same_terms_per_key(test, ref, new):
     first kept channel.
     """
     test.assertEqual(ref.nterms, new.nterms)
-    np.testing.assert_allclose(float(new.denom), float(ref.denom), rtol=1e-14, atol=0)
-    np.testing.assert_array_equal(np.asarray(ref.h1), np.asarray(new.h1))
+    assert_close(float(new.denom), float(ref.denom), label="denom")
+    assert_close(np.asarray(new.h1), np.asarray(ref.h1), label="h1")
     (size_key,) = ref.size_groups
     test.assertEqual(list(new.size_groups), [size_key])
     sr, sn = ref.size_groups[size_key], new.size_groups[size_key]
-    np.testing.assert_array_equal(sr.basis, sn.basis)
+    assert_close(sn.basis, sr.basis, label="basis")
     test.assertEqual(sr.integral_tags, sn.integral_tags)
     test.assertEqual(set(sr.term_info), set(sn.term_info))
     for key in sr.term_info:
         for name in ("p", "d"):
             x, y = sr.term_info[key][name], sn.term_info[key][name]
             test.assertEqual((x.dtype, x.shape), (y.dtype, y.shape))
-            np.testing.assert_array_equal(x, y)
+            if name == "d":
+                assert_close(y, x, label=f"d{key}")
+            else:
+                np.testing.assert_array_equal(x, y)
         np.testing.assert_allclose(np.asarray(new.a)[sn.term_info[key]["ix"]],
                                    np.asarray(ref.a)[sr.term_info[key]["ix"]], rtol=1e-14, atol=0)
     for ix in range(new.nterms):  # every global index points back to itself
@@ -498,7 +509,8 @@ class QCSORFromFileTests(TemporaryFiles, unittest.TestCase):
                 gauge = decomposition.two_body.gauge
                 r = gauge.chol.shape[0]
                 for g in range(r):
-                    np.testing.assert_array_equal(sg.integrals[g], np.outer(gauge.eigenvalues[g], gauge.eigenvalues[g]))
+                    assert_close(sg.integrals[g], np.outer(gauge.eigenvalues[g], gauge.eigenvalues[g]),
+                                 label=f"integrals {g}")
                     self.assertIsNone(sg.overlaps[g])
                 self.assertEqual(sg.integral_tags, ["thc"]*r + ["h1"]*expected)
                 for i, s in zip(range(r, r + expected), (0, 1)):

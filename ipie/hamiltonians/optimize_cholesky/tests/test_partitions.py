@@ -16,9 +16,14 @@ from ipie.hamiltonians.optimize_cholesky.partitions import (
     projected_partition_gradient,
     with_partitions,
 )
-from ipie.hamiltonians.optimize_cholesky.channels import build_fixed_decomposition, get_rotation_matrix
+from ipie.hamiltonians.optimize_cholesky.channels import (
+    build_fixed_decomposition,
+    get_rotation_matrix,
+    with_channels,
+)
 from ipie.hamiltonians.optimize_cholesky.problem import build_gauge_state, prepare_problem
 from ipie.hamiltonians.optimize_cholesky.loss import raw_loss
+from ipie.hamiltonians.optimize_cholesky.tests.pair_reference import dense_raw_loss
 from ipie.hamiltonians.optimize_cholesky.tests.test_channels import (
     check_hamiltonian,
     make_decomposition,
@@ -89,14 +94,14 @@ class CoefficientTests(unittest.TestCase):
                         for delta in (-.17,.12):
                             t = decomposition.two_body.t.copy()
                             t[i] += delta
-                            dense = raw_loss(with_partitions(decomposition,t),method="dense")
+                            dense = dense_raw_loss(with_partitions(decomposition,t))
                             np.testing.assert_allclose(c.value(t[i]),dense,atol=5e-17,rtol=3e-11)
                         h = 2e-5
                         t = decomposition.two_body.t.copy()
                         t[i] += h
-                        plus = raw_loss(with_partitions(decomposition,t),method="dense")
+                        plus = dense_raw_loss(with_partitions(decomposition,t))
                         t[i] -= 2*h
-                        minus = raw_loss(with_partitions(decomposition,t),method="dense")
+                        minus = dense_raw_loss(with_partitions(decomposition,t))
                         np.testing.assert_allclose(c.gradient,(plus-minus)/(2*h),atol=2e-12,rtol=3e-7)
 
     def test_C_is_allowed_to_be_negative_and_minimum_matches_scalar_solver(self):
@@ -205,7 +210,7 @@ class InnerSolverTests(unittest.TestCase):
                     final = result.decomposition
                     self.assertLess(result.loss,result.initial_loss)
                     self.assertTrue(np.all(np.diff([h.loss for h in result.history]) <= 1e-16))
-                    np.testing.assert_allclose(result.loss,raw_loss(final,method="dense"),
+                    np.testing.assert_allclose(result.loss,dense_raw_loss(final),
                                                atol=2e-17,rtol=2e-11)
                     np.testing.assert_allclose(result.loss,sor_diagnostics(final)["comm2"],
                                                atol=2e-17,rtol=2e-11)
@@ -277,7 +282,7 @@ class InnerSolverTests(unittest.TestCase):
         with patch("numpy.linalg.eigh",side_effect=AssertionError("eigh in inner loop")), \
              patch("ipie.hamiltonians.optimize_cholesky.channels.validate_gauge_state",
                    side_effect=AssertionError("ERI validation in inner loop")), \
-             patch("ipie.hamiltonians.optimize_cholesky.loss.get_rotation_matrix",
+             patch("ipie.hamiltonians.optimize_cholesky.channels.get_rotation_matrix",
                    side_effect=AssertionError("dense rotations in inner loop")):
             result = optimize_partitions(decomposition,InnerOptions(max_sweeps=2),loss_kind="raw")
         self.assertLess(result.loss,result.initial_loss)
@@ -298,7 +303,7 @@ class InnerSolverTests(unittest.TestCase):
         with self.assertRaises(TypeError):
             partition_coefficients(decomposition,True,loss_kind="raw")
         two = decomposition.two_body
-        bad = replace(decomposition,two_body=replace(two,channels=two.channels[::-1]))
+        bad = with_channels(decomposition, two_body=two.channels[::-1])
         with self.assertRaisesRegex(ValueError,"Channels disagree"):
             optimize_partitions(bad,loss_kind="raw")
         with self.assertRaises(ValueError):

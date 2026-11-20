@@ -11,7 +11,6 @@ from scipy.linalg import expm
 from ipie.hamiltonians.optimize_cholesky.gradients import (
     GaugeEvaluator,
     check_gauge_direction,
-    commutator_norm2_derivatives,
     eigh_vjp,
     exponential_gauge_vjp,
     fixed_partition_gradient,
@@ -33,8 +32,15 @@ from ipie.hamiltonians.optimize_cholesky.problem import (
     givens_gauge,
     prepare_problem,
 )
-from ipie.hamiltonians.optimize_cholesky.loss import commutator_norm2, raw_loss
+from ipie.hamiltonians.optimize_cholesky.loss import raw_loss
+from ipie.hamiltonians.optimize_cholesky.tests.pair_reference import (
+    commutator_norm2,
+    commutator_norm2_derivatives,
+    dense_raw_loss,
+)
 from ipie.hamiltonians.optimize_cholesky.partitions import optimize_partitions, partition_coefficients
+from ipie.hamiltonians.optimize_cholesky.tests.reference import reference_kernels as rk
+from ipie.hamiltonians.optimize_cholesky.tests.tolerance import assert_same_evaluation
 from ipie.hamiltonians.optimize_cholesky.tests.test_channels import (
     check_hamiltonian,
     example_tensors,
@@ -60,7 +66,7 @@ def fixture(nelec=(2,1),partition="balanced_log"):
 
 
 def minimum_amplitude_limit(evaluator,O):
-    state = evaluator._gauge(O)
+    state = evaluator.decomposition(O).two_body.gauge
     return max(np.sqrt(abs(state.eigenvalues[s.bix,s.modes[0]]*
                            state.eigenvalues[s.bix,s.modes[1]])*evaluator.tau2)
                for s in evaluator.sources)
@@ -163,10 +169,10 @@ class FixedGaugeGradientTests(unittest.TestCase):
                     def dense(angle):
                         gauge = build_gauge_state(problem.data,expm(angle*K2)@O)
                         d = build_fixed_decomposition(problem,gauge,.03,.04,t,partition=partition)
-                        return raw_loss(d,method="dense")
+                        return dense_raw_loss(d)
                     fd = (dense(1e-6)-dense(-1e-6))/(2e-6)
                     np.testing.assert_allclose(np.sum(result.gradient_O*(K2@O)),fd,atol=2e-11,rtol=2e-7)
-                    np.testing.assert_allclose(result.loss,raw_loss(state,method="dense"),atol=3e-17,rtol=1e-11)
+                    np.testing.assert_allclose(result.loss,dense_raw_loss(state),atol=3e-17,rtol=1e-11)
                     np.testing.assert_allclose(result.partition_gradient,
                                                [c.gradient for c in partition_coefficients(state,loss_kind="raw")],atol=5e-18)
                     np.testing.assert_array_equal(result.bound_correction_O,0.)
@@ -182,8 +188,8 @@ class FixedGaugeGradientTests(unittest.TestCase):
         result = evaluator.fixed(O,t=t)
         grad = exponential_gauge_vjp(theta,3,result.gradient_O)
         for i in range(3):
-            fd = central(lambda x:raw_loss(evaluator.decomposition(exponential_gauge(x,3),t=t),
-                                            method="dense"),theta,np.eye(3)[i])
+            fd = central(lambda x:dense_raw_loss(evaluator.decomposition(exponential_gauge(x,3),t=t)),
+                         theta,np.eye(3)[i])
             np.testing.assert_allclose(grad[i],fd,atol=2e-10,rtol=3e-7)
         np.testing.assert_allclose(O.T@result.tangent_gradient+result.tangent_gradient.T@O,0.,atol=1e-16)
         local = result.gradient_O@O.T
@@ -212,7 +218,7 @@ class FixedGaugeGradientTests(unittest.TestCase):
         with patch("numpy.linalg.eigh",wraps=original) as diagonalize, \
              patch("ipie.hamiltonians.optimize_cholesky.channels.validate_gauge_state",
                    side_effect=AssertionError("ERI reconstruction in a trial")), \
-             patch("ipie.hamiltonians.optimize_cholesky.loss.get_rotation_matrix",
+             patch("ipie.hamiltonians.optimize_cholesky.channels.get_rotation_matrix",
                    side_effect=AssertionError("dense channel construction in a trial")):
             evaluator.fixed(O,t=.1)
             self.assertEqual(diagonalize.call_count,1)
@@ -347,14 +353,11 @@ class MovingBoundTests(unittest.TestCase):
 
 class DerivativeBackendTests(unittest.TestCase):
     def assert_same_evaluation(self, left, right):
+        """Same mode, loss, gradients and amplitudes to the 1e-12 standard (tests/tolerance.py)."""
         self.assertEqual(left.mode, right.mode)
-        self.assertEqual(left.loss, right.loss)
-        for name in ("gradient_O", "fixed_gradient_O", "bound_correction_O",
-                     "tangent_gradient", "generator_gradient", "partition_gradient",
-                     "eigenvalue_gradient"):
-            np.testing.assert_array_equal(getattr(left, name), getattr(right, name), err_msg=name)
-        np.testing.assert_array_equal(left.decomposition.two_body.amplitudes,
-                                      right.decomposition.two_body.amplitudes)
+        assert_same_evaluation(left, right, label=f"{left.mode}: ")
+        np.testing.assert_allclose(left.decomposition.two_body.amplitudes,
+                                   right.decomposition.two_body.amplitudes, rtol=1e-12, atol=0)
 
     def test_default_and_explicit_numpy_engines_agree_in_all_three_modes(self):
         problem, state = make_decomposition((2, 0))
@@ -373,19 +376,33 @@ class DerivativeBackendTests(unittest.TestCase):
                                             getattr(explicit, method)(O, **kwargs))
 
     def test_evaluator_matches_the_checked_public_functions(self):
-        # GaugeEvaluator skips consistency checks; its results must be bitwise
-        # those of the checked public gradient functions on the same input.
-        problem, state = make_decomposition((2, 0))
-        O = state.two_body.gauge.O
-        evaluator = GaugeEvaluator(problem, tau1=.2, tau2=.04, loss_kind="raw")
-        fixed = evaluator.fixed(O, t=.12)
-        self.assert_same_evaluation(fixed, fixed_partition_gradient(problem, fixed.decomposition,
-                                                                    loss_kind="raw"))
-        normalized = evaluator.fixed_z(O, z=.2, max_abs_t=.4)
-        self.assert_same_evaluation(normalized, normalized_partition_gradient(
-            problem, normalized.decomposition, max_abs_t=.4, loss_kind="raw"))
-        relaxed = evaluator.relaxed(O, options=InnerOptions(gradient_atol=1e-12, gradient_rtol=0))
-        self.assert_same_evaluation(relaxed, relaxed_gauge_gradient(problem, relaxed.inner_result))
+        # GaugeEvaluator skips consistency checks (and shares work within a gauge); the
+        # checked public gradient functions recompute everything. Both must reproduce
+        # the frozen 3680f29 oracle, and each other, to the 1e-12 standard.
+        for nelec in ((2, 1), (1, 1), (2, 0)):
+            for partition in ("balanced_log", "anchored_log"):
+                with self.subTest(nelec=nelec, partition=partition):
+                    problem, state = make_decomposition(nelec, partition=partition)
+                    O = state.two_body.gauge.O
+                    evaluator = GaugeEvaluator(problem, tau1=.2, tau2=.04, loss_kind="raw",
+                                               partition=partition)
+                    oracle = rk.ReferenceOracle(problem.data.h1, problem.data.chol, nelec, tau1=.2,
+                                                tau2=.04, loss_kind="raw", partition=partition)
+                    inner = InnerOptions(gradient_atol=1e-12, gradient_rtol=0)
+                    fixed = evaluator.fixed(O, t=.12)
+                    self.assert_same_evaluation(fixed, fixed_partition_gradient(
+                        problem, fixed.decomposition, loss_kind="raw"))
+                    assert_same_evaluation(fixed, oracle.fixed(O, t=.12), label="fixed vs oracle: ")
+                    normalized = evaluator.fixed_z(O, z=.2, max_abs_t=.4)
+                    self.assert_same_evaluation(normalized, normalized_partition_gradient(
+                        problem, normalized.decomposition, max_abs_t=.4, loss_kind="raw"))
+                    assert_same_evaluation(normalized, oracle.fixed_z(O, z=.2, max_abs_t=.4),
+                                           label="fixed_z vs oracle: ")
+                    relaxed = evaluator.relaxed(O, options=inner)
+                    self.assert_same_evaluation(relaxed, relaxed_gauge_gradient(problem, relaxed.inner_result))
+                    frozen = oracle.relaxed(O, inner=rk.InnerSettings(gradient_atol=1e-12, gradient_rtol=0))
+                    assert_same_evaluation(relaxed, frozen, label="relaxed vs oracle: ")
+                    np.testing.assert_allclose(relaxed.inner_result.t, frozen["t"], rtol=0, atol=1e-12)
 
     def test_backend_is_chosen_only_on_the_evaluator(self):
         problem, state = make_decomposition((2, 0))

@@ -1,4 +1,12 @@
-"""Data contracts for real, zero-shift Cholesky gauge optimization."""
+"""Data contracts for real Cholesky gauge optimization.
+
+Decompositions store their channels as read-only arrays (SourceTable,
+ChannelTable, OneBodyTable); the small value records Channel, OneBodyChannel,
+DensitySource and PartitionCoefficients are built from those arrays only when
+an element is requested. Validation happens where data enters (problem
+preparation, builders, channels.with_channels, public functions that receive a
+caller-built decomposition), never in the record views.
+"""
 
 from dataclasses import asdict, dataclass
 import math
@@ -153,6 +161,62 @@ class Channel:
             raise ValueError("d must contain two finite real amplitudes")
 
 
+SOURCE_KINDS = ("two_branch", "spin_quartet")
+"""Source kinds; SourceTable.kind stores the index into this tuple."""
+
+
+def _frozen(value, dtype, shape=None):
+    """An owned, read-only array copy."""
+    array = np.array(value, dtype=dtype, copy=True)
+    if shape is not None:
+        array = array.reshape(shape)
+    array.setflags(write=False)
+    return array
+
+
+class _RecordSequence:
+    """Read-only sequence of value records built on demand from array rows.
+
+    Integer indexing returns one record, slicing a tuple of records, iteration
+    yields records. Equality with another sequence compares the records.
+    """
+
+    def _record(self, index):
+        raise NotImplementedError
+
+    def __len__(self):
+        raise NotImplementedError
+
+    def __getitem__(self, index):
+        if isinstance(index, slice):
+            return tuple(self._record(i) for i in range(*index.indices(len(self))))
+        if isinstance(index, (bool, np.bool_)) or not isinstance(index, Integral):
+            raise TypeError("index must be an integer or a slice")
+        position = int(index)
+        if position < 0:
+            position += len(self)
+        if not 0 <= position < len(self):
+            raise IndexError("index out of range")
+        return self._record(position)
+
+    def __iter__(self):
+        return (self._record(i) for i in range(len(self)))
+
+    def __eq__(self, other):
+        try:
+            if len(other) != len(self):
+                return False
+        except TypeError:
+            return NotImplemented
+        return all(a == b for a, b in zip(self, other))
+
+    def __ne__(self, other):
+        result = self.__eq__(other)
+        return result if result is NotImplemented else not result
+
+    __hash__ = None
+
+
 @dataclass(frozen=True)
 class DensitySource:
     """One partition coordinate: an "two_branch" density product or "spin_quartet".
@@ -166,6 +230,102 @@ class DensitySource:
     modes: Tuple[int, int]
     kind: str
     spins: Optional[Tuple[int, int]]
+
+
+@dataclass(frozen=True, eq=False)
+class SourceTable(_RecordSequence):
+    """The fixed source topology of a problem, with its canonical channel layout.
+
+    Row i is source i (one partition coordinate t_i): factor bix, modes
+    (alpha, beta), kind (index into SOURCE_KINDS) and spins ((-1, -1) for a
+    spin quartet, whose DensitySource.spins is None). The canonical layout
+    lists the channels every source emits, in order: source slices[i] =
+    [start, stop) and, per channel, its source, branch sign, spins and branch
+    weight factor (Green weight = factor/tau2). Built by
+    channels.enumerate_sources; element access returns DensitySource.
+    """
+
+    bix: np.ndarray
+    modes: np.ndarray
+    kind: np.ndarray
+    spins: np.ndarray
+    slices: np.ndarray
+    channel_source: np.ndarray
+    channel_sign: np.ndarray
+    channel_spins: np.ndarray
+    channel_weight: np.ndarray
+
+    def __len__(self):
+        return int(self.bix.shape[0])
+
+    @property
+    def nchannels(self):
+        return int(self.channel_source.shape[0])
+
+    def _record(self, i):
+        spins = None if self.spins[i, 0] < 0 else (int(self.spins[i, 0]), int(self.spins[i, 1]))
+        return DensitySource(int(self.bix[i]), (int(self.modes[i, 0]), int(self.modes[i, 1])),
+                             SOURCE_KINDS[int(self.kind[i])], spins)
+
+    def __eq__(self, other):
+        if isinstance(other, SourceTable):
+            return all(np.array_equal(getattr(self, name), getattr(other, name))
+                       for name in ("bix", "modes", "kind", "spins"))
+        return super().__eq__(other)
+
+
+@dataclass(frozen=True, eq=False)
+class ChannelTable(_RecordSequence):
+    """Two-body channels as arrays: bix (T,), spins (T,2), modes (T,2), d (T,2), a (T,).
+
+    a holds the UNNORMALIZED positive Green weights. Element access returns a
+    Channel. Tables are built and checked by channels.py; this class does no
+    validation of its own.
+    """
+
+    bix: np.ndarray
+    spins: np.ndarray
+    modes: np.ndarray
+    d: np.ndarray
+    a: np.ndarray
+
+    def __len__(self):
+        return int(self.bix.shape[0])
+
+    def _record(self, i):
+        return Channel(int(self.bix[i]), (int(self.spins[i, 0]), int(self.spins[i, 1])), float(self.a[i]),
+                       (int(self.modes[i, 0]), int(self.modes[i, 1])), (float(self.d[i, 0]), float(self.d[i, 1])))
+
+    def __eq__(self, other):
+        if isinstance(other, ChannelTable):
+            return all(np.array_equal(getattr(self, name), getattr(other, name))
+                       for name in ("bix", "spins", "modes", "d", "a"))
+        return super().__eq__(other)
+
+
+@dataclass(frozen=True, eq=False)
+class OneBodyTable(_RecordSequence):
+    """One-body channels as arrays: spin (K,), mode (K,), d (K,), a (K,).
+
+    Element access returns a OneBodyChannel.
+    """
+
+    spin: np.ndarray
+    mode: np.ndarray
+    d: np.ndarray
+    a: np.ndarray
+
+    def __len__(self):
+        return int(self.spin.shape[0])
+
+    def _record(self, i):
+        return OneBodyChannel(int(self.spin[i]), float(self.a[i]), int(self.mode[i]), float(self.d[i]))
+
+    def __eq__(self, other):
+        if isinstance(other, OneBodyTable):
+            return all(np.array_equal(getattr(self, name), getattr(other, name))
+                       for name in ("spin", "mode", "d", "a"))
+        return super().__eq__(other)
 
 
 @dataclass(frozen=True)
@@ -186,9 +346,13 @@ class OneBodyChannel:
 class TwoBodyDecomposition:
     """Fixed-gauge, fixed-partition two-body channels and their source map.
 
-    source_slices[i]=(start,stop) refers to channels[start:stop]. This map
-    preserves the branch sharing required by each source identity. Arrays
-    produced by builders are owned, read-only snapshots.
+    table holds the channels. canonical=True means table is exactly the
+    canonical layout of sources at amplitudes (what the builders produce);
+    the partition solver and the gauge gradients require it.
+    channels.with_channels makes non-canonical decompositions (hand-made or
+    filtered channel lists) for the loss kernels, rotation matrices and tests.
+    source_slices[i] = (start, stop) refers to channels[start:stop] of a
+    canonical table. All arrays are owned, read-only snapshots.
     """
 
     gauge: GaugeState
@@ -197,15 +361,25 @@ class TwoBodyDecomposition:
     tau2: float
     partition: str
     amplitude_bound: float
-    sources: Tuple[DensitySource, ...]
+    sources: SourceTable
     t: np.ndarray
     amplitudes: np.ndarray
-    source_slices: Tuple[Tuple[int, int], ...]
-    channels: Tuple[Channel, ...]
+    table: ChannelTable
+    canonical: bool = True
+
+    @property
+    def channels(self):
+        """The channels as a read-only sequence of Channel records."""
+        return self.table
+
+    @property
+    def source_slices(self):
+        """(number_of_sources, 2) channel ranges of the canonical layout."""
+        return self.sources.slices
 
     @property
     def weight_sum(self):
-        return sum((channel.a_i for channel in self.channels), 0.0)
+        return sum(self.table.a.tolist(), 0.0)
 
 
 @dataclass(frozen=True)
@@ -221,17 +395,22 @@ class OneBodyDecomposition:
     X: np.ndarray
     eigenvalues: np.ndarray
     tau1: float
-    channels: Tuple[OneBodyChannel, ...]
+    table: OneBodyTable
     shift: Tuple[float, float] = (0.0, 0.0)
+
+    @property
+    def channels(self):
+        """The channels as a read-only sequence of OneBodyChannel records."""
+        return self.table
 
     @property
     def spins(self):
         """Spins that carry one-body channels: (0,) for aa_only, else (0, 1)."""
-        return tuple(sorted({channel.spin for channel in self.channels}))
+        return tuple(sorted(set(self.table.spin.tolist())))
 
     @property
     def weight_sum(self):
-        return sum((channel.a_i for channel in self.channels), 0.0)
+        return sum(self.table.a.tolist(), 0.0)
 
 
 @dataclass(frozen=True)
@@ -249,7 +428,7 @@ class FixedDecomposition:
 
     @property
     def nterms(self):
-        return len(self.one_body.channels) + len(self.two_body.channels)
+        return len(self.one_body.table) + len(self.two_body.table)
 
     @property
     def denom(self):
@@ -257,8 +436,7 @@ class FixedDecomposition:
 
     @property
     def coefficients(self):
-        return np.array([c.a_i for c in self.one_body.channels]
-                        + [c.a_i for c in self.two_body.channels], dtype=np.float64)
+        return np.concatenate([self.one_body.table.a, self.two_body.table.a]).astype(np.float64)
 
     @property
     def shift(self):
@@ -398,6 +576,30 @@ class PartitionCoefficients:
         return math.fsum((left,right,-self.left_term,-self.right_term))
 
 
+@dataclass(frozen=True, eq=False)
+class PartitionProfiles(_RecordSequence):
+    """The coordinate profiles of all sources as arrays (t, C, left_term, right_term).
+
+    Element i is the PartitionCoefficients of source i, built on access.
+    """
+
+    t: np.ndarray
+    C: np.ndarray
+    left_term: np.ndarray
+    right_term: np.ndarray
+
+    def __len__(self):
+        return int(self.t.shape[0])
+
+    def _record(self, i):
+        return PartitionCoefficients(i, float(self.t[i]), float(self.C[i]),
+                                     float(self.left_term[i]), float(self.right_term[i]))
+
+    @property
+    def gradient(self):
+        return 2.0*(self.left_term-self.right_term)
+
+
 @dataclass(frozen=True)
 class ShiftCoefficients:
     """Exact quadratic profile of the loss in one spin's shift mu_sigma.
@@ -481,7 +683,7 @@ class PartitionOptimizationResult:
     initial_loss: float
     loss: float
     bounds: np.ndarray
-    coefficients: Tuple[PartitionCoefficients, ...]
+    coefficients: PartitionProfiles
     gradient: np.ndarray
     projected_gradient: np.ndarray
     gradient_threshold: float

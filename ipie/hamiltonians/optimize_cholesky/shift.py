@@ -13,9 +13,11 @@ spins decouple:
     w_k = s_k * sum_j ||[x_k x_k^T, A_j^sigma]||_F^2,
 
 with unit one-body legs, loss-scaled two-body blocks A_j and the one-body pair
-scale s_k (1 for raw, a_k=1/tau1 for weighted). The minimizer is the w-weighted
-mean of the orbital energies; the only constraint is the one-sided bound
-1 + d >= 1 - one_body_limit, i.e. mu_sigma >= max_k epsilon_k - one_body_limit/tau1.
+scale s_k (1 for raw, a_k=1/tau1 for weighted). sum_j ||[x_k x_k^T, A_j]||^2 is
+the mode-space field dL/dq of loss.py at the h-basis mode k. The minimizer is
+the w-weighted mean of the orbital energies; the only constraint is the
+one-sided bound 1 + d >= 1 - one_body_limit, i.e.
+mu_sigma >= max_k epsilon_k - one_body_limit/tau1.
 
 Layer order: models -> problem -> channels -> loss -> shift -> partitions.
 """
@@ -27,7 +29,7 @@ import math
 import numpy as np
 
 from .channels import one_body_at_shift, shift_pair
-from .loss import OverlapEvaluator, commutator_norm2
+from .loss import ModeSpace, channel_loads, check_bases, loss_kind_name
 from .models import FixedDecomposition, ShiftCoefficients
 
 
@@ -83,45 +85,35 @@ def with_shift(decomposition, shift):
 
 
 def check_one_body_shift(one_body, *, rtol=1e-13):
-    """Verify stored one-body amplitudes against (mu_sigma - epsilon)*tau1."""
+    """Verify stored one-body amplitudes against (mu_sigma - epsilon)*tau1 (math.isclose rule)."""
     shift = shift_pair(one_body.shift)
-    for channel in one_body.channels:
-        expected = (shift[channel.spin] - one_body.eigenvalues[channel.mode])*one_body.tau1
-        if not math.isclose(channel.d, expected, rel_tol=rtol, abs_tol=1e-300):
-            raise ValueError("One-body amplitudes disagree with the stored shift; rebuild channels")
+    table = one_body.table
+    expected = (np.asarray(shift)[table.spin] - np.asarray(one_body.eigenvalues)[table.mode])*one_body.tau1
+    diff = np.abs(table.d - expected)
+    if np.any(diff > np.maximum(rtol*np.maximum(np.abs(table.d), np.abs(expected)), 1e-300)):
+        raise ValueError("One-body amplitudes disagree with the stored shift; rebuild channels")
     return shift
 
 
-def shift_profiles(blocks, overlap, one_body, root_scales, lower):
-    """Exact per-spin profiles from the CURRENT block list.
+def shift_profiles(one_body, field, scales, lower):
+    """Exact per-spin profiles from the h-basis field.
 
-    blocks: per-channel (up, down) spin blocks, one-body first, with the
-    two-body blocks already scaled for the loss; overlap(a,b) returns the basis
-    overlap; root_scales: per-channel sqrt(s_i). Returns a tuple of
-    ShiftCoefficients for each spin that carries one-body channels.
+    field: (2, n) dL/dq on the h-basis modes (loss.ModeSpace.field with
+    cols=hslice) at the CURRENT loads; scales: per one-body channel pair scale
+    s_k. Returns a ShiftCoefficients for each spin that carries one-body channels.
     """
-    n_one = len(one_body.channels)
+    table = one_body.table
     shift = shift_pair(one_body.shift)
-    weight, moment = {}, {}
-    for index, channel in enumerate(one_body.channels):
-        terms = []
-        for other in blocks[n_one:]:
-            block = other[channel.spin]
-            if block is None:
-                continue
-            C = overlap(-1, block.basis)[np.ix_((channel.mode,), block.modes)]
-            terms.append(commutator_norm2((1.0,), block.kappa, C))
-        w = float(root_scales[index])**2*math.fsum(terms)
-        eps = float(one_body.eigenvalues[channel.mode])
-        weight.setdefault(channel.spin, []).append(w)
-        moment.setdefault(channel.spin, []).append(w*eps)
+    eps = np.asarray(one_body.eigenvalues, dtype=np.float64)
     result = []
     for spin in one_body.spins:
         if lower[spin] is None:
             raise ValueError(f"No shift bound for spin {spin}")
-        result.append(ShiftCoefficients(spin, shift[spin], float(lower[spin]),
-                                        math.fsum(weight[spin]), math.fsum(moment[spin]),
-                                        float(one_body.tau1)))
+        selected = table.spin == spin
+        modes = table.mode[selected]
+        w = np.asarray(scales)[selected]*field[spin, modes]
+        result.append(ShiftCoefficients(spin, shift[spin], float(lower[spin]), math.fsum(w.tolist()),
+                                        math.fsum((w*eps[modes]).tolist()), float(one_body.tau1)))
     return tuple(result)
 
 
@@ -129,10 +121,15 @@ def shift_coefficients(decomposition, *, loss_kind="weighted", one_body_limit=No
     """Standalone exact mu profiles at a fixed decomposition (all t fixed)."""
     if not isinstance(decomposition, FixedDecomposition):
         raise TypeError("decomposition must be a FixedDecomposition")
+    loss_kind = loss_kind_name(loss_kind)
     check_one_body_shift(decomposition.one_body)
-    evaluator = OverlapEvaluator(decomposition, loss_kind=loss_kind)
-    return shift_profiles(evaluator.blocks, evaluator._overlap, decomposition.one_body,
-                          evaluator.root_scales,
+    check_bases(decomposition)
+    space = ModeSpace.of(decomposition)
+    q, O = channel_loads(decomposition, loss_kind, space)
+    h, _ = space.offdiagonal_terms(O)
+    table = decomposition.one_body.table
+    scales = table.a if loss_kind == "weighted" else np.ones(len(table))
+    return shift_profiles(decomposition.one_body, space.field(q, h, space.hslice), scales,
                           shift_bounds(decomposition.one_body, one_body_limit))
 
 

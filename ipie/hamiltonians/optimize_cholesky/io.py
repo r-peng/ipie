@@ -153,32 +153,30 @@ def _pairs(values, dtype, count):
 
 
 def _arrays_from_decomposition(decomposition):
-    """Plain arrays of a FixedDecomposition (one pass over its channel objects)."""
+    """Plain arrays of a canonical FixedDecomposition, read straight from its tables."""
     one, two = decomposition.one_body, decomposition.two_body
+    if not two.canonical:
+        raise ValueError("Only canonical decompositions (from the builders or the optimizer) can be "
+                         "saved; with_channels results are not")
     gauge = two.gauge
-    oc, tc, src = one.channels, two.channels, two.sources
-    nch, nsrc = len(tc), len(src)
+    ot, tt, src = one.table, two.table, two.sources
+    nsrc = len(src)
     return {
         "policy": two.policy, "nelec": two.nelec, "denom": float(decomposition.denom),
         "h1_X": np.asarray(one.X, dtype=np.float64), "eps": np.asarray(one.eigenvalues, dtype=np.float64),
         "tau1": float(one.tau1), "shift": tuple(float(x) for x in one.shift),
-        "s1": np.fromiter((c.spin for c in oc), dtype=np.int64, count=len(oc)),
-        "a1": np.fromiter((c.a_i for c in oc), dtype=np.float64, count=len(oc)),
-        "m1": np.fromiter((c.mode for c in oc), dtype=np.int64, count=len(oc)),
-        "d1": np.fromiter((c.d for c in oc), dtype=np.float64, count=len(oc)),
+        "s1": np.array(ot.spin, dtype=np.int64), "a1": np.array(ot.a, dtype=np.float64),
+        "m1": np.array(ot.mode, dtype=np.int64), "d1": np.array(ot.d, dtype=np.float64),
         "O": np.asarray(gauge.O, dtype=np.float64), "chol": np.asarray(gauge.chol, dtype=np.float64),
         "ell": np.asarray(gauge.eigenvalues, dtype=np.float64), "X": np.asarray(gauge.X, dtype=np.float64),
         "tau2": float(two.tau2), "partition": str(two.partition),
         "amplitude_bound": float(two.amplitude_bound), "t": np.asarray(two.t, dtype=np.float64).reshape(-1),
-        "src_bix": np.fromiter((s.bix for s in src), dtype=np.int64, count=nsrc),
-        "src_modes": _pairs([s.modes for s in src], np.int64, nsrc),
+        "src_bix": np.array(src.bix, dtype=np.int64), "src_modes": _pairs(src.modes, np.int64, nsrc),
         "amplitudes": np.asarray(two.amplitudes, dtype=np.float64).reshape(nsrc, 2),
-        "slices": _pairs(two.source_slices, np.int64, nsrc),
-        "bix2": np.fromiter((c.bix for c in tc), dtype=np.int64, count=nch),
-        "spins2": _pairs([c.spins for c in tc], np.int64, nch),
-        "a2": np.fromiter((c.a_i for c in tc), dtype=np.float64, count=nch),
-        "modes2": _pairs([c.modes for c in tc], np.int64, nch),
-        "d2": _pairs([c.d for c in tc], np.float64, nch),
+        "slices": _pairs(src.slices, np.int64, nsrc),
+        "bix2": np.array(tt.bix, dtype=np.int64), "spins2": np.array(tt.spins, dtype=np.int64),
+        "a2": np.array(tt.a, dtype=np.float64), "modes2": np.array(tt.modes, dtype=np.int64),
+        "d2": np.array(tt.d, dtype=np.float64),
     }
 
 

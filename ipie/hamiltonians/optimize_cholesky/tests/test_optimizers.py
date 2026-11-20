@@ -26,6 +26,7 @@ from ipie.hamiltonians.optimize_cholesky.optimizers import (
 from ipie.hamiltonians.optimize_cholesky.gradients import GaugeEvaluator, exponential_gauge_vjp
 from ipie.hamiltonians.optimize_cholesky.problem import exponential_gauge, prepare_problem
 from ipie.hamiltonians.optimize_cholesky.loss import raw_loss
+from ipie.hamiltonians.optimize_cholesky.tests.pair_reference import dense_raw_loss
 from dataclasses import FrozenInstanceError, dataclass, replace
 from ipie.hamiltonians.optimize_cholesky.tests.test_channels import (
     check_hamiltonian,
@@ -350,8 +351,8 @@ class NestedOracleTests(unittest.TestCase):
         point=objective.evaluate(theta)
         np.testing.assert_allclose(point.O,exponential_gauge(theta,2,reference),atol=1e-15)
         expected=exponential_gauge_vjp(theta,2,point.gauge_gradient.gradient_O,reference)
-        np.testing.assert_array_equal(point.gradient_theta,expected)
-        self.assertAlmostEqual(point.loss,raw_loss(point.decomposition,method="dense"),places=14)
+        np.testing.assert_allclose(point.gradient_theta,expected,rtol=1e-12,atol=0)
+        self.assertAlmostEqual(point.loss,dense_raw_loss(point.decomposition),places=14)
         theta[0]=1.
         self.assertEqual(point.theta[0],.03)
         value,gradient=objective.value_and_grad([.03])
@@ -359,7 +360,7 @@ class NestedOracleTests(unittest.TestCase):
         self.assertEqual(objective.cache_hits,1)
         self.assertEqual(value,point.loss)
         gradient[:]=123
-        np.testing.assert_array_equal(point.gradient_theta,expected)
+        np.testing.assert_allclose(point.gradient_theta,expected,rtol=1e-12,atol=0)
         self.assertIs(objective.evaluate([.03]),point)
         self.assertFalse(objective.reference.flags.writeable)
         self.assertFalse(point.theta.flags.writeable)
@@ -405,7 +406,11 @@ class NestedOracleTests(unittest.TestCase):
         self.assertGreater(inner.sweeps,0)
         self.assertEqual(objective.inner_sweeps,inner.sweeps)
         self.assertEqual(objective.failed_evaluations,1)
-        self.assertIsNone(objective._cached)
+        # The failed point was not cached: evaluating it again is a fresh evaluation.
+        point=objective.evaluate([0.])
+        self.assertEqual((objective.evaluations,objective.cache_hits),(2,0))
+        self.assertIs(objective.evaluate([0.]),point)
+        self.assertEqual((objective.evaluations,objective.cache_hits),(2,1))
 
     def test_options_and_failed_initial_evaluations_are_not_hidden(self):
         _,engine=engine_fixture()
@@ -465,12 +470,12 @@ class PhysicalOuterTests(unittest.TestCase):
                     self.assertEqual(tuple(callback_rows),result.history)
                     self.assertTrue(result.validation_report.passed)
                     self.assertTrue(result.partition_result.converged)
-                    np.testing.assert_allclose(result.loss,raw_loss(result.decomposition,method="dense"),
+                    np.testing.assert_allclose(result.loss,dense_raw_loss(result.decomposition),
                                                atol=3e-17,rtol=3e-11)
                     np.testing.assert_allclose(result.O,exponential_gauge(result.theta,2,result.reference),atol=1e-15)
                     expected=exponential_gauge_vjp(result.theta,2,result.evaluation.gauge_gradient.gradient_O,
                                                    result.reference)
-                    np.testing.assert_array_equal(result.gradient_theta,expected)
+                    np.testing.assert_allclose(result.gradient_theta,expected,rtol=1e-12,atol=0)
                     check_hamiltonian(result.decomposition,problem.data.h1,problem.data.eri,nelec)
                     self.assertEqual(len(result.history),result.iterations+1)
                     self.assertFalse(result.theta.flags.writeable)

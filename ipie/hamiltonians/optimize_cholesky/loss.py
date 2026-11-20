@@ -1,69 +1,53 @@
-"""Reference squared commutator loss: dense matrices versus small overlaps.
+"""Squared commutator losses in mode space, and their pullback.
 
-For u=diag(I+A_up,I+A_down), squared spin norms are ADDED, never square
-rooted. Two objectives are supported (loss_kind):
+Every spin block of every channel is diagonal in one basis: a rotated Cholesky
+factor (bases 0..r-1) or the h eigenbasis (basis r). Write the block of
+channel i in spin sigma as A_i = sum_a kappa_{i,a} P_a with P_a = x_a x_a^T,
+and let s_i be the pair scale (1 for loss_kind "raw", the stored Green weight
+a_i for "weighted"). Two objectives are supported:
 
   raw       L_raw = sum_{i<j} ||[u_i,u_j]||_F^2
   weighted  L_w   = sum_{i<j} a_i a_j ||[u_i,u_j]||_F^2   (unnormalized a_i)
 
-Because [u_i,u_j]=[A_i,A_j] is bilinear, a_i a_j ||[A_i,A_j]||^2 equals
-||[sqrt(a_i) A_i, sqrt(a_j) A_j]||^2: L_w is L_raw evaluated on blocks whose
-merged amplitudes kappa are scaled by sqrt(a_i). Every kernel is therefore
-shared; the optimizer layers use those scaled blocks.
+with u_i = diag(I+A_i_up, I+A_i_down) and the two spin blocks' squared norms
+added. Over the global modes a = basis*n + mode define, per spin,
 
-The loss kind is chosen in one place: objective_loss(..., loss_kind=) and
-OverlapEvaluator(..., loss_kind=).total() return the objective, both kinds
-through the same scaled-block sum. commutator_loss is the separate diagnostic
-record: it evaluates unscaled pair norms once and reports L_raw, the
-sor_base-compatible weighted fields (normalized by denom by default) and the
-unnormalized L_w together. Its weighted diagnostics match
-sor_base.compute_total_commutativity when supplied the same actual channels and
-the same normalized coefficients. This module is a real float64 NumPy
-reference, not an autodiff implementation.
+    q[a]     = sum_i s_i kappa_{i,a}^2                     (diagonal loads)
+    O[a,a']  = sum_i s_i kappa_{i,a} kappa_{i,a'}, a!=a'   (same-spin rank-2 blocks;
+                                                            -W_{aa'} for canonical channels)
+    C        = X_all^T X_all, zero within each basis;  C2 = C*C;  F = C2 - C2*C2
+    h[a]     = (C2 O C2^T)[a,a]
+    OO       = sum O[a,a'] O[m,m'] C_am C_a'm C_a'm' C_am'.
+
+Then, exactly, L_sigma = q^T F q - 2 q.h - OO, and dL/dq = 2 (F q - h) >= 0 is
+the commutator field seen by a mode. Pairs within one basis commute and
+contribute nothing, so each basis enters L affinely through its own loads.
+The cost is a few dense operations on the (r+1)n x (r+1)n overlap matrix,
+independent of the number of channel pairs.
+
+Loads are built from the channel tables, so any channel list is accepted
+(including channels.with_channels results). Two legs on the same spin and the
+same mode merge into one projector, (1 + d0 P)(1 + d1 P) = 1 + (d0+d1+d0 d1) P.
+
+Entry points: objective_loss / raw_loss (the optimized value), commutator_loss
+(diagnostic record with the sor_base-compatible fields), loss_pullback (the
+loss with its channel-leg and basis adjoints, used by gradients.py), and the
+ModeSpace / channel_loads / offdiagonal_terms building blocks used by
+shift.py and partitions.py.
 """
 
-from dataclasses import dataclass
 import math
-from numbers import Integral, Real
 
 import numpy as np
 
-from .channels import get_rotation_matrix
 from .models import LOSS_KINDS, CommutatorLoss, FixedDecomposition
 from .problem import _real_array
 
 
-def commutator_norm2(d, e, overlap):
-    """Squared Frobenius norm of [V diag(d) V.T, Z diag(e) Z.T].
-
-    V and Z must each have orthonormal columns; overlap=V.T@Z. The formula is
-    2*Tr(D^2 C E^2 C.T) - 2*Tr((D C E C.T) @ (D C E C.T)).
-    The matrix square in the second term is NOT an elementwise square or a
-    squared Frobenius norm. Actual channel blocks have at most two columns.
-    Empty blocks give zero. Only negative roundoff relative to the two terms
-    is clamped; materially negative values raise FloatingPointError.
-    """
-    d = _real_array(d, "d")
-    e = _real_array(e, "e")
-    C = _real_array(overlap, "overlap")
-    if d.ndim != 1 or e.ndim != 1 or C.shape != (d.size, e.size):
-        raise ValueError("Expected vectors d,e and overlap.shape=(len(d),len(e))")
-    if not d.size or not e.size:
-        return 0.0
-    with np.errstate(over="raise", invalid="raise"):
-        first = 2.0 * np.sum((d[:,None] * C * e[None,:])**2)
-        product = ((d[:,None] * C) * e[None,:]) @ C.T
-        second = 2.0 * np.sum(product * product.T)
-        value = float(first - second)
-    if not np.isfinite(value):
-        raise FloatingPointError("Nonfinite overlap commutator norm")
-    tolerance = 64.0 * np.finfo(np.float64).eps * max(abs(float(first)), abs(float(second)))
-    if value < -tolerance:
-        raise FloatingPointError(
-            f"Squared norm {value:.3e} is materially negative (roundoff bound {tolerance:.3e}); "
-            "check basis orthogonality and overlap construction"
-        )
-    return max(0.0, value)
+def loss_kind_name(loss_kind):
+    if not isinstance(loss_kind, str) or loss_kind not in LOSS_KINDS:
+        raise ValueError(f"loss_kind must be one of {LOSS_KINDS}; got {loss_kind!r}")
+    return loss_kind
 
 
 def _weights(decomposition, normalize_weights):
@@ -84,12 +68,6 @@ def _weights(decomposition, normalize_weights):
     return weights
 
 
-def loss_kind_name(loss_kind):
-    if not isinstance(loss_kind, str) or loss_kind not in LOSS_KINDS:
-        raise ValueError(f"loss_kind must be one of {LOSS_KINDS}; got {loss_kind!r}")
-    return loss_kind
-
-
 def pair_scales(decomposition, loss_kind="weighted"):
     """Per-channel s_i with pair weight s_i*s_j (combined one-body-first order).
 
@@ -102,220 +80,242 @@ def pair_scales(decomposition, loss_kind="weighted"):
     return weights
 
 
-def _accumulate(pair_norm2, weights, normalize_weights, coefficients):
-    """One pass over all i<j pairs.
+# --------------------------------------------------------------------------- mode space
 
-    weights are the (possibly normalized) diagnostic weights; coefficients are
-    the stored unnormalized a_i used for L_w. Sums are sequential, as in
-    sor_base; with normalize_weights=False the weighted and unnormalized sums
-    are therefore bitwise identical.
+class ModeSpace:
+    """Gauge-dependent dense data for one decomposition's bases.
+
+    Modes are ordered basis by basis: Cholesky factor g owns modes
+    [g*n, (g+1)*n), the h eigenbasis owns [r*n, (r+1)*n) (hslice). C holds the
+    overlaps between modes of DIFFERENT bases and is zero within a basis.
     """
-    if coefficients.shape != weights.shape:
-        raise ValueError("coefficients and weights must have one entry per channel")
-    raw = weighted = weight = unnormalized = 0.0
+
+    def __init__(self, X, one_body_X):
+        X = np.asarray(X, dtype=np.float64)
+        self.nchol, self.n, _ = X.shape
+        n, r = self.n, self.nchol
+        self.X = X
+        self.nmodes = (r+1)*n
+        self.hslice = slice(r*n, (r+1)*n)
+        self.Xall = np.concatenate([X.transpose(1, 0, 2).reshape(n, r*n),
+                                    np.asarray(one_body_X, dtype=np.float64)], axis=1)
+        basis = np.repeat(np.arange(r+1), n)
+        self.cross = basis[:, None] != basis[None, :]
+        self.C = np.where(self.cross, self.Xall.T @ self.Xall, 0.0)
+        self.C2 = self.C*self.C
+        self.F = self.C2 - self.C2*self.C2
+
+    @classmethod
+    def of(cls, decomposition):
+        return cls(decomposition.two_body.gauge.X, decomposition.one_body.X)
+
+    def factor(self, g):
+        return slice(g*self.n, (g+1)*self.n)
+
+    def field(self, q, h, cols=slice(None)):
+        """dL/dq on the selected modes: 2 (F q - h)."""
+        return 2.0*(q @ self.F[:, cols] - h[:, cols])
+
+    def loss(self, q, h, OO):
+        """q^T F q - 2 q.h - OO summed over spins; roundoff below zero is clamped to 0."""
+        value = float(np.sum(q*(q @ self.F)) - 2.0*np.sum(q*h) - np.sum(OO))
+        if not math.isfinite(value):
+            raise FloatingPointError("Nonfinite commutator loss")
+        return max(0.0, value)
+
+    def orbital_K(self, Os):
+        """K[p,q,r,s] = sum_g sum_{aa'} O_g[a,a'] x_a[p] x_a[q] x_a'[r] x_a'[s]."""
+        X = self.X
+        return np.einsum("gpa,gqa,gab,grb,gsb->pqrs", X, X, Os, X, X, optimize=True)
+
+    def offdiagonal_terms(self, O):
+        """h (2, nmodes) and OO (2,) of the off-diagonal loads (zeros if O is None)."""
+        if O is None:
+            return np.zeros((2, self.nmodes)), np.zeros(2)
+        r, n = self.nchol, self.n
+        Y = self.C2[:, :r*n].reshape(self.nmodes, r, n)
+        h = np.einsum("arm,srmk,ark->sa", Y, O, Y, optimize=True)
+        OO = np.zeros(2)
+        for spin in (0, 1):
+            if np.any(O[spin]):
+                K = self.orbital_K(O[spin])
+                OO[spin] = np.einsum("pqrs,qrsp->", K, K, optimize=True)
+        return h, OO
+
+
+def channel_legs(table):
+    """Leg classes of a ChannelTable: (cross_spin, same_spin_distinct, same_spin_repeated) masks."""
+    same = table.spins[:, 0] == table.spins[:, 1]
+    repeated = same & (table.modes[:, 0] == table.modes[:, 1])
+    return ~same, same & ~repeated, repeated
+
+
+def channel_loads(decomposition, loss_kind, space=None):
+    """(q, O) of every channel of the decomposition (any channel list).
+
+    q (2, nmodes) diagonal loads; O (2, r, n, n) symmetric same-spin
+    off-diagonal loads with zero diagonal, or None if there are none.
+    """
+    loss_kind = loss_kind_name(loss_kind)
+    one, two = decomposition.one_body.table, decomposition.two_body.table
+    r, n, _ = decomposition.two_body.gauge.X.shape
+    N = (r+1)*n
+    weighted = loss_kind == "weighted"
+    q = np.zeros(2*N)
+    if len(one):
+        s1 = one.a if weighted else np.ones(len(one))
+        q += np.bincount(one.spin*N + r*n + one.mode, weights=s1*one.d*one.d, minlength=2*N)
+    O = None
+    if len(two):
+        s = two.a if weighted else np.ones(len(two))
+        d0, d1 = two.d[:, 0], two.d[:, 1]
+        gm0, gm1 = two.bix*n + two.modes[:, 0], two.bix*n + two.modes[:, 1]
+        split, distinct, repeated = channel_legs(two)
+        legs = split | distinct
+        q += np.bincount(two.spins[legs, 0]*N + gm0[legs], weights=(s*d0*d0)[legs], minlength=2*N)
+        q += np.bincount(two.spins[legs, 1]*N + gm1[legs], weights=(s*d1*d1)[legs], minlength=2*N)
+        if np.any(repeated):
+            kappa = d0[repeated] + d1[repeated] + d0[repeated]*d1[repeated]
+            q += np.bincount(two.spins[repeated, 0]*N + gm0[repeated], weights=s[repeated]*kappa*kappa,
+                             minlength=2*N)
+        if np.any(distinct):
+            flat = ((two.spins[distinct, 0]*r + two.bix[distinct])*n + two.modes[distinct, 0])*n \
+                + two.modes[distinct, 1]
+            O = np.bincount(flat, weights=(s*d0*d1)[distinct], minlength=2*r*n*n).reshape(2, r, n, n)
+            O = O + O.transpose(0, 1, 3, 2)
+    return q.reshape(2, N), O
+
+
+def check_bases(decomposition):
+    """Orthonormal bases of the right shape: what the mode-space formulas assume."""
+    X = _real_array(decomposition.two_body.gauge.X, "Cholesky bases")
+    if X.ndim != 3 or X.shape[0] < 1 or X.shape[1] != X.shape[2] or X.shape[1] < 1:
+        raise ValueError("Cholesky bases must have shape (r,n,n)")
+    n = X.shape[1]
+    bases = [("one-body basis", _real_array(decomposition.one_body.X, "one-body basis"))]
+    bases += [(f"Cholesky basis {g}", factor) for g, factor in enumerate(X)]
+    for name, basis in bases:
+        if basis.shape != (n, n):
+            raise ValueError(f"{name} must have shape {(n,n)}")
+        if not np.allclose(basis.T @ basis, np.eye(n), atol=1e-12, rtol=1e-10):
+            raise ValueError(f"{name} must have orthonormal columns for the overlap formula")
+    one, two = decomposition.one_body.table, decomposition.two_body.table
+    if not (np.isfinite(one.d).all() and np.isfinite(two.d).all()):
+        raise ValueError("Channel amplitudes must be finite and real")
+
+
+def _loss(decomposition, loss_kind, space):
+    q, O = channel_loads(decomposition, loss_kind, space)
+    h, OO = space.offdiagonal_terms(O)
+    return space.loss(q, h, OO)
+
+
+# --------------------------------------------------------------------------- public losses
+
+def objective_loss(decomposition, *, loss_kind="weighted"):
+    """The optimized objective for loss_kind, and nothing else.
+
+    raw: L_raw. weighted: sum_{i<j} a_i a_j ||[u_i,u_j]||_F^2 with the stored
+    unnormalized a_i.
+    """
+    if not isinstance(decomposition, FixedDecomposition):
+        raise TypeError("decomposition must be a FixedDecomposition")
+    loss_kind = loss_kind_name(loss_kind)
+    check_bases(decomposition)
+    return _loss(decomposition, loss_kind, ModeSpace.of(decomposition))
+
+
+def raw_loss(decomposition):
+    """Only L_raw: objective_loss with loss_kind='raw'."""
+    return objective_loss(decomposition, loss_kind="raw")
+
+
+def commutator_loss(decomposition, *, normalize_weights=True):
+    """Every loss at once: L_raw, unnormalized L_w and sor_base-compatible diagnostics.
+
+    normalize_weights affects only weighted_comm2, weight and weighted_mean;
+    comm2 and weighted_comm2_unnormalized do not depend on it. weight is the
+    sum of w_i w_j over ALL unordered pairs, ((sum w)^2 - sum w^2)/2.
+    """
+    weights = _weights(decomposition, normalize_weights)
+    check_bases(decomposition)
+    space = ModeSpace.of(decomposition)
+    raw = _loss(decomposition, "raw", space)
+    unnormalized = _loss(decomposition, "weighted", space)
+    weighted = unnormalized/decomposition.denom**2 if normalize_weights else unnormalized
+    first, second = math.fsum(weights), math.fsum(weights*weights)
+    weight = max(0.0, 0.5*(first*first - second))
     count = weights.size
-    for i in range(count):
-        for j in range(i+1, count):
-            pair = pair_norm2(i, j)
-            wij = float(weights[i] * weights[j])
-            raw += pair
-            weighted += wij * pair
-            unnormalized += float(coefficients[i] * coefficients[j]) * pair
-            # Include ALL pairs, even when their commutator is structurally zero.
-            weight += wij
     if not all(np.isfinite(value) for value in (raw, weighted, weight, unnormalized)):
         raise FloatingPointError("Overflow in total commutator diagnostics")
     return CommutatorLoss(raw, weighted, weight, weighted/weight if weight > 0 else None,
                           count*(count-1)//2, bool(normalize_weights), unnormalized)
 
 
-def dense_commutator_loss(decomposition, *, normalize_weights=True):
-    """Literal reference matching sor_base, using full n*n spin matrices.
+# --------------------------------------------------------------------------- pullback
 
-    normalize_weights=True uses a_i/denom, as after parse_decomposition().
-    False reproduces the same formulas with raw coefficients. Neither option
-    alters the channels, comm2 or weighted_comm2_unnormalized.
-    """
-    weights = _weights(decomposition, normalize_weights)
-    coefficients = _weights(decomposition, False)
-    matrices = [get_rotation_matrix(decomposition, i) for i in range(weights.size)]
+def loss_pullback(decomposition, loss_kind="weighted", check=True, space=None):
+    """(loss, dL/d channel-leg amplitudes (T,2), dL/dX (r,n,n)).
 
-    def pair_norm2(i, j):
-        result = 0.0
-        for left, right in zip(matrices[i], matrices[j]):
-            if left is None or right is None:
-                continue
-            comm = np.dot(left, right) - np.dot(right, left)
-            result += float(np.linalg.norm(comm, "fro")**2)
-        return result
-
-    return _accumulate(pair_norm2, weights, normalize_weights, coefficients)
-
-
-@dataclass(frozen=True)
-class _SpinBlock:
-    basis: int
-    modes: tuple
-    kappa: tuple
-
-
-class OverlapEvaluator:
-    """Low-rank evaluator and lazy basis-overlap cache for one FIXED state.
-
-    Basis -1 is the jointly diagonalized h basis; nonnegative basis ids are
-    Cholesky bix values. Spin blocks use at most two orthonormal columns.
-    Channel identities/multiplicities are preserved, even for identity terms.
-    Build a new evaluator after changing bases, channels, or amplitudes.
-    """
-
-    def __init__(self, decomposition, *, loss_kind="weighted", check=True):
-        """check=False skips the basis and channel checks for a decomposition
-        that GaugeEvaluator built itself; numbers are identical either way."""
-        self.decomposition = decomposition
-        self.loss_kind = loss_kind_name(loss_kind)
-        self.scales = pair_scales(decomposition, self.loss_kind)
-        self.root_scales = np.sqrt(self.scales)
-        self.root_scales.setflags(write=False)
-        if check:
-            X = _real_array(decomposition.two_body.gauge.X, "Cholesky bases")
-            if X.ndim != 3 or X.shape[0] < 1 or X.shape[1] != X.shape[2] or X.shape[1] < 1:
-                raise ValueError("Cholesky bases must have shape (r,n,n)")
-        else:
-            X = decomposition.two_body.gauge.X
-        self.nbasis = X.shape[1]
-        basis = self._basis if check else (lambda array, name: array)
-        self._bases = {-1: basis(decomposition.one_body.X, "one-body basis")}
-        for bix, factor in enumerate(X):
-            self._bases[bix] = basis(factor, f"Cholesky basis {bix}")
-        self._overlaps = {}
-        blocks = []
-        for index, channel in enumerate(decomposition.one_body.channels):
-            if check:
-                self._leg(channel.spin, channel.mode, channel.d)
-            spin_blocks = [None, None]
-            spin_blocks[channel.spin] = self._block(-1, ((channel.mode,channel.d),),
-                                                    self.root_scales[index])
-            blocks.append(tuple(spin_blocks))
-        offset = len(decomposition.one_body.channels)
-        for index, channel in enumerate(decomposition.two_body.channels):
-            if check and (channel.bix not in self._bases or channel.bix < 0):
-                raise ValueError("Channel Cholesky basis index is out of range")
-            legs = [[], []]
-            for spin, mode, d in zip(channel.spins, channel.modes, channel.d):
-                if check:
-                    self._leg(spin, mode, d)
-                legs[spin].append((mode,d))
-            blocks.append(tuple(self._block(channel.bix, spin_legs, self.root_scales[offset+index])
-                                for spin_legs in legs))
-        self.blocks = tuple(blocks)
-
-    def _basis(self, array, name):
-        basis = _real_array(array, name)
-        if basis.shape != (self.nbasis,self.nbasis):
-            raise ValueError(f"{name} must have shape {(self.nbasis,self.nbasis)}")
-        if not np.allclose(basis.T @ basis, np.eye(self.nbasis), atol=1e-12, rtol=1e-10):
-            raise ValueError(f"{name} must have orthonormal columns for the overlap formula")
-        basis = basis.copy()
-        basis.setflags(write=False)
-        return basis
-
-    def _leg(self, spin, mode, d):
-        for value, name in ((spin,"spin"), (mode,"mode")):
-            if isinstance(value, (bool,np.bool_)) or not isinstance(value, Integral):
-                raise ValueError(f"{name} must be an integer")
-        if spin not in (0,1) or not 0 <= mode < self.nbasis:
-            raise ValueError("Channel spin/mode index is out of range")
-        if not isinstance(d, Real) or not np.isfinite(d):
-            raise ValueError("Channel amplitudes must be finite and real")
-
-    @staticmethod
-    def _block(basis, legs, scale=1.0):
-        coefficients = {}
-        for mode, d in legs:
-            old = coefficients.get(mode, 0.0)
-            coefficients[mode] = old + d + old*d
-        # Distinct modes are orthogonal. Repeated mode: (1+old P)(1+d P).
-        # The loss scale multiplies the MERGED amplitude (the matrix A), never d.
-        active = [(mode,float(kappa)) for mode,kappa in coefficients.items() if kappa != 0]
-        if not active:
-            return None
-        scale = float(scale)
-        return _SpinBlock(basis, tuple(p for p,_ in active),
-                          tuple(d if scale == 1.0 else scale*d for _,d in active))
-
-    def _overlap(self, left, right):
-        key = (min(left,right), max(left,right))
-        if key not in self._overlaps:
-            self._overlaps[key] = self._bases[key[0]].T @ self._bases[key[1]]
-        overlap = self._overlaps[key]
-        return overlap if left <= right else overlap.T
-
-    @property
-    def overlap_cache_size(self):
-        return len(self._overlaps)
-
-    def pair_norm2(self, i, j):
-        """Squared full-spin norm for one pair, including arbitrary spin order."""
-        for index in (i,j):
-            if isinstance(index, (bool,np.bool_)) or not isinstance(index, Integral):
-                raise TypeError("Channel index must be an integer")
-            if not 0 <= index < len(self.blocks):
-                raise IndexError("Channel index is out of range")
-        result = 0.0
-        for left, right in zip(self.blocks[i], self.blocks[j]):
-            if left is None or right is None or left.basis == right.basis:
-                continue
-            C = self._overlap(left.basis, right.basis)[np.ix_(left.modes, right.modes)]
-            result += commutator_norm2(left.kappa, right.kappa, C)
-        return result
-
-    def total(self):
-        """The loss_kind objective: fsum of all (scaled) pair norms."""
-        value = math.fsum(self.pair_norm2(i, j) for i in range(len(self.blocks))
-                          for j in range(i+1, len(self.blocks)))
-        if not math.isfinite(value):
-            raise FloatingPointError("Nonfinite commutator loss")
-        return value
-
-
-def overlap_commutator_loss(decomposition, *, normalize_weights=True):
-    """Cached-overlap diagnostics; no dense channel or commutator matrices."""
-    evaluator = OverlapEvaluator(decomposition, loss_kind="raw")
-    return _accumulate(evaluator.pair_norm2, _weights(decomposition, normalize_weights),
-                       normalize_weights, _weights(decomposition, False))
-
-
-def commutator_loss(decomposition, *, method="overlap", normalize_weights=True):
-    """Every loss at once: L_raw, unnormalized L_w and sor_base-compatible diagnostics.
-
-    normalize_weights affects only weighted_comm2, weight and weighted_mean;
-    comm2 and weighted_comm2_unnormalized do not depend on it. For the
-    optimized objective alone, use objective_loss.
-    """
-    if method == "overlap":
-        return overlap_commutator_loss(decomposition, normalize_weights=normalize_weights)
-    if method == "dense":
-        return dense_commutator_loss(decomposition, normalize_weights=normalize_weights)
-    raise ValueError("method must be 'overlap' or 'dense'")
-
-
-def objective_loss(decomposition, *, loss_kind="weighted", method="overlap"):
-    """The optimized objective for loss_kind, and nothing else.
-
-    raw: L_raw. weighted: sum_{i<j} a_i a_j ||[u_i,u_j]||_F^2 with the stored
-    unnormalized a_i. method='overlap' uses scaled blocks and math.fsum for
-    both kinds, exactly as the partition solver and gradients do; 'dense'
-    uses literal matrices and explicit pair weights.
+    gX[g][:, alpha] is the unconstrained partial derivative with respect to
+    the factor eigenvector X[g][:, alpha] (same-basis pairs excluded). The
+    one-body basis is fixed (it does not depend on the gauge). check=True runs
+    check_bases first. space: a ModeSpace already built for these bases
+    (GaugeEvaluator reuses one per gauge); None builds it.
     """
     loss_kind = loss_kind_name(loss_kind)
-    if method == "overlap":
-        return OverlapEvaluator(decomposition, loss_kind=loss_kind).total()
-    if method == "dense":
-        result = dense_commutator_loss(decomposition, normalize_weights=False)
-        return result.comm2 if loss_kind == "raw" else result.weighted_comm2_unnormalized
-    raise ValueError("method must be 'overlap' or 'dense'")
+    if check:
+        check_bases(decomposition)
+    space = ModeSpace.of(decomposition) if space is None else space
+    q, O = channel_loads(decomposition, loss_kind, space)
+    h, OO = space.offdiagonal_terms(O)
+    loss = space.loss(q, h, OO)
+    G = space.field(q, h)                                            # dL/dq, (2, N)
 
+    two = decomposition.two_body.table
+    r, n, N = space.nchol, space.n, space.nmodes
+    s = two.a if loss_kind == "weighted" else np.ones(len(two))
+    d0, d1 = two.d[:, 0], two.d[:, 1]
+    gm0, gm1 = two.bix*n + two.modes[:, 0], two.bix*n + two.modes[:, 1]
+    split, distinct, repeated = channel_legs(two)
+    g_amplitude = np.zeros((len(two), 2))
+    legs = split | distinct
+    g_amplitude[legs, 0] = 2.0*(s*d0)[legs]*G[two.spins[legs, 0], gm0[legs]]
+    g_amplitude[legs, 1] = 2.0*(s*d1)[legs]*G[two.spins[legs, 1], gm1[legs]]
+    if np.any(repeated):
+        kappa = d0[repeated] + d1[repeated] + d0[repeated]*d1[repeated]
+        common = 2.0*s[repeated]*kappa*G[two.spins[repeated, 0], gm0[repeated]]
+        g_amplitude[repeated, 0] = common*(1.0 + d1[repeated])
+        g_amplitude[repeated, 1] = common*(1.0 + d0[repeated])
 
-def raw_loss(decomposition, *, method="overlap"):
-    """Only L_raw: objective_loss with loss_kind='raw'."""
-    return objective_loss(decomposition, loss_kind="raw", method=method)
+    C, C2 = space.C, space.C2
+    GC = (np.outer(q[0], q[0]) + np.outer(q[1], q[1]))*(2.0*C - 4.0*C*C2)   # from q^T F(C) q
+    gX_offdiagonal = np.zeros((r, n, n))
+    if O is not None:
+        X = space.X
+        Yr = C2[:, :r*n].reshape(N, r, n)
+        dO = np.zeros_like(O)                                        # dL/dO, entries independent
+        for spin in (0, 1):
+            Os = O[spin]
+            if not np.any(Os):
+                continue
+            # -2 q.h, h = diag(C2 O C2^T)
+            dO[spin] -= 2.0*np.einsum("xga,xgb->gab", Yr*q[spin][:, None, None], Yr, optimize=True)
+            C2O = np.einsum("xgm,gmk->xgk", Yr, Os).reshape(N, r*n)
+            GC[:, :r*n] -= 8.0*q[spin][:, None]*C[:, :r*n]*C2O
+            # -OO = -sum_{pqrs} K[p,q,r,s] K[q,r,s,p]
+            K = space.orbital_K(Os)
+            Kt = K.transpose(3, 0, 1, 2)                             # Kt[p,q,r,s] = K[q,r,s,p]
+            T = np.einsum("pqrs,gpa,gqa->gars", Kt, X, X, optimize=True)
+            dO[spin] -= 2.0*np.einsum("gars,grb,gsb->gab", T, X, X, optimize=True)
+            V = np.einsum("gab,grb,gsb->gars", Os, X, X, optimize=True)
+            gX_offdiagonal -= 8.0*np.einsum("qrsu,gqa,gars->gua", K, X, V, optimize=True)
+        both = dO + dO.transpose(0, 1, 3, 2)
+        coupling = both[two.spins[distinct, 0], two.bix[distinct], two.modes[distinct, 0], two.modes[distinct, 1]]
+        g_amplitude[distinct, 0] += (s*d1)[distinct]*coupling
+        g_amplitude[distinct, 1] += (s*d0)[distinct]*coupling
+    GX = space.Xall @ (GC + GC.T)
+    gX = GX[:, :r*n].reshape(n, r, n).transpose(1, 0, 2) + gX_offdiagonal
+    if not (np.isfinite(g_amplitude).all() and np.isfinite(gX).all()):
+        raise FloatingPointError("Nonfinite loss pullback")
+    return float(loss), g_amplitude, gX
