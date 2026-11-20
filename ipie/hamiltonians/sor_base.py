@@ -304,12 +304,14 @@ class SumOfRotationBase:
                     E2_chunks.append(ixs)
                 p = xp.asarray(terms['p'])
                 d = xp.asarray(terms['d'])
+                assert len(d[d<-1.+self.thresh])==0
+
                 sg.term_info[term_key] = {'p':p,'d':d,'ix':xp.asarray(ixs)}
                 # at this point not sure what saved ixs is for 
                 # might not need if we never compute all overlap ratios
 
                 if iprint>1:
-                    print('key=',term_key)
+                    print('\nkey=',term_key)
                     print('ixs=',ixs)
                     print('a=',a)
                     print('p=',p)

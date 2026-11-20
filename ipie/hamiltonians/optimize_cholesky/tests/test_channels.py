@@ -17,7 +17,6 @@ from ipie.hamiltonians.optimize_cholesky.channels import (
 from ipie.hamiltonians.optimize_cholesky.problem import (
     build_gauge_state,
     exponential_gauge,
-    givens_gauge,
     prepare_problem,
 )
 

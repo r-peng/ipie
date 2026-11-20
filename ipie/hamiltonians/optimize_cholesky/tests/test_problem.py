@@ -9,11 +9,6 @@ from ipie.hamiltonians.optimize_cholesky.models import (
     TensorData,
     ValidationOptions,
 )
-from ipie.hamiltonians.optimize_cholesky.problem import (
-    build_gauge_state,
-    prepare_problem,
-    validate_inputs,
-)
 from dataclasses import replace
 from pathlib import Path
 from ipie.hamiltonians.optimize_cholesky.problem import (
