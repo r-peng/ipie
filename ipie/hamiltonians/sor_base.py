@@ -511,7 +511,7 @@ def compute_h1e_shift(h1e,eri,chol,nelec,dt1,dt2):
 
 class QCSOR(SumOfRotationBase):
 
-    def make_shift(self,h1e,eri,chol,nelec,dt1,dt2,iprint=0,fname=None):
+    def make_shift(self,h1e,chol,nelec,dt1,dt2,iprint=0,fname=None):
         ell,c = compute_cholesky_shift(chol)
         if iprint>0:
             print('cholesky bands =',ell)
@@ -533,7 +533,8 @@ class QCSOR(SumOfRotationBase):
 
         mu = compute_h1e_shift(h_t,eri_new,Lp,nelec,dt1,dt2)
         self.E0 += mu[0]*nelec[0]+mu[1]*nelec[1]
-        h_t -= 0.5 * np.einsum("prrs->ps",eri)
+        #h_t -= 0.5 * np.einsum("prrs->ps",eri)
+        h_t -= 0.5 * np.einsum("gpr,grs->ps",chol,chol)
         if np.fabs(mu[0]-mu[1])<1e-16:
             h_t -= mu[0]*np.eye(n)
         else:
@@ -561,39 +562,78 @@ class QCSOR(SumOfRotationBase):
         return modified_cholesky(M, cmax=cmax).reshape(-1, nbasis, nbasis)
 
     @classmethod
-    def optimize_from_cholesky(cls,h1e,eri,chol,nelecs,dt1,dt2,source,**kwargs):
+    def optimize_from_cholesky(cls,h1e,chol,nelecs,dt1,dt2,source,*,
+                               theta=0.1,seed=None,partition='balanced_log',loss_kind='weighted',
+                               maxiter=None,verbosity=None,gradient_atol=None,gradient_rtol=None,
+                               maxsweep=None,inner_atol=None,inner_rtol=None,
+                               amplitude_limit=None,one_body_limit=None,
+                               options=None,inner_options=None,
+                               drop_identity=False,overwrite=False,metadata=None):
         """Optimize the Cholesky gauge and save the result to the HDF5 file `source`.
 
         The file is written by optimize_cholesky.io.save_decomposition and is read
-        back with QCSOR.from_file(source). Extra keyword arguments drop_identity,
-        overwrite and metadata are passed to save_decomposition.
+        back with QCSOR.from_file(source). Returns the OuterOptimizationResult.
+        All options are keyword-only; an unknown name raises TypeError.
+
+        Start and objective:
+          theta=0.1         scale of the random starting angles, uniform in [-theta, theta]
+          seed=None         seed for those angles (numpy RandomState); None draws from the
+                            global np.random state, so np.random.seed(s) still works
+          partition, loss_kind   amplitude map and objective of GaugeEvaluator
+
+        Outer L-BFGS. Based on `options` (an LBFGSOptions; default
+        LBFGSOptions(verbosity=2, line_search='weak_wolfe')), with each of these
+        overriding its field when not None:
+          maxiter -> max_iterations (default 100), verbosity (default 2),
+          gradient_atol (default 1e-8), gradient_rtol (default 1e-6).
+          The outer loop stops at gradient_atol + gradient_rtol*|initial gradient|_inf.
+
+        Inner partition and shift solve at every trial gauge. Based on `inner_options`
+        (an InnerOptions; default InnerOptions(optimize_shift=True)), with each of these
+        overriding its field when not None:
+          maxsweep -> max_sweeps (default 500), inner_atol -> gradient_atol (default
+          1e-11), inner_rtol -> gradient_rtol (default 1e-9), amplitude_limit (default
+          (1-1e-8)*amplitude_bound), one_body_limit (default 1-1e-8).
+
+        drop_identity, overwrite and metadata are passed to save_decomposition.
         """
+        from dataclasses import replace
         from ipie.hamiltonians.optimize_cholesky.io import save_decomposition
         from ipie.hamiltonians.optimize_cholesky.models import LBFGSOptions,InnerOptions
         from ipie.hamiltonians.optimize_cholesky.problem import prepare_problem
         from ipie.hamiltonians.optimize_cholesky.gradients import GaugeEvaluator
         from ipie.hamiltonians.optimize_cholesky.optimizers import optimize_gauge
+
+        def overridden(base,fields):
+            given = {name:value for name,value in fields.items() if value is not None}
+            return replace(base,**given) if given else base
+
+        # Options first: invalid settings fail before any numerical work.
+        if options is None:
+            options = LBFGSOptions(verbosity=2,line_search='weak_wolfe')
+        elif not isinstance(options,LBFGSOptions):
+            raise TypeError("options must be LBFGSOptions")
+        options = overridden(options,{'max_iterations':maxiter,'verbosity':verbosity,
+                                      'gradient_atol':gradient_atol,'gradient_rtol':gradient_rtol})
+        if inner_options is None:
+            inner_options = InnerOptions(optimize_shift=True)
+        elif not isinstance(inner_options,InnerOptions):
+            raise TypeError("inner_options must be InnerOptions")
+        inner_options = overridden(inner_options,{'max_sweeps':maxsweep,'gradient_atol':inner_atol,
+                                                  'gradient_rtol':inner_rtol,'amplitude_limit':amplitude_limit,
+                                                  'one_body_limit':one_body_limit})
+
+        eri = np.einsum("gpr,gqs->prqs", chol, chol)
         problem = prepare_problem(h1e,eri,chol,nelec=nelecs)
-    
         r = problem.data.nchol
-        theta = kwargs.get('theta',0.1)
-        theta = theta*(np.random.rand(r * (r - 1) // 2)*2.-1.)
-    
-        partition = kwargs.get('partition','balanced_log')
-        loss_kind = kwargs.get('loss_kind','weighted')
-        evaluator = GaugeEvaluator(problem, tau1=dt1, tau2=dt2, loss_kind=loss_kind, partition=partition, backend='numpy')
-    
-        maxiter = kwargs.get('maxiter',100)
-        maxsweep = kwargs.get('maxsweep',100)
-        verbosity = kwargs.get('verbosity',2)
-        result = optimize_gauge(evaluator,
-            solver='lbfgs',
-            theta0=theta,
-            options=LBFGSOptions(max_iterations=maxiter,verbosity=verbosity, line_search='weak_wolfe'),
-            inner_options=InnerOptions(max_sweeps=maxsweep, gradient_atol=1e-6, gradient_rtol=1e-6,optimize_shift=True),
-    )
-        save_decomposition(source,result,drop_identity=kwargs.get('drop_identity',False),
-                           overwrite=kwargs.get('overwrite',False),metadata=kwargs.get('metadata',None))
+        draws = np.random.rand(r*(r-1)//2) if seed is None else np.random.RandomState(seed).rand(r*(r-1)//2)
+        theta0 = theta*(draws*2.-1.)
+
+        evaluator = GaugeEvaluator(problem,tau1=dt1,tau2=dt2,loss_kind=loss_kind,partition=partition,
+                                   backend='numpy')
+        result = optimize_gauge(evaluator,solver='lbfgs',theta0=theta0,options=options,
+                                inner_options=inner_options)
+        save_decomposition(source,result,drop_identity=drop_identity,overwrite=overwrite,metadata=metadata)
         return result
 
     @classmethod
