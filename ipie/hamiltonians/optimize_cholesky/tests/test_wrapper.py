@@ -1,4 +1,8 @@
-"""Step 5: QCSOR.optimize_from_cholesky options, defaults and limits."""
+"""Step 5: QCSOR.optimize_from_cholesky options, defaults and limits.
+
+Since 3290327 the wrapper takes (h1e, chol, nelecs, dt1, dt2, source) and builds
+eri = einsum("gpr,gqs->prqs", chol, chol) itself.
+"""
 
 from contextlib import ExitStack
 from unittest.mock import patch
@@ -23,9 +27,12 @@ OPTIMIZERS = "ipie.hamiltonians.optimize_cholesky.optimizers.optimize_gauge"
 SAVE = "ipie.hamiltonians.optimize_cholesky.io.save_decomposition"
 
 
+PREPARE = "ipie.hamiltonians.optimize_cholesky.problem.prepare_problem"
+
+
 def tensors():
-    h1, eri, chol = synthetic(3, 2, 23)
-    return h1, eri, chol, (2, 1)
+    h1, _, chol = synthetic(3, 2, 23)
+    return h1, chol, (2, 1)
 
 
 def captured(**kwargs):
@@ -48,6 +55,8 @@ class WrapperOptionTests(unittest.TestCase):
         self.assertEqual(outer, LBFGSOptions(verbosity=2, line_search="weak_wolfe"))
         self.assertEqual((outer.max_iterations, outer.gradient_atol, outer.gradient_rtol), (100, 1e-8, 1e-6))
         self.assertEqual(call.kwargs["solver"], "lbfgs")
+        # Since roadmap step 13: a tied Cholesky shift from the median start.
+        self.assertEqual((call.kwargs["optimize_cholesky_shift"], call.kwargs["cholesky_shift0"]), ("tied", None))
         self.assertEqual(save.kwargs, {"drop_identity": False, "overwrite": False, "metadata": None})
 
     def test_every_option_reaches_its_field(self):
@@ -85,10 +94,19 @@ class WrapperOptionTests(unittest.TestCase):
         for kwargs in ({"amplitude_limit": 1.5}, {"one_body_limit": 0.}, {"maxsweep": -1},
                        {"inner_atol": -1.}, {"gradient_rtol": float("nan")}, {"maxiter": 2.5}):
             with self.subTest(kwargs=kwargs), \
-                 patch("ipie.hamiltonians.optimize_cholesky.problem.prepare_problem",
-                       side_effect=AssertionError("prepare_problem ran")), \
+                 patch(PREPARE, side_effect=AssertionError("prepare_problem ran")), \
                  self.assertRaises(ValueError):
                 captured(**kwargs)
+
+    def test_eri_is_built_from_chol(self):
+        h1, chol, nelec = tensors()
+        with patch(PREPARE, wraps=prepare_problem) as prepare:
+            captured()
+        args, kwargs = prepare.call_args
+        np.testing.assert_array_equal(args[0], h1)
+        np.testing.assert_array_equal(args[1], np.einsum("gpr,gqs->prqs", chol, chol))
+        np.testing.assert_array_equal(args[2], chol)
+        self.assertEqual(kwargs, {"nelec": nelec})
 
     def test_seeded_and_global_random_starts(self):
         count = 1                                                   # r = 2 factors
@@ -118,9 +136,10 @@ class WrapperLimitTests(unittest.TestCase):
         limit, one_body_limit = 1.02*tightest, .01
         with tempfile.TemporaryDirectory() as folder:
             path = os.path.join(folder, "decomposition.h5")
-            result = QCSOR.optimize_from_cholesky(m["h1"], m["eri"], m["chol"], m["nelec"], .03, .04, path,
+            # Limits computed from the unshifted eigenvalues: run without a Cholesky shift.
+            result = QCSOR.optimize_from_cholesky(m["h1"], m["chol"], m["nelec"], .03, .04, path,
                                                   seed=1, maxiter=2, verbosity=0, amplitude_limit=limit,
-                                                  one_body_limit=one_body_limit)
+                                                  one_body_limit=one_body_limit, optimize_cholesky_shift=False)
             ham = QCSOR.from_file(path, thresh=None)
         inner = result.partition_result
         self.assertEqual(inner.amplitude_limit, limit)

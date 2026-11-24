@@ -24,6 +24,8 @@ import numpy as np
 from .channels import (
     canonical_table,
     fixed_partition_amplitudes,
+    leg_log_bases,
+    leg_partition_map,
     partition_log_bases,
     partition_map,
     positive_scale,
@@ -73,9 +75,9 @@ def _validate_partition_state(decomposition):
     if len(two.source_slices) != count or np.shape(two.t) != (count,):
         raise ValueError("Source slices and t must have one entry per source")
     t, amplitudes = fixed_partition_amplitudes(
-        two.gauge.eigenvalues, two.sources, two.tau2, two.t,
+        two.map_eigenvalues, two.sources, two.tau2, two.t,
         two.partition, two.amplitude_bound)
-    if np.shape(two.amplitudes) != (count, 2) or not np.array_equal(two.amplitudes, amplitudes):
+    if np.shape(two.amplitudes) != np.shape(amplitudes) or not np.array_equal(two.amplitudes, amplitudes):
         raise ValueError("Stored amplitudes disagree with the source partition map; rebuild channels")
     if not two.canonical:
         raise ValueError("Channels disagree with the shared source amplitudes/branch order: "
@@ -99,7 +101,7 @@ def _with_partitions(decomposition, t):
     """with_partitions without re-checking the input decomposition."""
     two = decomposition.two_body
     ratios, amplitudes = fixed_partition_amplitudes(
-        two.gauge.eigenvalues, two.sources, two.tau2, t,
+        two.map_eigenvalues, two.sources, two.tau2, t,
         two.partition, two.amplitude_bound)
     return replace(decomposition, two_body=replace(
         two, t=ratios, amplitudes=amplitudes,
@@ -122,7 +124,7 @@ def partition_bounds(decomposition, *, amplitude_limit=None, max_abs_t=30.0):
     """
     _validate_partition_state(decomposition)
     two = decomposition.two_body
-    return _partition_intervals(two.gauge.eigenvalues, two.sources, two.tau2,
+    return _partition_intervals(two.map_eigenvalues, two.sources, two.tau2,
                                 two.partition, two.amplitude_bound,
                                 amplitude_limit=amplitude_limit, max_abs_t=max_abs_t)
 
@@ -140,8 +142,13 @@ def interval_logs(eigenvalues, sources, tau2, partition, log_rho):
     """Uncapped interval ends log(|d_R(0)|/rho) and log(rho/|d_L(0)|) of every source.
 
     -inf (lower) / +inf (upper) mark a leg that supplies no amplitude bound.
-    Shared by the partition intervals and the bound pullback.
+    Shared by the partition intervals and the bound pullback. Per-spin
+    eigenvalues (2, r, n) bound each leg by its largest spin amplitude.
     """
+    if np.ndim(eigenvalues) == 3:
+        logs, _ = leg_log_bases(eigenvalues, sources, math.log(tau2), partition)
+        log_left, log_right = np.max(logs[:, 0, :], axis=1), np.max(logs[:, 1, :], axis=1)
+        return log_right - log_rho, log_rho - log_left
     left, right = source_eigenvalues(eigenvalues, sources)
     log_left, log_right = partition_log_bases(left, right, math.log(tau2), partition)
     return log_right - log_rho, log_rho - log_left
@@ -220,13 +227,18 @@ class _InnerState:
         # The mode space depends on the bases only (gauge and h), not on t or mu.
         self.space = space = ModeSpace.of(decomposition) if space is None else space
         sources = two.sources
-        self.ell = np.asarray(two.gauge.eigenvalues, dtype=np.float64)
+        # (r, n) for unshifted or tied shifts; (2, r, n) per spin when the shift is split.
+        self.ell = np.asarray(two.map_eigenvalues, dtype=np.float64)
+        self.split = two.split
         self.tau2, self.partition = float(two.tau2), two.partition
         self.t = np.array(two.t, dtype=np.float64, copy=True)
         self.amplitudes = np.array(two.amplitudes, dtype=np.float64, copy=True)
         self.src_bix, self.src_modes = sources.bix, sources.modes
-        self.src_left, self.src_right = source_eigenvalues(self.ell, sources)
         self.log_tau = math.log(self.tau2)
+        if self.split:
+            self.leg_logs, self.leg_signs = leg_log_bases(self.ell, sources, self.log_tau, self.partition)
+        else:
+            self.src_left, self.src_right = source_eigenvalues(self.ell, sources)
         # Canonical layout per channel: owning source, branch sign, spins, global modes, pair scale.
         self.src, self.sign, self.spins = sources.channel_source, sources.channel_sign, sources.channel_spins
         self.gm = sources.bix[self.src][:, None]*space.n + sources.modes[self.src]
@@ -245,12 +257,14 @@ class _InnerState:
         self.factor_blocks = []
         for (lo, hi), (c_lo, c_hi) in zip(self.factor_sources, self.factor_channels):
             self.factor_blocks.append((self.src[c_lo:c_hi] - lo, self.sign[c_lo:c_hi, None],
-                                       self.scale[c_lo:c_hi], local[c_lo:c_hi, 0], local[c_lo:c_hi, 1]))
-        # One-body channels.
+                                       self.scale[c_lo:c_hi], local[c_lo:c_hi, 0], local[c_lo:c_hi, 1],
+                                       self.spins[c_lo:c_hi]))
+        # One-body channels; ob_eps is each channel's orbital energy in its own spin's basis.
         self.one_body = one
         self.ob_spin, self.ob_mode = one.table.spin, one.table.mode
         self.ob_scale = one.table.a if weighted else np.ones(len(one.table))
-        self.eps, self.tau1 = np.asarray(one.eigenvalues, dtype=np.float64), float(one.tau1)
+        self.ob_eps = one.mode_eigenvalues[self.ob_spin, self.ob_mode]
+        self.tau1 = float(one.tau1)
         self.shift = list(shift_pair(one.shift))
         self.shift_changed = False
         # Loads; the off-diagonal part (h, OO) does not depend on t or mu.
@@ -260,12 +274,21 @@ class _InnerState:
     def loss(self):
         return self.space.loss(self.q, self.h, self.OO)
 
+    def _channel_amplitudes(self, amplitudes, src, sign, spins):
+        """sign_c * (d_left, d_right) of channels with local sources src (and leg spins, if split)."""
+        if not self.split:
+            return sign*amplitudes[src]
+        d = np.empty((src.shape[0], 2))
+        d[:, 0] = amplitudes[src, 0, spins[:, 0]]
+        d[:, 1] = amplitudes[src, 1, spins[:, 1]]
+        return sign*d
+
     def source_terms(self, field, channels=None, sources=None):
         """(left, right) of each source: loads of its +t and -t legs times the field."""
         lo, hi = (0, self.src.shape[0]) if channels is None else channels
         s_lo, s_hi = (0, self.t.shape[0]) if sources is None else sources
         src = self.src[lo:hi]
-        d = self.sign[lo:hi, None]*self.amplitudes[src]
+        d = self._channel_amplitudes(self.amplitudes, src, self.sign[lo:hi, None], self.spins[lo:hi])
         s = self.scale[lo:hi]
         G = np.maximum(field, 0.0)                     # dL/dq >= 0; clamp roundoff
         left = s*d[:, 0]*d[:, 0]*G[self.spins[lo:hi, 0], self.gm[lo:hi, 0]]
@@ -274,16 +297,19 @@ class _InnerState:
                 np.bincount(src-s_lo, weights=right, minlength=s_hi-s_lo))
 
     def set_amplitudes(self, lo, hi, t):
-        """The partition map (channels.partition_map) for sources [lo, hi) at log ratios t."""
-        self.amplitudes[lo:hi] = partition_map(self.src_left[lo:hi], self.src_right[lo:hi], t,
-                                               self.log_tau, self.partition)[0]
+        """The partition map (channels.partition_map, or leg_partition_map if split) for sources [lo, hi)."""
+        if self.split:
+            self.amplitudes[lo:hi] = leg_partition_map(self.leg_logs[lo:hi], self.leg_signs[lo:hi], t)[0]
+        else:
+            self.amplitudes[lo:hi] = partition_map(self.src_left[lo:hi], self.src_right[lo:hi], t,
+                                                   self.log_tau, self.partition)[0]
         self.t[lo:hi] = t
 
     def factor_terms(self, g, field):
         """(left, right) of factor g's sources from the factor's own field columns (2, n)."""
         lo, hi = self.factor_sources[g]
-        src, sign, s, m0, m1 = self.factor_blocks[g]
-        d = sign*self.amplitudes[lo:hi][src]
+        src, sign, s, m0, m1, spins = self.factor_blocks[g]
+        d = self._channel_amplitudes(self.amplitudes[lo:hi], src, sign, spins)
         G = np.maximum(field, 0.0).reshape(-1)        # dL/dq >= 0; clamp roundoff
         left = s*d[:, 0]*d[:, 0]*G[m0]
         right = s*d[:, 1]*d[:, 1]*G[m1]
@@ -297,8 +323,8 @@ class _InnerState:
         if hi == lo:
             self.q[:, columns] = 0.0
             return
-        src, sign, s, m0, m1 = self.factor_blocks[g]
-        d = sign*self.amplitudes[lo:hi][src]
+        src, sign, s, m0, m1, spins = self.factor_blocks[g]
+        d = self._channel_amplitudes(self.amplitudes[lo:hi], src, sign, spins)
         loads = np.bincount(m0, weights=s*d[:, 0]**2, minlength=2*n)
         loads += np.bincount(m1, weights=s*d[:, 1]**2, minlength=2*n)
         self.q[:, columns] = loads.reshape(2, n)
@@ -310,7 +336,7 @@ class _InnerState:
 
     def set_shift(self, shift):
         """One-body loads at a new (mu_up, mu_down); the domain 1+d>0 is checked."""
-        d = (np.asarray(shift, dtype=np.float64)[self.ob_spin] - self.eps[self.ob_mode])*self.tau1
+        d = (np.asarray(shift, dtype=np.float64)[self.ob_spin] - self.ob_eps)*self.tau1
         if not np.isfinite(d).all() or np.any(1.0+d <= 0):
             raise GaugeFeasibilityError("Shift leaves the one-body real-exponential domain 1+d>0")
         n = self.space.n
@@ -436,7 +462,7 @@ def _solve_partitions(decomposition, options, loss_kind, space=None):
     if optimize_shift and decomposition.two_body.nelec is None:
         raise ValueError("optimize_shift requires particle numbers: pass nelec to prepare_problem")
     two = decomposition.two_body
-    bounds = _partition_intervals(two.gauge.eigenvalues, two.sources, two.tau2, two.partition,
+    bounds = _partition_intervals(two.map_eigenvalues, two.sources, two.tau2, two.partition,
                                   two.amplitude_bound, amplitude_limit=amplitude_limit,
                                   max_abs_t=max_abs_t)
     state = _InnerState(decomposition, loss_kind, space)

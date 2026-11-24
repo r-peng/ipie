@@ -353,6 +353,13 @@ class TwoBodyDecomposition:
     filtered channel lists) for the loss kernels, rotation matrices and tests.
     source_slices[i] = (start, stop) refers to channels[start:stop] of a
     canonical table. All arrays are owned, read-only snapshots.
+
+    cholesky_shift: None, or (r, 2) shifts mu[gamma, sigma] of the rotated
+    factors, so the channels use lambda[sigma, gamma, alpha] =
+    ell[gamma, alpha] - mu[gamma, sigma] (see FixedDecomposition.cholesky_energy).
+    amplitudes holds (d_left, d_right) per source, shape (count, 2), unless the
+    shift differs between spins; then it is (count, 2, 2) = [source, leg, spin]
+    and split is True. A tied or absent shift uses today's (count, 2) layout.
     """
 
     gauge: GaugeState
@@ -366,6 +373,38 @@ class TwoBodyDecomposition:
     amplitudes: np.ndarray
     table: ChannelTable
     canonical: bool = True
+    cholesky_shift: Optional[np.ndarray] = None
+
+    @property
+    def split(self):
+        """True when the amplitudes are stored per spin, shape (count, 2, 2)."""
+        return np.ndim(self.amplitudes) == 3
+
+    @property
+    def spin_eigenvalues(self):
+        """(2, r, n) shifted factor eigenvalues lambda[sigma] = ell - mu[:, sigma]."""
+        ell = np.asarray(self.gauge.eigenvalues, dtype=np.float64)
+        if self.cholesky_shift is None:
+            return np.stack([ell, ell])
+        return ell[None, :, :] - np.asarray(self.cholesky_shift, dtype=np.float64).T[:, :, None]
+
+    @property
+    def map_eigenvalues(self):
+        """The eigenvalues the partition map uses: (r, n) unless split, then (2, r, n)."""
+        if self.split:
+            return self.spin_eigenvalues
+        if self.cholesky_shift is None:
+            return self.gauge.eigenvalues
+        return np.asarray(self.gauge.eigenvalues, dtype=np.float64) \
+            - np.asarray(self.cholesky_shift, dtype=np.float64)[:, 0][:, None]
+
+    @property
+    def leg_amplitudes(self):
+        """(count, 2, 2) amplitudes [source, leg, spin]; equal spins unless split."""
+        if self.split:
+            return self.amplitudes
+        amplitudes = np.asarray(self.amplitudes, dtype=np.float64)
+        return np.repeat(amplitudes[:, :, None], 2, axis=2)
 
     @property
     def channels(self):
@@ -390,6 +429,12 @@ class OneBodyDecomposition:
     channels represent sum_k (epsilon_k-mu_sigma) n_{k,sigma}. The remainder
     sum_sigma mu_sigma N_sigma is a constant only on a fixed (N_up, N_down)
     sector; see FixedDecomposition.shift_energy.
+
+    Without a Cholesky shift the matrix is the bare h, X is (n, n) and
+    eigenvalues (n,). With one it is h_sigma = h + sum_g (m_g - mu[g,sigma]) L_g
+    (channels.one_body_matrices), and cholesky_shift records the (r, 2) shift.
+    When h_up and h_down differ, X is (2, n, n) and eigenvalues (2, n), one
+    eigensystem per spin (split is True).
     """
 
     X: np.ndarray
@@ -397,6 +442,26 @@ class OneBodyDecomposition:
     tau1: float
     table: OneBodyTable
     shift: Tuple[float, float] = (0.0, 0.0)
+    cholesky_shift: Optional[np.ndarray] = None
+
+    @property
+    def split(self):
+        """True when each spin has its own eigensystem, X (2, n, n)."""
+        return np.ndim(self.X) == 3
+
+    def spin_X(self, spin):
+        """Eigenvectors (columns) of spin's one-body matrix."""
+        return self.X[spin] if self.split else self.X
+
+    def spin_eigenvalues(self, spin):
+        """Eigenvalues of spin's one-body matrix, ascending."""
+        return self.eigenvalues[spin] if self.split else self.eigenvalues
+
+    @property
+    def mode_eigenvalues(self):
+        """(2, n) eigenvalues eps[sigma, k], equal rows unless split."""
+        eps = np.asarray(self.eigenvalues, dtype=np.float64)
+        return eps if self.split else np.stack([eps, eps])
 
     @property
     def channels(self):
@@ -425,6 +490,35 @@ class FixedDecomposition:
 
     one_body: OneBodyDecomposition
     two_body: TwoBodyDecomposition
+
+    def __post_init__(self):
+        a, b = self.one_body.cholesky_shift, self.two_body.cholesky_shift
+        if (a is None) != (b is None) or (a is not None and not np.array_equal(a, b)):
+            raise ValueError("The one-body and two-body channels were built for different Cholesky shifts")
+
+    @property
+    def cholesky_shift(self):
+        """None, or the (r, 2) shifts mu[gamma, sigma] of the rotated factors."""
+        return self.two_body.cholesky_shift
+
+    @property
+    def cholesky_energy(self):
+        """E_c = 1/2 sum_g (sum_s N_s mu[g,s]^2 - m_g^2), m_g = sum_s N_s mu[g,s].
+
+        On the (N_up, N_down) sector H = H_channels + E_c, where H_channels uses
+        the shifted factors L_g - mu[g,s] I and h_s = h + sum_g (m_g - mu[g,s]) L_g.
+        A tied shift gives -1/2 N(N-1) sum_g mu_g^2.
+        """
+        mu = self.cholesky_shift
+        if mu is None:
+            return 0.0
+        nelec = self.two_body.nelec
+        if nelec is None:
+            raise ValueError("A Cholesky shift requires particle numbers (nelec)")
+        counts = np.asarray(nelec, dtype=np.float64)
+        mu = np.asarray(mu, dtype=np.float64)
+        m = mu @ counts
+        return float(0.5*np.sum((mu*mu) @ counts - m*m))
 
     @property
     def nterms(self):
@@ -455,12 +549,14 @@ class FixedDecomposition:
 
     @property
     def lambda_electronic(self):
-        """Lambda without E0: denom + sum_sigma mu_sigma N_sigma.
+        """Lambda without E0: denom + sum_sigma mu_sigma N_sigma + cholesky_energy.
 
         On the (N_up, N_down) sector, (E0+lambda_electronic)*I - H_tot equals
-        sum_i a_i U_i. With zero shift this is denom.
+        sum_i a_i U_i. With zero shifts this is denom.
         """
-        return float(self.denom + self.shift_energy)
+        if self.cholesky_shift is None:
+            return float(self.denom + self.shift_energy)
+        return float(self.denom + self.shift_energy + self.cholesky_energy)
 
 
 LOSS_KINDS = ("raw", "weighted")
@@ -766,6 +862,13 @@ class GaugeGradient:
     derivative is TWICE the corresponding upper generator entry.
     fixed_gradient_O holds t fixed; bound_correction_O supplies the fixed-z
     chain rule in fixed_z/relaxed modes. Inner optimizer steps are not unrolled.
+
+    cholesky_gradient: None, or dL/d of the Cholesky shift mu[gamma, sigma] at
+    the same point, with the same t (fixed_t), z (fixed_z) or envelope
+    (relaxed) convention: (r,) for a tied shift (one mu_gamma for every spin
+    with channels; for aa_only that is mu_up), (r, 2) per spin. With a shift,
+    gradient_O includes the gauge dependence of the one-body matrices h_sigma.
+    (PartitionOptimizationResult.shift_gradient is the one-body shift's.)
     """
 
     loss: float
@@ -779,6 +882,7 @@ class GaugeGradient:
     partition_gradient: np.ndarray
     eigenvalue_gradient: np.ndarray
     inner_result: Optional[PartitionOptimizationResult] = None
+    cholesky_gradient: Optional[np.ndarray] = None
 
 
 @dataclass(frozen=True)
@@ -929,11 +1033,39 @@ class LBFGSOptions(OptimizerOptions):
 
 @dataclass(frozen=True)
 class ExponentialEvaluation:
-    """Matching parameters, reduced loss, gradient and converged inner snapshot."""
+    """Matching parameters, reduced loss, gradient and converged inner snapshot.
+
+    theta and gradient_theta are the gauge angles and their gradient. When
+    the outer objective also optimizes the Cholesky shift, scaled_shift holds
+    its coordinates mu/s and gradient_scaled_shift their gradient; the solver
+    then works on coordinates = (theta, mu/s), or mu/s alone when
+    theta_frozen. Without them coordinates is theta itself.
+    """
 
     theta: np.ndarray
     gradient_theta: np.ndarray
     gauge_gradient: GaugeGradient
+    scaled_shift: Optional[np.ndarray] = None
+    gradient_scaled_shift: Optional[np.ndarray] = None
+    theta_frozen: bool = False
+
+    @property
+    def coordinates(self):
+        """The solver's coordinate vector."""
+        if self.scaled_shift is None:
+            return self.theta
+        if self.theta_frozen:
+            return self.scaled_shift
+        return np.concatenate([self.theta, self.scaled_shift])
+
+    @property
+    def gradient(self):
+        """The gradient with respect to coordinates."""
+        if self.scaled_shift is None:
+            return self.gradient_theta
+        if self.theta_frozen:
+            return self.gradient_scaled_shift
+        return np.concatenate([self.gradient_theta, self.gradient_scaled_shift])
 
     @property
     def loss(self):
@@ -948,12 +1080,26 @@ class ExponentialEvaluation:
         return self.decomposition.two_body.gauge.O
 
     @property
+    def cholesky_shift(self):
+        """The (r, 2) Cholesky shift of this point, or None (also for a decomposition without one)."""
+        return getattr(self.decomposition, "cholesky_shift", None)
+
+    @property
     def gradient_norm(self):
-        return float(np.max(np.abs(self.gradient_theta),initial=0.))
+        """max |gradient| over the solver coordinates (gauge angles and scaled shift)."""
+        return float(np.max(np.abs(self.gradient),initial=0.))
 
     @property
     def tangent_gradient_norm(self):
-        return float(np.linalg.norm(self.gauge_gradient.tangent_gradient,"fro"))
+        """Frobenius norm of the physical tangent gradient, joined (2-norm) with the scaled shift gradient.
+
+        The tangent part is left out when the gauge is frozen.
+        """
+        tangent = float(np.linalg.norm(self.gauge_gradient.tangent_gradient,"fro"))
+        if self.scaled_shift is None:
+            return tangent
+        shift = float(np.linalg.norm(self.gradient_scaled_shift))
+        return shift if self.theta_frozen else math.hypot(tangent, shift)
 
 
 @dataclass(frozen=True)
@@ -994,7 +1140,12 @@ class OuterTrial:
 
 @dataclass(frozen=True)
 class OuterOptimizationResult:
-    """Last ACCEPTED state, never the last rejected line-search evaluation."""
+    """Last ACCEPTED state, never the last rejected line-search evaluation.
+
+    theta and initial_theta are gauge angles. When the Cholesky shift was
+    optimized, initial_cholesky_shift is the start, cholesky_scale the fixed
+    s of its coordinates mu/s, and cholesky_shift the final (r, 2) shift.
+    """
 
     evaluation: ExponentialEvaluation
     reference: np.ndarray
@@ -1012,10 +1163,17 @@ class OuterOptimizationResult:
     cache_hits: int
     inner_sweeps: int
     validation_report: Optional[ValidationReport] = None
+    initial_cholesky_shift: Optional[np.ndarray] = None
+    cholesky_scale: Optional[np.ndarray] = None
 
     @property
     def theta(self):
         return self.evaluation.theta
+
+    @property
+    def cholesky_shift(self):
+        """The final (r, 2) Cholesky shift, or None."""
+        return self.evaluation.cholesky_shift
 
     @property
     def O(self):

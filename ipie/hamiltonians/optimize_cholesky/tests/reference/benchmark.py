@@ -14,6 +14,10 @@ For each system and each kernel the installed GaugeEvaluator accepts
     outer        --outer L-BFGS iterations of optimize_gauge (weak-Wolfe),
                  seconds per objective evaluation
 
+With --cholesky-shift tied (or split) the relaxed evaluation uses the median
+Cholesky shift at its gauge, in that form, and the outer run optimizes the
+gauge and the shift together from the median (optimize_cholesky_shift).
+
 Pair-loop kernels ("reference", or the default of a package that still has
 pair loops, i.e. before step 3) are not run on systems whose estimated relaxed time exceeds --budget seconds; the
 estimate (number of channel pairs times the measured cost of the frozen
@@ -88,6 +92,9 @@ def run_system(name, args, kernel_seconds):
     from ipie.hamiltonians.optimize_cholesky.models import InnerOptions, LBFGSOptions
     from ipie.hamiltonians.optimize_cholesky.optimizers import optimize_gauge
     from ipie.hamiltonians.optimize_cholesky.problem import exponential_gauge, prepare_problem
+    shift = args.cholesky_shift
+    if shift != "none":
+        from ipie.hamiltonians.optimize_cholesky.optimizers import median_cholesky_shift
 
     m = molecule(name)
     chol = m["chol"]
@@ -100,7 +107,7 @@ def run_system(name, args, kernel_seconds):
     rows = []
     for kernel in kernels():
         row = dict(system=name, policy=problem.policy, n=n, nchol=r, channels=T, kernel=kernel,
-                   prepare_s=prepare)
+                   prepare_s=prepare, cholesky_shift=shift)
         pair_loops = kernel == "reference" or (kernel is None and package_has_pair_loops())
         if pair_loops and estimate > args.budget:
             row.update(skipped=True, estimated_relaxed_s=estimate)
@@ -108,6 +115,10 @@ def run_system(name, args, kernel_seconds):
             continue
         extra = {} if kernel is None else {"kernel": kernel}
         ev = GaugeEvaluator(problem, tau1=TAU1, tau2=TAU2, **extra)
+        if shift != "none":
+            mu = median_cholesky_shift(problem, O)
+            ev = ev.with_cholesky_shift(mu if shift == "tied" else np.stack([mu, mu], axis=1))
+            ev = ev.with_cholesky_gradient(shift)
         options = InnerOptions(**INNER)
         times, g = [], None
         for _ in range(args.repeat):
@@ -120,7 +131,8 @@ def run_system(name, args, kernel_seconds):
             result = optimize_gauge(ev, theta0=theta(r, 0.1, 0),
                                     options=LBFGSOptions(max_iterations=args.outer, line_search="weak_wolfe",
                                                          validate_final=False),
-                                    inner_options=options)
+                                    inner_options=options,
+                                    **({} if shift == "none" else {"optimize_cholesky_shift": shift}))
             seconds = time.perf_counter()-start
             row.update(outer_iterations=int(result.iterations), outer_evaluations=int(result.evaluations),
                        outer_s=seconds, outer_s_per_eval=seconds/max(1, result.evaluations),
@@ -132,6 +144,8 @@ def run_system(name, args, kernel_seconds):
 def show(row):
     head = (f"{row['system']:10s} {row['policy']:7s} n={row['n']:2d} r={row['nchol']:3d} "
             f"channels={row['channels']:6d} kernel={str(row['kernel']):10s} prepare={row['prepare_s']:6.2f}s")
+    if row.get("cholesky_shift", "none") != "none":
+        head += f" shift={row['cholesky_shift']}"
     if row.get("skipped"):
         return head + f"  skipped (estimated relaxed ~{row['estimated_relaxed_s']/60:.0f} min)"
     text = head + f"  relaxed={row['relaxed_s']:7.3f}s loss={row['loss']:.6e} sweeps={row['sweeps']}"
@@ -147,6 +161,8 @@ def main():
     parser.add_argument("--systems", nargs="+", default=["h2_ccpvdz", "h4_631g", "lih_sto3g"])
     parser.add_argument("--repeat", type=int, default=3)
     parser.add_argument("--outer", type=int, default=0, help="L-BFGS iterations to time (0: skip)")
+    parser.add_argument("--cholesky-shift", choices=("none", "tied", "split"), default="none",
+                        help="median Cholesky shift in this form, optimized with the gauge in the outer run")
     parser.add_argument("--budget", type=float, default=600.0,
                         help="skip pair-loop kernels whose estimated relaxed time exceeds this (s)")
     parser.add_argument("--json", help="append the rows to this JSON file")

@@ -181,6 +181,79 @@ def partition_map(left, right, t, log_tau, partition):
     return amplitudes, logs_left, logs_right
 
 
+def leg_usage(sources):
+    """(count, 2, 2) mask [source, leg, spin]: the spins each leg carries in some channel.
+
+    A two-branch leg carries its source's spin; a quartet leg carries both.
+    """
+    used = np.zeros((len(sources), 2, 2), dtype=bool)
+    used[sources.channel_source, 0, sources.channel_spins[:, 0]] = True
+    used[sources.channel_source, 1, sources.channel_spins[:, 1]] = True
+    return used
+
+
+def leg_values(spin_eigenvalues, sources):
+    """(count, 2, 2) per-spin eigenvalues lambda [source, leg, spin] of each source's two modes."""
+    lam = np.asarray(spin_eigenvalues, dtype=np.float64)
+    bix, modes = sources.bix, sources.modes
+    return np.stack([lam[:, bix, modes[:, 0]].T, lam[:, bix, modes[:, 1]].T], axis=1)
+
+
+def _log_leg_scale(values, used):
+    """log of the RMS of |values| over the used spins of each leg; -inf if they all vanish."""
+    magnitude = np.where(used, np.abs(values), 0.0)
+    peak = np.max(magnitude, axis=2)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        ratio = np.where(peak[:, :, None] > 0, magnitude/peak[:, :, None], 0.0)
+        mean = np.sum(ratio*ratio, axis=2)/np.maximum(np.sum(used, axis=2), 1)
+        return np.where(peak > 0, np.log(peak) + 0.5*np.log(mean), -np.inf)
+
+
+def leg_log_bases(spin_eigenvalues, sources, log_tau, partition):
+    """Per-spin map at t=0: (logs, signs), each (count, 2, 2) = [source, leg, spin].
+
+    d_L,s = lam_L,s kappa_L e^t and d_R,s = -lam_R,s kappa_R e^-t with
+    kappa_L kappa_R = tau2, so d_L,s d_R,s' = -lam_L,s lam_R,s' tau2 for every
+    spin pair: one t serves a whole quartet. anchored_log: kappa_L = kappa_R =
+    sqrt(tau2). balanced_log: kappa_L = sqrt(tau2) (g_R/g_L)^(1/2), where the
+    leg scale g is |lam| for a one-spin leg and the RMS over spins for a quartet
+    leg; both legs are absent when g_L or g_R vanishes. With equal spins both
+    reduce to the shared map (partition_log_bases). -inf marks an absent or
+    unused leg; logs are log|d| at t=0.
+    """
+    values = leg_values(spin_eigenvalues, sources)
+    used = leg_usage(sources)
+    with np.errstate(divide="ignore"):
+        logs = np.where(used, np.log(np.abs(values)), -np.inf)
+    if partition == "balanced_log":
+        scale = _log_leg_scale(values, used)
+        absent = np.any(scale == -np.inf, axis=1)
+        with np.errstate(invalid="ignore"):
+            offset = 0.5*(scale[:, ::-1] - scale)
+            logs = logs + 0.5*log_tau + offset[:, :, None]
+        logs[absent] = -np.inf
+        logs = np.where(used, logs, -np.inf)
+    else:
+        logs = logs + 0.5*log_tau
+    signs = np.sign(values)
+    signs[:, 1, :] *= -1.0
+    return logs, signs
+
+
+def leg_partition_map(logs, signs, t):
+    """Per-spin amplitudes (count, 2, 2) at log ratios t, and their logs; no domain checks.
+
+    The split-spin counterpart of partition_map; an absent leg is exactly +0.0.
+    """
+    t = np.asarray(t, dtype=np.float64)
+    shifted = logs + np.stack([t, -t], axis=1)[:, :, None]
+    amplitudes = np.zeros(np.shape(logs), dtype=np.float64)
+    live = shifted != -np.inf
+    with np.errstate(over="ignore"):
+        amplitudes[live] = signs[live]*np.exp(shifted[live])
+    return amplitudes, shifted
+
+
 def _source_index_arrays(sources):
     if isinstance(sources, SourceTable):
         return sources.bix, sources.modes
@@ -203,7 +276,13 @@ def fixed_partition_amplitudes(eigenvalues, sources, tau2, t=None,
     log ratios; a finite scalar broadcasts to every source. All requested
     amplitudes must satisfy abs(d)<amplitude_bound<=1. The paired
     real-exponential domain is checked, never repaired by clipping.
+
+    eigenvalues of shape (2, r, n) are per spin (split Cholesky shifts): d is
+    then (count, 2, 2) = [source, leg, spin] from leg_log_bases, with zeros
+    for spins a leg does not carry.
     """
+    if np.ndim(eigenvalues) == 3:
+        return _split_partition_amplitudes(eigenvalues, sources, tau2, t, partition, amplitude_bound)
     tau2 = positive_scale(tau2, "tau2")
     bound = positive_scale(amplitude_bound, "amplitude_bound")
     if bound > 1:
@@ -238,6 +317,52 @@ def fixed_partition_amplitudes(eigenvalues, sources, tau2, t=None,
     return ratios, amplitudes
 
 
+def _map_arguments(tau2, amplitude_bound, partition):
+    tau2 = positive_scale(tau2, "tau2")
+    bound = positive_scale(amplitude_bound, "amplitude_bound")
+    if bound > 1:
+        raise ValueError("amplitude_bound must be <=1 for paired real exponentials")
+    if partition not in ("balanced_log", "anchored_log"):
+        raise ValueError("partition must be 'balanced_log' or 'anchored_log'")
+    return tau2, bound
+
+
+def _split_partition_amplitudes(eigenvalues, sources, tau2, t, partition, amplitude_bound):
+    """fixed_partition_amplitudes for per-spin eigenvalues (2, r, n): d is (count, 2, 2)."""
+    tau2, bound = _map_arguments(tau2, amplitude_bound, partition)
+    lam = _real_array(eigenvalues, "eigenvalues")
+    if lam.ndim != 3 or lam.shape[0] != 2:
+        raise ValueError("per-spin eigenvalues must have shape (2,r,n)")
+    sources = source_table(sources)
+    count = len(sources)
+    if t is None:
+        ratios = np.zeros(count, dtype=np.float64)
+    else:
+        supplied = _real_array(t, "t")
+        if supplied.ndim == 0:
+            ratios = np.full(count, float(supplied))
+        elif supplied.shape == (count,):
+            ratios = supplied.copy()
+        else:
+            raise ValueError(f"t must be a scalar or a length-{count} vector")
+    bix, modes = sources.bix, sources.modes
+    if count and (np.any(bix < 0) or np.any(bix >= lam.shape[1])
+                  or np.any(modes < 0) or np.any(modes >= lam.shape[2])):
+        bad = int(np.flatnonzero((bix < 0) | (bix >= lam.shape[1]) | np.any(modes < 0, axis=1)
+                                 | np.any(modes >= lam.shape[2], axis=1))[0])
+        raise ValueError(f"Invalid basis or mode indices in source {bad}")
+    logs, signs = leg_log_bases(lam, sources, np.log(tau2), partition)
+    amplitudes, shifted = leg_partition_map(logs, signs, ratios)
+    flat_logs, flat = shifted.reshape(count, 4), amplitudes.reshape(count, 4)
+    over = np.max(flat_logs, axis=1, initial=-np.inf) >= np.log(bound)
+    underflow = np.any((flat_logs != -np.inf) & (flat == 0), axis=1)
+    outside = ~np.isfinite(flat).all(axis=1) | (np.max(np.abs(flat), axis=1, initial=0.0) >= bound)
+    _report_domain(over, underflow, outside, bound, bix, modes)
+    ratios.setflags(write=False)
+    amplitudes.setflags(write=False)
+    return ratios, amplitudes
+
+
 def _check_amplitude_domain(amplitudes, logs_left, logs_right, log_bound, bound, bix, modes):
     """Reject the first source whose amplitudes leave abs(d)<bound or underflow.
 
@@ -248,6 +373,11 @@ def _check_amplitude_domain(amplitudes, logs_left, logs_right, log_bound, bound,
     underflow = (((logs_left != -np.inf) & (amplitudes[:, 0] == 0))
                  | ((logs_right != -np.inf) & (amplitudes[:, 1] == 0)))
     outside = ~np.isfinite(amplitudes).all(axis=1) | (np.max(np.abs(amplitudes), axis=1, initial=0.0) >= bound)
+    _report_domain(over, underflow, outside, bound, bix, modes)
+
+
+def _report_domain(over, underflow, outside, bound, bix, modes):
+    """Raise for the first failing source, in the order over, underflow, outside."""
     failed = over | underflow | outside
     if not np.any(failed):
         return
@@ -266,12 +396,20 @@ def _check_amplitude_domain(amplitudes, logs_left, logs_right, log_bound, bound,
 # --------------------------------------------------------------------------- channel tables
 
 def canonical_table(sources, amplitudes, tau2):
-    """ChannelTable of the canonical layout: channel c = sign_c*(d_left, d_right) of its source."""
+    """ChannelTable of the canonical layout: channel c = sign_c*(d_left, d_right) of its source.
+
+    Per-spin amplitudes (count, 2, 2) give each channel the values of its own leg spins.
+    """
     src = sources.channel_source
     sign = sources.channel_sign
     d = np.empty((src.shape[0], 2), dtype=np.float64)
-    d[:, 0] = sign*amplitudes[src, 0]
-    d[:, 1] = sign*amplitudes[src, 1]
+    if np.ndim(amplitudes) == 3:
+        spins = sources.channel_spins
+        d[:, 0] = sign*amplitudes[src, 0, spins[:, 0]]
+        d[:, 1] = sign*amplitudes[src, 1, spins[:, 1]]
+    else:
+        d[:, 0] = sign*amplitudes[src, 0]
+        d[:, 1] = sign*amplitudes[src, 1]
     modes = sources.modes[src]
     return ChannelTable(_frozen(sources.bix[src], np.int64), _frozen(sources.channel_spins, np.int64),
                         _frozen(modes, np.int64), _frozen(d, np.float64),
@@ -279,14 +417,83 @@ def canonical_table(sources, amplitudes, tau2):
 
 
 def _two_body_from_amplitudes(gauge, policy, nelec, tau2, partition, amplitude_bound,
-                              sources, t, amplitudes):
+                              sources, t, amplitudes, cholesky_shift=None):
     """Assemble a canonical TwoBodyDecomposition from per-source log ratios and amplitudes."""
     return TwoBodyDecomposition(gauge, policy, nelec, tau2, partition, float(amplitude_bound),
-                                sources, t, amplitudes, canonical_table(sources, amplitudes, tau2), True)
+                                sources, t, amplitudes, canonical_table(sources, amplitudes, tau2), True,
+                                cholesky_shift)
+
+
+# --------------------------------------------------------------------------- Cholesky shifts
+
+def cholesky_shift_array(cholesky_shift, nchol, policy=None):
+    """Canonical read-only (r, 2) Cholesky shifts mu[gamma, sigma], or None for no shift.
+
+    A length-r vector is a tied shift (the same mu_gamma for both spins); an
+    (r, 2) array gives (mu_up, mu_down) for each rotated factor. All zeros
+    means no shift and gives None, so a zero shift runs exactly today's code.
+    For aa_only, which has no down-spin channels, a length-r vector shifts the
+    up spin only (mu_down = 0).
+    """
+    if cholesky_shift is None:
+        return None
+    mu = _real_array(cholesky_shift, "cholesky_shift")
+    if mu.shape == (nchol,):
+        mu = np.stack([mu, np.zeros_like(mu) if policy == "aa_only" else mu], axis=1)
+    elif mu.shape != (nchol, 2):
+        raise ValueError(f"cholesky_shift must have shape ({nchol},) or ({nchol}, 2); got {mu.shape}")
+    if not np.any(mu):
+        return None
+    return _frozen(mu, np.float64)
+
+
+def check_cholesky_shift(mu, policy, nelec):
+    """A shift needs particle numbers; aa_only has no down-spin channels, so mu[:, 1] must be 0."""
+    if mu is None:
+        return
+    if nelec is None:
+        raise ValueError("A Cholesky shift requires particle numbers: pass nelec to prepare_problem "
+                         "(h_sigma and E_c depend on N_up and N_down)")
+    if policy == "aa_only" and np.any(np.asarray(mu)[:, 1] != 0):
+        raise ValueError("This policy emits no down-spin channels; cholesky_shift[:, 1] must be 0")
+
+
+def split_cholesky_shift(mu):
+    """True when the shift differs between the spins of some factor."""
+    return mu is not None and not np.array_equal(mu[:, 0], mu[:, 1])
+
+
+def map_eigenvalues(eigenvalues, mu, per_spin=False):
+    """Partition-map eigenvalues: ell without a shift, ell - mu_gamma (r, n) when tied, (2, r, n) when split.
+
+    per_spin=True always gives the (2, r, n) per-spin eigenvalues, also for a
+    tied or absent shift (the representation a per-spin shift gradient needs).
+    """
+    if mu is None and not per_spin:
+        return eigenvalues
+    ell = np.asarray(eigenvalues, dtype=np.float64)
+    if per_spin or split_cholesky_shift(mu):
+        if mu is None:
+            return np.stack([ell, ell])
+        return ell[None, :, :] - np.asarray(mu).T[:, :, None]
+    return ell - np.asarray(mu)[:, 0][:, None]
+
+
+def one_body_matrices(h, chol, mu, nelec):
+    """(h_up, h_down) with h_s = h + sum_g (m_g - mu[g,s]) L_g and m_g = sum_s N_s mu[g,s].
+
+    chol holds the rotated factors L_g (unshifted). With the shifted factors
+    L_g - mu[g,s] I this reproduces H on the (N_up, N_down) sector up to the
+    constant FixedDecomposition.cholesky_energy. A tied shift gives
+    h + (N-1) sum_g mu_g L_g for both spins.
+    """
+    mu = np.asarray(mu, dtype=np.float64)
+    m = mu @ np.asarray(nelec, dtype=np.float64)
+    return tuple(h + np.einsum("g,gpq->pq", m - mu[:, s], chol) for s in (0, 1))
 
 
 def build_two_body_channels(problem, gauge, tau2, t=None, *, partition="balanced_log",
-                            amplitude_bound=1.0):
+                            amplitude_bound=1.0, cholesky_shift=None, per_spin=False):
     """Build a reference two-body decomposition at a supplied validated gauge.
 
     t is indexed by enumerate_sources(problem), not by individual channels.
@@ -294,18 +501,25 @@ def build_two_body_channels(problem, gauge, tau2, t=None, *, partition="balanced
     hybrid source emits a shared-amplitude four-spin quartet. The gauge is
     validated here against the original tensors (reusing the problem's input
     report). GaugeEvaluator builds the same channels without these checks.
+
+    cholesky_shift: None, (r,) tied or (r, 2) per-spin shifts of the rotated
+    factors (cholesky_shift_array); the channels then use ell - mu. A split
+    shift stores per-spin amplitudes (TwoBodyDecomposition.split);
+    per_spin=True does so for any shift (needed for a per-spin shift gradient).
     """
     policy = _problem_policy(problem)
     tau2 = positive_scale(tau2, "tau2")
     validate_gauge_state(problem.data, gauge, problem.report.options, input_report=problem.report)
+    mu = cholesky_shift_array(cholesky_shift, problem.data.nchol, policy)
+    check_cholesky_shift(mu, policy, problem.nelec)
     sources = enumerate_sources(problem)
     ratios, amplitudes = fixed_partition_amplitudes(
-        gauge.eigenvalues, sources, tau2, t, partition, amplitude_bound)
+        map_eigenvalues(gauge.eigenvalues, mu, per_spin), sources, tau2, t, partition, amplitude_bound)
     weight = 1.0 / tau2
     if not np.isfinite(weight) or weight <= 0:
         raise ValueError("tau2 gives a nonrepresentable positive channel coefficient")
     return _two_body_from_amplitudes(gauge, policy, problem.nelec, tau2, partition,
-                                     amplitude_bound, sources, ratios, amplitudes)
+                                     amplitude_bound, sources, ratios, amplitudes, mu)
 
 
 def shift_pair(shift):
@@ -322,8 +536,11 @@ def shift_pair(shift):
     return (float(values[0]), float(values[1]))
 
 
-def _one_body_from_eigensystem(X, ell, tau1, shift, spins, nelec):
-    """Channels d[k,sigma]=(mu_sigma-epsilon_k)*tau1 on a fixed h eigensystem."""
+def _one_body_from_eigensystem(X, ell, tau1, shift, spins, nelec, cholesky_shift=None):
+    """Channels d[k,sigma]=(mu_sigma-epsilon_k)*tau1 on a fixed eigensystem.
+
+    ell (n,) is shared by the spins; ell (2, n) with X (2, n, n) is per spin.
+    """
     shift = shift_pair(shift)
     if nelec is None and any(shift):
         raise ValueError("A nonzero one-body shift requires particle numbers: pass nelec "
@@ -333,10 +550,11 @@ def _one_body_from_eigensystem(X, ell, tau1, shift, spins, nelec):
     weight = 1.0 / tau1
     if not np.isfinite(weight) or weight <= 0:
         raise ValueError("tau1 gives a nonrepresentable positive coefficient")
-    n = np.asarray(ell).shape[0]
+    per_spin = np.ndim(ell) == 2
+    n = np.shape(ell)[-1]
     blocks = []
     for s in spins:
-        ds = (shift[s] - ell) * tau1
+        ds = (shift[s] - (ell[s] if per_spin else ell)) * tau1
         if not np.isfinite(ds).all() or np.any(1.0 + ds <= 0):
             failed = ds[ds<-1.]
             raise ValueError("One-body amplitudes require 1-(epsilon-mu)*tau1 > 0; "
@@ -348,10 +566,34 @@ def _one_body_from_eigensystem(X, ell, tau1, shift, spins, nelec):
                          _frozen(np.tile(np.arange(n), len(spins)), np.int64, (count,)),
                          _frozen(np.concatenate(blocks) if blocks else np.zeros(0), np.float64, (count,)),
                          _frozen(np.full(count, weight), np.float64, (count,)))
-    return OneBodyDecomposition(X, ell, tau1, table, shift)
+    return OneBodyDecomposition(X, ell, tau1, table, shift, cholesky_shift)
 
 
-def build_one_body_channels(problem, tau1, shift=None):
+def one_body_eigensystem(h, chol, mu, nelec, spins, per_spin=False):
+    """(eigenvalues, X) of the one-body matrices for Cholesky shift mu (None: bare h).
+
+    Per spin (2, n), (2, n, n) when both spins carry channels and the shift is
+    split (or per_spin=True); otherwise one shared eigensystem (n,), (n, n),
+    of the matrix of the first spin that carries channels. Read-only arrays.
+    """
+    both = len(spins) == 2
+    if mu is None:
+        ell, X = np.linalg.eigh(h)
+        if per_spin and both:
+            ell, X = np.stack([ell, ell]), np.stack([X, X])
+    else:
+        matrices = one_body_matrices(h, chol, mu, nelec)
+        if both and (per_spin or split_cholesky_shift(mu)):
+            pairs = [np.linalg.eigh(m) for m in matrices]
+            ell, X = np.stack([p[0] for p in pairs]), np.stack([p[1] for p in pairs])
+        else:
+            ell, X = np.linalg.eigh(matrices[spins[0]])
+    ell.setflags(write=False)
+    X.setflags(write=False)
+    return ell, X
+
+
+def build_one_body_channels(problem, tau1, shift=None, *, gauge=None, cholesky_shift=None, per_spin=False):
     """Jointly diagonalize bare h and retain one channel per mode and spin.
 
     d=(mu_sigma-epsilon)*tau1, weight=1/tau1, with shift=(mu_up, mu_down)
@@ -360,6 +602,11 @@ def build_one_body_channels(problem, tau1, shift=None):
     exponentials require d>-1; positive d>=1 is allowed because this identity
     has no minus branch. A nonzero shift requires problem.nelec, since
     sum_sigma mu_sigma N_sigma is folded into Lambda.
+
+    cholesky_shift (with the gauge whose rotated factors it shifts)
+    diagonalizes h_sigma = h + sum_g (m_g - mu[g,sigma]) L_g instead of h
+    (one_body_matrices): one eigensystem for a tied shift, one per spin for a
+    split shift or with per_spin=True (when both spins carry channels).
     """
     policy = _problem_policy(problem)
     tau1 = positive_scale(tau1, "tau1")
@@ -369,11 +616,13 @@ def build_one_body_channels(problem, tau1, shift=None):
         raise ValueError("h1 must be square")
     _require_report(ValidationReport({"h1_symmetry": _metric(h, h.T, problem.report.options)},
                                      problem.report.options))
-    ell, X = np.linalg.eigh(h)
-    ell.setflags(write=False)
-    X.setflags(write=False)
+    mu = cholesky_shift_array(cholesky_shift, problem.data.nchol, policy)
+    check_cholesky_shift(mu, policy, problem.nelec)
+    if mu is not None and gauge is None:
+        raise ValueError("A Cholesky shift needs the gauge whose rotated factors it shifts")
     spins = (0,) if policy == "aa_only" else (0,1)
-    return _one_body_from_eigensystem(X, ell, tau1, shift, spins, problem.nelec)
+    ell, X = one_body_eigensystem(h, None if mu is None else gauge.chol, mu, problem.nelec, spins, per_spin)
+    return _one_body_from_eigensystem(X, ell, tau1, shift, spins, problem.nelec, mu)
 
 
 def one_body_at_shift(one_body, shift, nelec):
@@ -381,15 +630,24 @@ def one_body_at_shift(one_body, shift, nelec):
     if not isinstance(one_body, OneBodyDecomposition):
         raise TypeError("one_body must be a OneBodyDecomposition")
     return _one_body_from_eigensystem(one_body.X, one_body.eigenvalues, one_body.tau1,
-                                      shift, one_body.spins, nelec)
+                                      shift, one_body.spins, nelec, one_body.cholesky_shift)
 
 
 def build_fixed_decomposition(problem, gauge, tau1, tau2, t=None, *,
-                              partition="balanced_log", amplitude_bound=1.0, shift=None):
-    """Build both lists with the same policy, without normalizing either list."""
-    two_body = build_two_body_channels(problem, gauge, tau2, t,
-                                       partition=partition, amplitude_bound=amplitude_bound)
-    one_body = build_one_body_channels(problem, tau1, shift)
+                              partition="balanced_log", amplitude_bound=1.0, shift=None,
+                              cholesky_shift=None, per_spin=False):
+    """Build both lists with the same policy, without normalizing either list.
+
+    cholesky_shift: None, (r,) tied or (r, 2) per-spin shifts of the gauge's
+    rotated factors; see build_two_body_channels and build_one_body_channels.
+    per_spin=True stores both lists per spin even for a tied or absent shift.
+    On the (N_up, N_down) sector sum_i a_i U_i = lambda_electronic I - H.
+    """
+    two_body = build_two_body_channels(problem, gauge, tau2, t, partition=partition,
+                                       amplitude_bound=amplitude_bound, cholesky_shift=cholesky_shift,
+                                       per_spin=per_spin)
+    one_body = build_one_body_channels(problem, tau1, shift, gauge=gauge, cholesky_shift=cholesky_shift,
+                                       per_spin=per_spin)
     result = FixedDecomposition(one_body, two_body)
     if not np.isfinite(result.denom) or result.denom <= 0:
         raise ValueError("The combined positive coefficient sum is not representable")
@@ -487,11 +745,11 @@ def two_body_rotation_matrix(channel, gauge):
 
 
 def one_body_rotation_matrix(channel, one_body):
-    """Single rank-one factor in the jointly diagonalized h eigenbasis."""
-    n = one_body.X.shape[0]
+    """Single rank-one factor in its spin's h eigenbasis."""
+    n = one_body.spin_X(0).shape[0]
     if channel.spin not in (0,1) or not 0 <= channel.mode < n:
         raise ValueError("Invalid one-body channel index")
-    x = one_body.X[:, channel.mode]
+    x = one_body.spin_X(channel.spin)[:, channel.mode]
     U = [None, None]
     U[channel.spin] = np.eye(n) + channel.d * np.outer(x, x)
     return U

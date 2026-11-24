@@ -18,6 +18,7 @@ from .models import (
     OuterIteration,
     OuterOptimizationResult,
 )
+from .channels import check_cholesky_shift, cholesky_shift_array
 from .gradients import exponential_gauge_vjp, GaugeEvaluator
 from .partitions import _partition_limits, _readonly
 from .problem import exponential_gauge, _real_array, validate_gauge_state
@@ -263,29 +264,113 @@ class OuterOptimizer(ABC):
 
 # Fixed exponential objective and cached nested evaluations
 
+def factor_eigenvalues(problem,O=None):
+    """(r, n) ascending eigenvalues of the rotated factors L_g(O) (O=None: the input factors)."""
+    data = problem.data
+    O = np.eye(data.nchol) if O is None else _real_array(O,"O")
+    if O.shape != (data.nchol,data.nchol):
+        raise ValueError("O must have shape (nchol, nchol)")
+    chol = (O@data.chol.reshape(data.nchol,-1)).reshape(data.chol.shape)
+    return np.linalg.eigh(chol)[0]
+
+
+def median_cholesky_shift(problem,O=None):
+    """Each rotated factor's spectral median, as the midpoint of its middle gap: shape (r,).
+
+    For an even number of orbitals this is np.median of the eigenvalues, as
+    in sor_base.compute_cholesky_shift. For an odd number np.median is the
+    middle eigenvalue itself (lambda = 0 exactly: balanced_log raises there
+    and the relaxed loss has a kink), so the midpoint of the wider of the two
+    gaps next to it is used instead. A single orbital gives 0.
+    """
+    ell = factor_eigenvalues(problem,O)
+    n = ell.shape[1]
+    if n == 1:
+        return np.zeros(ell.shape[0])
+    m = n//2
+    if n % 2 == 0:
+        return .5*(ell[:,m-1]+ell[:,m])
+    below,above = ell[:,m]-ell[:,m-1],ell[:,m+1]-ell[:,m]
+    return np.where(above > below,.5*(ell[:,m]+ell[:,m+1]),.5*(ell[:,m-1]+ell[:,m]))
+
+
+def cholesky_shift_scale(problem,O=None):
+    """s_g = max - min eigenvalue of each rotated factor (1 for a flat factor): shape (r,).
+
+    The outer coordinates of a Cholesky shift are mu/s, so that one unit
+    moves mu across the whole spectrum of its factor.
+    """
+    ell = factor_eigenvalues(problem,O)
+    spread = ell[:,-1]-ell[:,0]
+    return np.where(np.isfinite(spread) & (spread > 0),spread,1.)
+
+
+def resolve_cholesky_shift(problem,start,O=None):
+    """A Cholesky shift (r, 2) from 'median', 'zero', or an (r,) / (r, 2) array.
+
+    'median' is median_cholesky_shift at the gauge O for both spins (spin up
+    only for aa_only, whose mu_down is 0); an (r,) array is tied the same way.
+    """
+    r = problem.data.nchol
+    if isinstance(start,str):
+        if start == "median":
+            start = median_cholesky_shift(problem,O)
+        elif start == "zero":
+            return np.zeros((r,2))
+        else:
+            raise ValueError("A Cholesky shift start must be 'median', 'zero' or an array")
+    mu = cholesky_shift_array(start,r,problem.policy)
+    check_cholesky_shift(mu,problem.policy,problem.nelec)
+    return np.zeros((r,2)) if mu is None else np.array(mu)
+
+
+def _shift_mode(value):
+    """False (or None) for no optimized Cholesky shift, else 'tied' or 'split'."""
+    if value is None or value is False:
+        return None
+    if isinstance(value,str) and value in ("tied","split"):
+        return value
+    raise ValueError("optimize_cholesky_shift must be False, 'tied' or 'split'")
+
+
 class ExponentialGaugeObjective:
     """Reduced value/gradient oracle with one immutable coordinate reference.
 
     The inner configuration and supplied seed are frozen for a run. With no
     seed, every trial starts at its own interval midpoints. A rejected trial
     never becomes the seed for another evaluation. The one-entry cache holds
-    theta, value, gradient and inner solution together; no unbounded snapshot
-    history is retained. General inner solutions are tracked local solutions,
-    not certified global minima.
+    the coordinates, value, gradient and inner solution together; no
+    unbounded snapshot history is retained. General inner solutions are
+    tracked local solutions, not certified global minima.
+
+    Coordinates. By default they are the packed gauge angles theta of
+    O = expm(S(theta)) @ reference, and the evaluator's own Cholesky shift
+    (if any) stays fixed. With optimize_cholesky_shift='tied' or 'split' they
+    are x = (theta, mu/s) (pack and unpack convert):
+      * 'tied': one mu_g for both spins (spin up only for aa_only), r entries;
+      * 'split': mu[:, up] then mu[:, down], 2r entries (r for aa_only, which
+        has no down-spin channels and is then the same as 'tied');
+      * s = cholesky_scale (r,), fixed for the run; None takes
+        cholesky_shift_scale at the reference gauge. optimize_gauge uses the
+        starting gauge instead.
+    frozen_theta holds the gauge angles fixed (mu only); x is then mu/s.
+    The Cholesky shift is an outer variable: every evaluation solves the
+    inner problem at that shift and uses its envelope gradient.
     """
 
-    def __init__(self,evaluator,*,reference=None,inner_options=None,inner_t0=None):
+    def __init__(self,evaluator,*,reference=None,inner_options=None,inner_t0=None,
+                 optimize_cholesky_shift=False,cholesky_scale=None,frozen_theta=None):
         if not isinstance(evaluator,GaugeEvaluator):
             raise TypeError("evaluator must be a GaugeEvaluator")
         self._evaluator = evaluator
         self._nchol = evaluator.problem.data.nchol
-        self._nparams = self.nchol*(self.nchol-1)//2
         if inner_options is not None and not isinstance(inner_options,InnerOptions):
             raise TypeError("inner_options must be InnerOptions")
         self._inner_options = InnerOptions() if inner_options is None else inner_options
         _partition_limits(evaluator.amplitude_bound,self.inner_options.amplitude_limit,
                           self.inner_options.max_abs_t)
-        self._reference = _readonly(exponential_gauge(np.zeros(self.nparams),self.nchol,reference))
+        self._reference = _readonly(exponential_gauge(np.zeros(self.nchol*(self.nchol-1)//2),
+                                                      self.nchol,reference))
         if inner_t0 is None:
             self._inner_t0 = None
         else:
@@ -293,6 +378,33 @@ class ExponentialGaugeObjective:
             if seed.ndim != 0 and seed.shape != (len(evaluator.sources),):
                 raise ValueError("inner_t0 must be a scalar or have one entry per source")
             self._inner_t0 = _readonly(seed)
+        self._shift_mode = _shift_mode(optimize_cholesky_shift)
+        self._engine = evaluator
+        self._scale = None
+        self._frozen = None
+        self._nshift = 0
+        if self._shift_mode is None:
+            if cholesky_scale is not None or frozen_theta is not None:
+                raise ValueError("cholesky_scale and frozen_theta need optimize_cholesky_shift='tied' or 'split'")
+        else:
+            problem = evaluator.problem
+            if problem.nelec is None:
+                raise ValueError("Optimizing a Cholesky shift requires particle numbers: pass nelec to prepare_problem")
+            tied = self._shift_mode == "tied" or problem.policy == "aa_only"
+            self._nshift = self.nchol if tied else 2*self.nchol
+            self._engine = evaluator.with_cholesky_gradient("tied" if tied else "split")
+            scale = cholesky_shift_scale(problem,self._reference) if cholesky_scale is None else \
+                _real_array(cholesky_scale,"cholesky_scale")
+            if scale.shape != (self.nchol,) or not np.all(np.isfinite(scale)) or np.any(scale <= 0):
+                raise ValueError(f"cholesky_scale must hold {self.nchol} finite positive numbers")
+            self._scale = _readonly(scale)
+            if frozen_theta is not None:
+                frozen = _real_array(frozen_theta,"frozen_theta")
+                if frozen.shape != (self.nchol*(self.nchol-1)//2,):
+                    raise ValueError(f"frozen_theta must be a length-{self.nchol*(self.nchol-1)//2} vector")
+                self._frozen = _readonly(frozen)
+        self._ntheta = 0 if self._frozen is not None else self.nchol*(self.nchol-1)//2
+        self._nparams = self._ntheta+self._nshift
         self.evaluations = self.failed_evaluations = self.cache_hits = self.inner_sweeps = 0
         self._cached = None
 
@@ -309,6 +421,30 @@ class ExponentialGaugeObjective:
         return self._nparams
 
     @property
+    def ntheta(self):
+        """Gauge angles among the coordinates: r(r-1)/2, or 0 with frozen_theta."""
+        return self._ntheta
+
+    @property
+    def nshift(self):
+        """Scaled Cholesky-shift entries among the coordinates (0 when the shift is not optimized)."""
+        return self._nshift
+
+    @property
+    def optimize_cholesky_shift(self):
+        """None, 'tied' or 'split' (as requested; aa_only is laid out as 'tied')."""
+        return self._shift_mode
+
+    @property
+    def cholesky_scale(self):
+        """The fixed scale s (r,) of the shift coordinates mu/s, or None."""
+        return self._scale
+
+    @property
+    def frozen_theta(self):
+        return self._frozen
+
+    @property
     def inner_options(self):
         return self._inner_options
 
@@ -320,27 +456,101 @@ class ExponentialGaugeObjective:
     def inner_t0(self):
         return self._inner_t0
 
+    def unpack(self,x):
+        """(theta, mu) for coordinates x; mu is the (r, 2) Cholesky shift, or None if it is not optimized."""
+        x = _real_array(x,"x")
+        if x.shape != (self.nparams,):
+            raise ValueError(f"x must be a length-{self.nparams} vector")
+        theta = self._frozen if self._frozen is not None else x[:self._ntheta]
+        if self._shift_mode is None:
+            return theta,None
+        y = x[self._ntheta:]*np.tile(self._scale,self._nshift//self.nchol)
+        mu = np.zeros((self.nchol,2))
+        if self._nshift == self.nchol:
+            mu[:,0] = y
+            if self._evaluator.problem.policy != "aa_only":
+                mu[:,1] = y
+        else:
+            mu[:,0],mu[:,1] = y[:self.nchol],y[self.nchol:]
+        return theta,mu
+
+    def pack(self,theta=None,cholesky_shift=None):
+        """Coordinates x for gauge angles theta (zeros if None) and a Cholesky shift ((r,) or (r, 2)).
+
+        A 'tied' layout needs a tied shift (equal columns; mu_down = 0 for aa_only).
+        """
+        r = self.nchol
+        parts = []
+        if self._frozen is None:
+            theta = np.zeros(r*(r-1)//2) if theta is None else _real_array(theta,"theta")
+            if theta.shape != (r*(r-1)//2,):
+                raise ValueError(f"theta must be a length-{r*(r-1)//2} vector")
+            parts.append(theta)
+        if self._shift_mode is not None:
+            mu = resolve_cholesky_shift(self._evaluator.problem,
+                                        np.zeros(r) if cholesky_shift is None else cholesky_shift)
+            if self._nshift == r:
+                other = np.zeros(r) if self._evaluator.problem.policy == "aa_only" else mu[:,0]
+                if not np.array_equal(mu[:,1],other):
+                    raise ValueError("A tied layout needs a tied Cholesky shift (equal spin columns)")
+                parts.append(mu[:,0]/self._scale)
+            else:
+                parts.extend((mu[:,0]/self._scale,mu[:,1]/self._scale))
+        elif cholesky_shift is not None:
+            raise ValueError("This objective does not optimize a Cholesky shift")
+        return np.concatenate(parts) if parts else np.zeros(0)
+
+    def _shift_coordinates_gradient(self,derivative):
+        """d loss/d (mu/s) from the evaluator's cholesky_gradient, in the coordinate layout."""
+        g = np.asarray(derivative.cholesky_gradient,dtype=np.float64)
+        if self._nshift == self.nchol:
+            return g*self._scale
+        return np.concatenate([g[:,0]*self._scale,g[:,1]*self._scale])
+
     def evaluate(self,theta):
-        """Return one matching value/coordinate-gradient/inner snapshot."""
+        """Return one matching value/coordinate-gradient/inner snapshot.
+
+        theta: the coordinates (the gauge angles, followed by mu/s when the
+        Cholesky shift is optimized; see the class docstring).
+        """
         theta = _real_array(theta,"theta")
         if theta.shape != (self.nparams,):
             raise ValueError(f"theta must be a length-{self.nparams} vector")
-        if self._cached is not None and np.array_equal(theta,self._cached.theta):
+        if self._cached is not None and np.array_equal(theta,self._cached.coordinates):
             self.cache_hits += 1
             return self._cached
         self.evaluations += 1
         inner = None
         try:
-            O = exponential_gauge(theta,self.nchol,self.reference)
-            derivative = self.evaluator.relaxed(O,t0=self.inner_t0,options=self.inner_options)
+            if self._shift_mode is None:
+                O = exponential_gauge(theta,self.nchol,self.reference)
+                derivative = self.evaluator.relaxed(O,t0=self.inner_t0,options=self.inner_options)
+            else:
+                angles,mu = self.unpack(theta)
+                O = exponential_gauge(angles,self.nchol,self.reference)
+                derivative = self._engine.relaxed(O,t0=self.inner_t0,options=self.inner_options,
+                                                  cholesky_shift=mu)
             inner = derivative.inner_result
             if inner is None or not inner.converged:
                 raise InnerConvergenceError("Outer objective requires a converged inner snapshot",inner)
-            gradient = exponential_gauge_vjp(theta,self.nchol,derivative.gradient_O,self.reference)
-            if (not np.isfinite(derivative.loss) or not np.isfinite(gradient).all()
-                    or not np.isfinite(derivative.tangent_gradient).all()):
-                raise FloatingPointError("Nonfinite outer value or coordinate gradient")
-            point = ExponentialEvaluation(_readonly(theta),_readonly(gradient),derivative)
+            if self._shift_mode is None:
+                gradient = exponential_gauge_vjp(theta,self.nchol,derivative.gradient_O,self.reference)
+                if (not np.isfinite(derivative.loss) or not np.isfinite(gradient).all()
+                        or not np.isfinite(derivative.tangent_gradient).all()):
+                    raise FloatingPointError("Nonfinite outer value or coordinate gradient")
+                point = ExponentialEvaluation(_readonly(theta),_readonly(gradient),derivative)
+            else:
+                gradient = exponential_gauge_vjp(angles,self.nchol,derivative.gradient_O,self.reference)
+                shift_gradient = self._shift_coordinates_gradient(derivative)
+                if (not np.isfinite(derivative.loss) or not np.isfinite(gradient).all()
+                        or not np.isfinite(shift_gradient).all()
+                        or not np.isfinite(derivative.tangent_gradient).all()):
+                    raise FloatingPointError("Nonfinite outer value or coordinate gradient")
+                point = ExponentialEvaluation(
+                    _readonly(angles),_readonly(gradient),derivative,
+                    scaled_shift=_readonly(theta[self._ntheta:]),
+                    gradient_scaled_shift=_readonly(shift_gradient),
+                    theta_frozen=self._frozen is not None)
             if not math.isfinite(point.tangent_gradient_norm):
                 raise FloatingPointError("Nonfinite physical tangent-gradient norm")
         except RECOVERABLE_TRIAL_ERRORS as exc:
@@ -359,14 +569,13 @@ class ExponentialGaugeObjective:
     def value_and_grad(self,theta):
         """Joint callable for external optimizers, e.g. a SciPy jac=True call."""
         point = self.evaluate(theta)
-        return point.loss,point.gradient_theta.copy()
+        return point.loss,point.gradient.copy()
 
     def validate(self,point):
         """Full final gauge/ERI check, called outside the optimizer loops."""
         problem = self.evaluator.problem
         return validate_gauge_state(problem.data,point.decomposition.two_body.gauge,
                                     problem.report.options,input_report=problem.report)
-
 
 
 
@@ -432,7 +641,7 @@ class LBFGSOptimizer(OuterOptimizer):
     def _step(self, point, run, iteration):
         options = self.options
         pairs = run.solver_state
-        gradient = point.gradient_theta
+        gradient = point.gradient
         # 1. Two-loop direction; discard bad history and fall back to descent.
         with np.errstate(over="ignore", invalid="ignore", divide="ignore"):
             direction = _lbfgs_direction(gradient, pairs)
@@ -462,8 +671,8 @@ class LBFGSOptimizer(OuterOptimizer):
                                  trials=outcome.trials)
         candidate, alpha = outcome.candidate, outcome.step_size
         # 4. Store only acceptable positive-curvature pairs in this fixed chart.
-        s = candidate.theta-point.theta
-        y = candidate.gradient_theta-point.gradient_theta
+        s = candidate.coordinates-point.coordinates
+        y = candidate.gradient-point.gradient
         sy = float(np.dot(s, y))
         curvature_scale = float(np.linalg.norm(s)*np.linalg.norm(y))
         update = (np.isfinite(sy) and sy > 0 and np.isfinite(curvature_scale)
@@ -501,8 +710,8 @@ class LBFGSOptimizer(OuterOptimizer):
             if self._budget_exhausted(run):
                 exhausted = True
                 break
-            theta = point.theta+alpha*direction
-            if np.array_equal(theta, point.theta):
+            theta = point.coordinates+alpha*direction
+            if np.array_equal(theta, point.coordinates):
                 break
             try:
                 trial = self.objective.evaluate(theta)
@@ -579,9 +788,9 @@ class LBFGSOptimizer(OuterOptimizer):
             if self._budget_exhausted(run):
                 exhausted = True
                 break
-            theta = point.theta+alpha*direction
-            if np.array_equal(theta, point.theta) or (
-                    best is not None and np.array_equal(theta, best[1].theta)):
+            theta = point.coordinates+alpha*direction
+            if np.array_equal(theta, point.coordinates) or (
+                    best is not None and np.array_equal(theta, best[1].coordinates)):
                 stop = "trial parameters unchanged in floating point"
                 break
             try:
@@ -592,7 +801,7 @@ class LBFGSOptimizer(OuterOptimizer):
                 self._print_rejected(attempt, alpha, reason)
                 upper = alpha
             else:
-                trial_slope = float(np.dot(trial.gradient_theta, direction))
+                trial_slope = float(np.dot(trial.gradient, direction))
                 decrease = trial.loss <= point.loss+c1*alpha*slope
                 curvature = math.isfinite(trial_slope) and trial_slope >= c2*slope
                 if decrease and curvature:
@@ -652,12 +861,20 @@ class LBFGSOptimizer(OuterOptimizer):
                               acceptance=details.get("acceptance", ""))
 
     def _build_result(self, point, summary):
+        initial = summary.initial_evaluation
+        if getattr(self.objective, "nshift", 0):
+            shift = self.objective.unpack(initial.coordinates)[1]       # zeros stay zeros
+        else:
+            shift = initial.cholesky_shift
+        scale = getattr(self.objective, "cholesky_scale", None)
         return OuterOptimizationResult(
-            point, _readonly(self.objective.reference), _readonly(summary.initial_evaluation.theta),
-            float(summary.initial_evaluation.loss), summary.gradient_threshold,
+            point, _readonly(self.objective.reference), _readonly(initial.theta),
+            float(initial.loss), summary.gradient_threshold,
             summary.tangent_gradient_threshold, summary.history, summary.trials,
             summary.converged, summary.status, summary.message, summary.evaluations,
             summary.failed_evaluations, summary.cache_hits, summary.inner_sweeps,
+            initial_cholesky_shift=None if shift is None else _readonly(shift),
+            cholesky_scale=None if scale is None else _readonly(scale),
         )
 
 
@@ -691,7 +908,8 @@ class GDMOptimizer(OuterOptimizer):
 # Solver selection and compatibility entry points
 
 def optimize_gauge(evaluator,*,theta0=None,reference=None,inner_t0=None,
-                    inner_options=None,options=None,callback=None,solver="lbfgs"):
+                    inner_options=None,options=None,callback=None,solver="lbfgs",
+                    optimize_cholesky_shift=False,cholesky_shift0=None,optimize_theta=True):
     """Select an outer solver; L-BFGS uses fixed-exponential nested relaxation.
 
     New code can construct ExponentialGaugeObjective and LBFGSOptimizer
@@ -702,6 +920,16 @@ def optimize_gauge(evaluator,*,theta0=None,reference=None,inner_t0=None,
     callback(record) receives initial/accepted scalar diagnostics. Raising
     StopIteration returns that accepted state with status='callback_stopped'.
     Final full gauge/ERI validation is run once by default, outside the loops.
+
+    Cholesky shifts (all need nelec):
+      * optimize_cholesky_shift=False (default) optimizes theta. The shift is
+        the evaluator's own, or cholesky_shift0 if given (then held fixed).
+      * optimize_cholesky_shift='tied' or 'split' optimizes x = (theta, mu/s),
+        with s = cholesky_shift_scale at the starting gauge O(theta0), fixed
+        for the run. cholesky_shift0 is the start: 'median' (the default),
+        'zero', or an (r,) / (r, 2) array (resolve_cholesky_shift, at O(theta0)).
+      * optimize_theta=False holds the gauge at theta0 and optimizes mu only.
+    The result reports initial_cholesky_shift, cholesky_scale and cholesky_shift.
     """
     if not isinstance(solver,str):
         raise TypeError("solver must be a string: 'lbfgs' or 'gdm'")
@@ -710,7 +938,30 @@ def optimize_gauge(evaluator,*,theta0=None,reference=None,inner_t0=None,
     if solver == "gdm":
         GDMOptimizer._unimplemented()
     options = _coerce_lbfgs_options(options)
-    objective = ExponentialGaugeObjective(evaluator,reference=reference,
-                                          inner_options=inner_options,inner_t0=inner_t0)
-    return LBFGSOptimizer(objective,options=options).optimize(theta0,callback=callback)
-
+    mode = _shift_mode(optimize_cholesky_shift)
+    if not isinstance(optimize_theta,(bool,np.bool_)):
+        raise ValueError("optimize_theta must be boolean")
+    if mode is None and not optimize_theta:
+        raise ValueError("Nothing to optimize: optimize_theta=False needs optimize_cholesky_shift='tied' or 'split'")
+    if mode is None and cholesky_shift0 is None:
+        objective = ExponentialGaugeObjective(evaluator,reference=reference,
+                                              inner_options=inner_options,inner_t0=inner_t0)
+        return LBFGSOptimizer(objective,options=options).optimize(theta0,callback=callback)
+    if not isinstance(evaluator,GaugeEvaluator):
+        raise TypeError("evaluator must be a GaugeEvaluator")
+    r = evaluator.problem.data.nchol
+    angles = np.zeros(r*(r-1)//2) if theta0 is None else _real_array(theta0,"theta0")
+    if angles.shape != (r*(r-1)//2,):
+        raise ValueError(f"theta0 must be a length-{r*(r-1)//2} vector")
+    start = exponential_gauge(angles,r,reference)
+    mu0 = resolve_cholesky_shift(evaluator.problem,"median" if cholesky_shift0 is None else cholesky_shift0,start)
+    if mode is None:
+        # theta only, at a fixed shift
+        objective = ExponentialGaugeObjective(evaluator.with_cholesky_shift(mu0),reference=reference,
+                                              inner_options=inner_options,inner_t0=inner_t0)
+        return LBFGSOptimizer(objective,options=options).optimize(theta0,callback=callback)
+    objective = ExponentialGaugeObjective(
+        evaluator,reference=reference,inner_options=inner_options,inner_t0=inner_t0,
+        optimize_cholesky_shift=mode,cholesky_scale=cholesky_shift_scale(evaluator.problem,start),
+        frozen_theta=None if optimize_theta else angles)
+    return LBFGSOptimizer(objective,options=options).optimize(objective.pack(angles,mu0),callback=callback)

@@ -425,22 +425,31 @@ def _check_sector(policy,nelec):
 
 
 def _read_decomposition_file(path):
-    """Read and check a file written by optimize_cholesky.io.save_decomposition."""
+    """Read and check a file written by optimize_cholesky.io.save_decomposition (format version 2 or 3).
+
+    Version 2 files have no Cholesky shift and one (n,n) h1_X; it is returned
+    as (k,n,n) like version 3. chol_lam (the shifted channel eigenvalues) is
+    None without a shift.
+    """
     try:
         import h5py
     except ImportError as exc:  # pragma: no cover - depends on the environment
         raise ImportError("Reading optimized decompositions requires h5py; install it with "
                           "'pip install h5py'") from exc
-    from ipie.hamiltonians.optimize_cholesky.io import FORMAT,FORMAT_VERSION,POLICY_TO_DECOMP_TYPE
+    from ipie.hamiltonians.optimize_cholesky.io import FORMAT,READABLE_VERSIONS,POLICY_TO_DECOMP_TYPE
     names = ('h1','v0','chol_X','chol_ell','h1_X','h1_eps','a','p1','d1','p2','d2','keys')
     with h5py.File(path,'r') as f:
         fmt,version = f.attrs.get('format'),int(f.attrs.get('format_version',-1))
-        if fmt!=FORMAT or version!=FORMAT_VERSION:
-            raise ValueError(f'{path} is not a {FORMAT} file of format_version {FORMAT_VERSION} '
+        if fmt!=FORMAT or version not in READABLE_VERSIONS:
+            raise ValueError(f'{path} is not a {FORMAT} file of format_version {READABLE_VERSIONS} '
                              f'(found format={fmt!r}, version={version}); save it with '
                              'optimize_cholesky.io.save_decomposition')
         A = f.attrs
         data = {name:f[name][()] for name in names}
+        shifted = version>=3 and bool(A['has_cholesky_shift'])
+        data['chol_lam'] = f['chol_lam'][()] if shifted else None
+        data['cholesky_shift'] = np.array(A['cholesky_shift'],dtype=np.float64) if shifted else None
+        data['cholesky_energy'] = float(A['cholesky_energy']) if version>=3 else 0.
         p = f['provenance']
         data['policy'] = str(A['policy'])
         data['decomp_type'] = str(A['decomp_type'])
@@ -457,20 +466,28 @@ def _read_decomposition_file(path):
             'amplitude_bound':float(A['amplitude_bound']),'denom':data['denom'],
             'denom_all':float(A['denom_all']),'lambda_electronic':data['lambda_electronic'],
             'drop_identity':bool(A['drop_identity']),'dropped_identity':data['dropped_identity'],
+            'cholesky_shift':None if data['cholesky_shift'] is None else data['cholesky_shift'].tolist(),
+            'cholesky_energy':data['cholesky_energy'],
             'provenance':json.loads(str(p.attrs['record'])),'user':json.loads(str(p.attrs['user_metadata'])),
         }
 
     n,r = data['nbasis'],data['nchol']
     keys,T,T1 = data['keys'],data['a'].shape[0],data['p1'].shape[0]
     k = data['h1_eps'].shape[0] if data['h1_eps'].ndim==2 else -1
+    if version==2 and data['h1_X'].ndim==2 and k>=0:
+        data['h1_X'] = np.repeat(data['h1_X'][None],k,axis=0)
     def require(condition,message):
         if not condition:
             raise ValueError(f'{path}: {message}')
     require(data['policy'] in POLICY_TO_DECOMP_TYPE and data['decomp_type']==POLICY_TO_DECOMP_TYPE[data['policy']],
             'inconsistent policy/decomp_type')
     require(data['chol_X'].shape==(r,n,n) and data['chol_ell'].shape==(r,n),'invalid factor arrays')
-    require(data['h1_X'].shape==(n,n) and k>=0 and data['h1_eps'].shape==(k,n),'invalid h1 basis arrays')
+    require(k>=0 and data['h1_X'].shape==(k,n,n) and data['h1_eps'].shape==(k,n),'invalid h1 basis arrays')
     require(data['h1'].shape==(n,n) and data['v0'].shape==(2,n,n),'invalid h1/v0 arrays')
+    if data['cholesky_shift'] is not None:
+        require(data['cholesky_shift'].shape==(r,2) and data['chol_lam'].shape==(2,r,n),
+                'invalid Cholesky shift arrays')
+        require(data['nelec'] is not None,'a Cholesky shift needs the stored particle numbers')
     require(data['a'].ndim==1 and data['d1'].shape==(T1,) and data['p2'].shape==data['d2'].shape==(T-T1,2),
             'invalid term arrays')
     require(keys.ndim==2 and keys.shape[1]==5,'invalid key table')
@@ -512,6 +529,18 @@ def compute_h1e_shift(h1e,eri,chol,nelec,dt1,dt2):
 class QCSOR(SumOfRotationBase):
 
     def make_shift(self,h1e,chol,nelec,dt1,dt2,iprint=0,fname=None):
+        """One-shot Cholesky shift (median of each factor's eigenvalues) plus one-body shift.
+
+        h1e is the bare h. With L'_g = L_g - c_g I and N = N_up + N_down, on the
+        (N_up, N_down) sector
+            H = bare(h + (N-1) sum_g c_g L'_g, L' x L') + 1/2 N(N-1) sum_g c_g^2,
+        and mu = compute_h1e_shift(...) is chosen for that bare Hamiltonian.
+        Returns (h_t, L') with
+            h_t = h + (N-1) sum_g c_g L'_g - 1/2 sum_g L'_g^2 - mu
+        (a pair of matrices if mu_up != mu_down), and adds
+        1/2 N(N-1) sum_g c_g^2 + mu.N to self.E0, so that
+        H = sum_s h_t,s n_s + 1/2 sum_g rho'_g^2 + E0 on the sector.
+        """
         ell,c = compute_cholesky_shift(chol)
         if iprint>0:
             print('cholesky bands =',ell)
@@ -524,17 +553,16 @@ class QCSOR(SumOfRotationBase):
         n = h1e.shape[0]
         N = sum(nelec)
         Lp  = chol - c[:, None, None]*np.eye(n)
-        h_t = h1e + N*np.einsum("g,gpq->pq", c, Lp)     # h1e is the bare h
+        h_t = h1e + (N-1)*np.einsum("g,gpq->pq", c, Lp)     # bare h for the factors Lp
         if iprint>0:
             w = np.linalg.eigvalsh(h_t)
             print('shifted h1e band =',w)
-        self.E0 += 0.5*N**2*np.sum(c**2)                    # add to energies measured with (h_t, Lp)
+        self.E0 += 0.5*N*(N-1)*np.sum(c**2)                 # add to energies measured with (h_t, Lp)
         eri_new = np.einsum("gpr,gqs->prqs", Lp, Lp)
 
         mu = compute_h1e_shift(h_t,eri_new,Lp,nelec,dt1,dt2)
         self.E0 += mu[0]*nelec[0]+mu[1]*nelec[1]
-        #h_t -= 0.5 * np.einsum("prrs->ps",eri)
-        h_t -= 0.5 * np.einsum("gpr,grs->ps",chol,chol)
+        h_t -= 0.5 * np.einsum("gpr,grs->ps",Lp,Lp)         # h' = bare h - 1/2 sum_g L'_g^2
         if np.fabs(mu[0]-mu[1])<1e-16:
             h_t -= mu[0]*np.eye(n)
         else:
@@ -568,12 +596,18 @@ class QCSOR(SumOfRotationBase):
                                maxsweep=None,inner_atol=None,inner_rtol=None,
                                amplitude_limit=None,one_body_limit=None,
                                options=None,inner_options=None,
+                               cholesky_shift=None,optimize_cholesky_shift='tied',
                                drop_identity=False,overwrite=False,metadata=None):
         """Optimize the Cholesky gauge and save the result to the HDF5 file `source`.
 
         The file is written by optimize_cholesky.io.save_decomposition and is read
         back with QCSOR.from_file(source). Returns the OuterOptimizationResult.
         All options are keyword-only; an unknown name raises TypeError.
+
+        h1e is the bare one-body matrix h. The two-electron integrals are built as
+        eri = einsum("gpr,gqs->prqs", chol, chol), so the decomposition is exact for
+        the Hamiltonian that chol represents: a truncated Cholesky factorization
+        gives the correspondingly truncated Hamiltonian.
 
         Start and objective:
           theta=0.1         scale of the random starting angles, uniform in [-theta, theta]
@@ -595,6 +629,23 @@ class QCSOR(SumOfRotationBase):
           1e-11), inner_rtol -> gradient_rtol (default 1e-9), amplitude_limit (default
           (1-1e-8)*amplitude_bound), one_body_limit (default 1-1e-8).
 
+        Cholesky shift (needs nelecs). By default a tied shift mu_g of the rotated
+        factors is optimized together with the gauge, from the median start:
+          optimize_cholesky_shift='tied' (default), 'split' or False: optimize the shift
+                            with the gauge ('tied': one mu_g for both spins; 'split':
+                            per spin, which measured no better in roadmap step 13 and
+                            costs more), or hold it fixed (False).
+          cholesky_shift=None, 'median', 'zero' or an (r,) / (r,2) array: the start of
+                            the optimized shift ('median' when None), or the fixed shift
+                            with optimize_cholesky_shift=False (None: no shift, the
+                            behaviour before roadmap step 13). 'median' is each rotated
+                            factor's spectral median at the starting gauge
+                            (optimize_cholesky.optimizers.median_cholesky_shift).
+        With a shift the saved file carries it (format version 3) and is exact only on
+        the nelecs sector; its energy integrals stay the physical ones. Without
+        nelecs pass optimize_cholesky_shift=False. make_shift is a separate
+        preprocessing route and is unchanged.
+
         drop_identity, overwrite and metadata are passed to save_decomposition.
         """
         from dataclasses import replace
@@ -602,7 +653,8 @@ class QCSOR(SumOfRotationBase):
         from ipie.hamiltonians.optimize_cholesky.models import LBFGSOptions,InnerOptions
         from ipie.hamiltonians.optimize_cholesky.problem import prepare_problem
         from ipie.hamiltonians.optimize_cholesky.gradients import GaugeEvaluator
-        from ipie.hamiltonians.optimize_cholesky.optimizers import optimize_gauge
+        from ipie.hamiltonians.optimize_cholesky.optimizers import optimize_gauge,_shift_mode
+        from ipie.hamiltonians.optimize_cholesky.channels import cholesky_shift_array
 
         def overridden(base,fields):
             given = {name:value for name,value in fields.items() if value is not None}
@@ -623,6 +675,16 @@ class QCSOR(SumOfRotationBase):
                                                   'gradient_rtol':inner_rtol,'amplitude_limit':amplitude_limit,
                                                   'one_body_limit':one_body_limit})
 
+        mode = _shift_mode(optimize_cholesky_shift)
+        if isinstance(cholesky_shift,str):
+            if cholesky_shift not in ('median','zero'):
+                raise ValueError("cholesky_shift must be None, 'median', 'zero' or an array")
+        elif cholesky_shift is not None:
+            cholesky_shift_array(cholesky_shift,np.shape(chol)[0])          # shape and finiteness
+        if (mode is not None or cholesky_shift is not None) and nelecs is None:
+            raise ValueError('A Cholesky shift requires particle numbers (nelecs); pass '
+                             'optimize_cholesky_shift=False (and no cholesky_shift) to optimize without one')
+
         eri = np.einsum("gpr,gqs->prqs", chol, chol)
         problem = prepare_problem(h1e,eri,chol,nelec=nelecs)
         r = problem.data.nchol
@@ -632,7 +694,8 @@ class QCSOR(SumOfRotationBase):
         evaluator = GaugeEvaluator(problem,tau1=dt1,tau2=dt2,loss_kind=loss_kind,partition=partition,
                                    backend='numpy')
         result = optimize_gauge(evaluator,solver='lbfgs',theta0=theta0,options=options,
-                                inner_options=inner_options)
+                                inner_options=inner_options,optimize_cholesky_shift=optimize_cholesky_shift,
+                                cholesky_shift0=cholesky_shift)
         save_decomposition(source,result,drop_identity=drop_identity,overwrite=overwrite,metadata=metadata)
         return result
 
@@ -644,32 +707,45 @@ class QCSOR(SumOfRotationBase):
         per-channel Python objects are built. One size group of key nbasis:
           * bix=gamma (0..r-1): factor eigenvectors (isometry, S=None), integrals
             W=outer(ell,ell), tag 'thc' (used by local_energy);
-          * bix=r (and r+1 if mu_up!=mu_down): the h eigenbasis, integrals
-            eps-mu_s, tag 'h1';
+          * bix=r (and r+1 if the spins need separate bases): the one-body
+            channel basis, integrals eps-mu_s, tag 'h1'. It is the eigenbasis of
+            h, or of h_s = h + sum_g (m_g - mu[g,s]) L_g with a Cholesky shift;
           * term_info keys in file order, so parse_decomposition gives the file's
             global term order (minus any truncated terms).
 
-        Optional truncation (default None: no truncation, exact):
+        Truncation (default thresh=1e-6; thresh=None keeps every term, exact):
           * thresh drops one-body channel (k,s) if |eps_k - mu_s| < thresh, i.e.
             the SHIFTED orbital energy, the term (eps_k-mu_s) n_ks it represents
             (equivalently |d| < thresh*tau1);
           * thresh drops two-body channels with |W_ab| = |ell_a ell_b| < thresh
             (equivalently |d_L d_R| < thresh*tau2). All branches of a source share
-            W, so a source is always dropped as a whole.
-        Truncation is not exact: the walk then uses H minus the dropped terms, with
-        Lambda = (kept sum a) + mu.N = ham.denom + ham.E0 after parsing. ham.h1, v0
-        and the W integrals are NOT truncated, so local_energy still measures the
-        full H. Bases are kept even if all of their terms are dropped, so bix stays
-        valid. ham.truncation records the thresholds, counts, dropped weight and
-        largest dropped |eps-mu| and |W|; optimized_metadata['lambda_electronic']
-        is the file's untruncated value.
+            W, so a source is always dropped as a whole. With a Cholesky shift the
+            channel's own |lambda_a,s lambda_b,s'| (its leg spins) is compared, so
+            the branches of a split quartet can be dropped separately.
+        Truncation is not exact: the walk then uses H minus the dropped terms.
+        ham.h1, v0 and the W integrals are NOT truncated, so local_energy still
+        measures the full H. Bases are kept even if all of their terms are dropped,
+        so bix stays valid. iprint>0 prints the thresholds, counts, dropped weight
+        and largest dropped |eps-mu| and |W|.
 
-        Sets h1 (h' = h - 1/2 sum L^2), v0, mu, optimized_nelec, dropped_identity,
-        truncation and optimized_metadata. With parse=True (default)
-        parse_decomposition(nelec) is called, with nelec defaulting to the particle
-        numbers of the optimization; a sector on which the stored policy is not
-        exact raises ValueError (hybrid: any; ab_only: (1,1); aa_only: N_down=0),
-        and the parsed denom is checked against the file minus the dropped weight.
+        Energies. On the (N_up, N_down) sector, sum_i a_i U_i = Lambda I - H with
+        Lambda = ham.denom + mu.N + ham.cholesky_energy (ham.denom: the parsed,
+        kept weight sum; mu = ham.mu; cholesky_energy = E_c, 0 without a Cholesky
+        shift). The file's lambda_electronic attribute is the untruncated Lambda.
+        ham.E0 is the constant added to a local energy measured with ham.h1. The
+        energy integrals (ham.h1, v0 and the 'thc' W = ell ell^T) are the
+        physical, unshifted ones even when the channels carry a Cholesky shift,
+        so E0 stays 0.
+
+        Sets h1 = h' = h - 1/2 sum L^2 for both spins (shape (2,n,n), as
+        decompose_h1 does), v0, mu (the file's one-body (mu_up, mu_down)),
+        cholesky_shift ((r,2) or None) and cholesky_energy. Version 2 and 3
+        files load. With parse=True (default) parse_decomposition(nelec) is
+        called, with nelec defaulting to the particle numbers of the
+        optimization; a sector on which the stored policy is not exact raises
+        ValueError (hybrid: any; ab_only: (1,1); aa_only: N_down=0; with a
+        Cholesky shift: only the stored sector), and the parsed denom is
+        checked against the file minus the dropped weight.
         """
         data = _read_decomposition_file(path)
         n,r = data['nbasis'],data['nchol']
@@ -680,7 +756,7 @@ class QCSOR(SumOfRotationBase):
             ell = data['chol_ell'][g]
             sg.add_basis(data['chol_X'][g],np.outer(ell,ell),'thc',isometry=True)
         for k,eps in enumerate(data['h1_eps']):
-            sg.add_basis(data['h1_X'] if k==0 else data['h1_X'].copy(),eps,'h1')
+            sg.add_basis(np.array(data['h1_X'][k]),eps,'h1')
 
         a,p1,d1,p2,d2,keys = data['a'],data['p1'],data['d1'],data['p2'],data['d2'],data['keys']
         T1,T = p1.shape[0],a.shape[0]
@@ -699,8 +775,14 @@ class QCSOR(SumOfRotationBase):
                     truncation['max_dropped_eps'] = float(value1[~keep[:T1]].max())
             if thresh is not None and T>T1:
                 bix2 = np.repeat(keys[~one,0],counts[~one])
-                ell = data['chol_ell']
-                value2 = np.abs(ell[bix2,p2[:,0]]*ell[bix2,p2[:,1]])
+                if data['chol_lam'] is None:
+                    ell = data['chol_ell']
+                    value2 = np.abs(ell[bix2,p2[:,0]]*ell[bix2,p2[:,1]])
+                else:
+                    # Shifted channels: lambda of each leg's own spin (leg 0 is up for (0,1) keys).
+                    lam = data['chol_lam']
+                    s0,s1 = np.repeat(keys[~one,1],counts[~one]),np.repeat(keys[~one,2],counts[~one])
+                    value2 = np.abs(lam[s0,bix2,p2[:,0]]*lam[s1,bix2,p2[:,1]])
                 keep[T1:] = value2>=thresh
                 if not keep[T1:].all():
                     truncation['max_dropped_W'] = float(value2[~keep[T1:]].max())
@@ -728,9 +810,11 @@ class QCSOR(SumOfRotationBase):
             sg.term_info[key] = {'a':a[start:stop],'p':p,'d':d}
         ham.size_groups[n] = sg
 
-        ham.h1 = xp.asarray(data['h1'])
+        ham.h1 = xp.asarray(np.stack([data['h1'],data['h1']]))
         ham.v0 = np.array(data['v0'])
         ham.mu = np.array(data['mu'],dtype=np.float64)
+        ham.cholesky_shift = None if data['cholesky_shift'] is None else np.array(data['cholesky_shift'])
+        ham.cholesky_energy = float(data['cholesky_energy'])
         #ham.optimized_nelec = data['nelec']
         #ham.dropped_identity = data['dropped_identity']
         #ham.truncation = truncation
@@ -749,7 +833,11 @@ class QCSOR(SumOfRotationBase):
                 print('largest dropped |eps-mu|=',truncation['max_dropped_eps'],
                       'largest dropped |W|=',truncation['max_dropped_W'])
             print('mu=',data['mu'],'denom (file)=',data['denom'],'lambda_electronic (file)=',data['lambda_electronic'])
+            if data['cholesky_shift'] is not None:
+                print('Cholesky shift: E_c=',data['cholesky_energy'],'max|mu_up-mu_down|=',
+                      float(np.max(np.abs(data['cholesky_shift'][:,0]-data['cholesky_shift'][:,1]))))
         policy,expected_denom = data['policy'],data['denom']
+        shifted_sector = data['nelec'] if data['cholesky_shift'] is not None else None
         dropped_weight = truncation['dropped_weight']
         if nelec is None:
             nelec = data['nelec']
@@ -760,6 +848,9 @@ class QCSOR(SumOfRotationBase):
                 raise ValueError('parse=True needs nelec: the optimization stored no particle numbers')
             nelec = tuple(int(x) for x in nelec)
             _check_sector(policy,nelec)
+            if shifted_sector is not None and nelec!=tuple(shifted_sector):
+                raise ValueError(f'This decomposition has a Cholesky shift and is exact only on the sector it '
+                                 f'was built for, nelec={tuple(shifted_sector)}, not {nelec}')
             ham.parse_decomposition(nelec,iprint=iprint)
             if not math.isclose(float(ham.denom),expected_denom-dropped_weight,
                                 rel_tol=1e-12,abs_tol=1e-12*expected_denom):

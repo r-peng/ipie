@@ -47,11 +47,15 @@ def one_body_limit_value(one_body_limit):
 
 
 def shift_bounds(one_body, one_body_limit=None):
-    """(lower_up, lower_down); None for a spin without one-body channels."""
+    """(lower_up, lower_down); None for a spin without one-body channels.
+
+    Each spin's bound uses its own largest orbital energy (they differ only
+    when a split Cholesky shift gives the spins different one-body matrices).
+    """
     rho = one_body_limit_value(one_body_limit)
-    lower = float(np.max(one_body.eigenvalues) - rho/one_body.tau1)
     spins = one_body.spins
-    return tuple(lower if s in spins else None for s in (0, 1))
+    return tuple(float(np.max(one_body.spin_eigenvalues(s)) - rho/one_body.tau1) if s in spins else None
+                 for s in (0, 1))
 
 
 def shift_scale(eigenvalues):
@@ -88,7 +92,7 @@ def check_one_body_shift(one_body, *, rtol=1e-13):
     """Verify stored one-body amplitudes against (mu_sigma - epsilon)*tau1 (math.isclose rule)."""
     shift = shift_pair(one_body.shift)
     table = one_body.table
-    expected = (np.asarray(shift)[table.spin] - np.asarray(one_body.eigenvalues)[table.mode])*one_body.tau1
+    expected = (np.asarray(shift)[table.spin] - one_body.mode_eigenvalues[table.spin, table.mode])*one_body.tau1
     diff = np.abs(table.d - expected)
     if np.any(diff > np.maximum(rtol*np.maximum(np.abs(table.d), np.abs(expected)), 1e-300)):
         raise ValueError("One-body amplitudes disagree with the stored shift; rebuild channels")
@@ -104,11 +108,11 @@ def shift_profiles(one_body, field, scales, lower):
     """
     table = one_body.table
     shift = shift_pair(one_body.shift)
-    eps = np.asarray(one_body.eigenvalues, dtype=np.float64)
     result = []
     for spin in one_body.spins:
         if lower[spin] is None:
             raise ValueError(f"No shift bound for spin {spin}")
+        eps = np.asarray(one_body.spin_eigenvalues(spin), dtype=np.float64)
         selected = table.spin == spin
         modes = table.mode[selected]
         w = np.asarray(scales)[selected]*field[spin, modes]

@@ -17,9 +17,17 @@ Two independent references are used:
     the file arrays, and the truncated Hamiltonian is checked in Fock space.
 
 The structural comparisons (assert_same_qcsor, assert_same_terms_per_key) cover
-the terms, bases and h1/v0. Lambda = denom + E0 with E0 = mu.N is tested
-separately (QCSORFromFileTests.test_lambda_includes_the_shift_energy and the
-Fock-space reconstructions), so a wrong shift energy shows up there by name.
+the terms, bases and h1/v0. The shift energy is tested separately
+(QCSORFromFileTests.test_lambda_and_E0_conventions and the Fock-space
+reconstructions), so a wrong one shows up there by name.
+
+Conventions since e28eda6: on the (N_up, N_down) sector
+sum_i a_i U_i = Lambda I - H with Lambda = ham.denom + mu.N, where mu = ham.mu
+is the one-body shift and ham.denom the parsed weight sum. ham.E0 is the
+constant added to a local energy measured with ham.h1; ham.h1 carries no
+shift, so from_file leaves E0 = 0. The file's lambda_electronic attribute is
+the untruncated Lambda. Since format version 3 ham.h1 is per spin (2, n, n);
+files with a Cholesky shift are tested in test_io_cholesky_shift.
 """
 
 from contextlib import redirect_stdout
@@ -144,6 +152,11 @@ def shift_energy(shift, nelec):
     return shift[0]*nelec[0] + shift[1]*nelec[1]
 
 
+def sector_lambda(ham, shift, nelec):
+    """Lambda = ham.denom + mu.N + E_c on the (N_up, N_down) sector (see the module docstring)."""
+    return float(ham.denom) + shift_energy(shift, nelec) + float(getattr(ham, "cholesky_energy", 0.))
+
+
 def file_attrs(path):
     """The file's attributes plus decoded provenance record and user metadata."""
     with h5py.File(path, "r") as f:
@@ -153,26 +166,33 @@ def file_attrs(path):
     return attrs
 
 
-def reference_qcsor(decomposition, *, drop_identity=False, nelec=None):
-    """Per-channel QCSOR construction (the previous load_optimized), parsed."""
+def reference_qcsor(decomposition, *, drop_identity=False, nelec=None, h=None):
+    """Per-channel QCSOR construction (the previous load_optimized), parsed.
+
+    h: the bare one-body matrix for the (physical) energy integrals; by default
+    it is rebuilt from an unshifted decomposition's h eigensystem. The h1 bases
+    are per spin unless the spins share one basis and mu_up == mu_down.
+    """
     one, two = decomposition.one_body, decomposition.two_body
     gauge = two.gauge
-    n = one.X.shape[0]
+    n = np.shape(gauge.chol)[1]
     ham = QCSOR(n, decomp_type=POLICY_TO_DECOMP_TYPE[two.policy])
     sg = SizeGroup()
     for g in range(gauge.chol.shape[0]):
         ell = np.array(gauge.eigenvalues[g])
         sg.add_basis(np.array(gauge.X[g]), np.outer(ell, ell), "thc", isometry=True)
-    shift, eps, X1 = tuple(one.shift), np.array(one.eigenvalues), np.array(one.X)
+    shift = tuple(one.shift)
     # h1 bases follow the policy (as in the file), even if every one-body channel was filtered out.
     spins = (0,) if two.policy == "aa_only" else (0, 1)
-    if len(spins) == 1 or shift[0] == shift[1]:
-        sg.add_basis(X1, eps - shift[spins[0]], "h1")
+    X = {s: np.array(one.spin_X(s)) for s in spins}
+    eps = {s: np.array(one.spin_eigenvalues(s)) for s in spins}
+    if len(spins) == 1 or (np.array_equal(X[0], X[1]) and np.array_equal(eps[0], eps[1]) and shift[0] == shift[1]):
+        sg.add_basis(X[spins[0]], eps[spins[0]] - shift[spins[0]], "h1")
         h1_bix = {s: sg.get_basis_index() for s in spins}
     else:
         h1_bix = {}
         for s in spins:
-            sg.add_basis(X1.copy(), eps - shift[s], "h1")
+            sg.add_basis(X[s].copy(), eps[s] - shift[s], "h1")
             h1_bix[s] = sg.get_basis_index()
     for c in one.channels:
         if not (drop_identity and c.d == 0.):
@@ -186,8 +206,13 @@ def reference_qcsor(decomposition, *, drop_identity=False, nelec=None):
         else:
             sg.add_2body_term(int(c.bix), (0, 1), float(c.a_i), [int(pr), int(pl)], [float(dr), float(dl)])
     ham.size_groups[n] = sg
+    if h is None:
+        if two.cholesky_shift is not None:
+            raise ValueError("pass the bare h of a decomposition with a Cholesky shift")
+        X1, e1 = np.array(one.X), np.array(one.eigenvalues)
+        h = (X1*e1) @ X1.T
     L2 = np.einsum("gpr,grq->pq", np.asarray(gauge.chol), np.asarray(gauge.chol))
-    ham.h1 = (X1*eps) @ X1.T - .5*L2
+    ham.h1 = np.stack([h - .5*L2, h - .5*L2])
     ham.v0 = np.tile(.5*L2[None], (2, 1, 1))
     ham.mu = np.array(shift)
     ham.parse_decomposition(two.nelec if nelec is None else nelec)
@@ -323,7 +348,8 @@ def check_truncated_hamiltonian(ham, problem, kept, dropped, nelec):
     if dropped.nterms:
         removed = reference_qcsor(dropped, nelec=nelec)
         H = H - (float(removed.denom)*np.eye(len(basis)) - sor_green_function(removed, basis, basis_map, n))
-    check_norm(float(ham.denom + ham.E0)*np.eye(len(basis)) - sor_green_function(ham, basis, basis_map, n), H)
+    Lam = sector_lambda(ham, kept.shift, nelec)
+    check_norm(Lam*np.eye(len(basis)) - sor_green_function(ham, basis, basis_map, n), H)
 
 
 # --------------------------------------------------------------------------- the file
@@ -441,8 +467,8 @@ class QCSORFromFileTests(TemporaryFiles, unittest.TestCase):
                     ham = QCSOR.from_file(self.saved(decomposition, drop_identity=drop), nelec=nelec, thresh=None)
                     assert_same_qcsor(self, reference_qcsor(decomposition, drop_identity=drop, nelec=nelec), ham)
 
-    def test_lambda_includes_the_shift_energy(self):
-        """E0 = mu.N, so Lambda = denom + E0 = lambda_electronic stored in the file."""
+    def test_lambda_and_E0_conventions(self):
+        """E0 = 0 and mu = ham.mu after from_file; denom + mu.N = lambda_electronic in the file."""
         for nelec, shift in SECTORS + (((2, 1), (.9, -.4)),):
             with self.subTest(nelec=nelec, shift=shift):
                 if shift == (.9, -.4):
@@ -451,12 +477,19 @@ class QCSORFromFileTests(TemporaryFiles, unittest.TestCase):
                     _, decomposition = shifted_fixture(nelec, shift)
                 path = self.saved(decomposition)
                 ham = QCSOR.from_file(path, nelec=nelec, thresh=None)
-                self.assertAlmostEqual(float(ham.E0), shift_energy(shift, nelec), places=14)
-                self.assertAlmostEqual(float(ham.denom + ham.E0), float(file_attrs(path)["lambda_electronic"]),
+                self.assertEqual(float(ham.E0), 0.0)
+                np.testing.assert_array_equal(ham.mu, shift)
+                self.assertAlmostEqual(sector_lambda(ham, ham.mu, nelec), float(file_attrs(path)["lambda_electronic"]),
                                        delta=1e-12*float(ham.denom))
-        _, decomposition = shifted_fixture((2, 1), (.05, -.03))
-        other = QCSOR.from_file(self.saved(decomposition), nelec=(1, 2), thresh=None)  # hybrid: any sector
-        self.assertAlmostEqual(float(other.E0), shift_energy((.05, -.03), (1, 2)), places=14)
+        # Hybrid is exact on any sector: Lambda follows the parsed sector, not the stored one.
+        problem, decomposition = shifted_fixture((2, 1), (.05, -.03))
+        other = QCSOR.from_file(self.saved(decomposition), nelec=(1, 2), thresh=None)
+        self.assertEqual(float(other.E0), 0.0)
+        n = problem.data.h1.shape[0]
+        basis, basis_map = sector_basis(n, (1, 2))
+        H = physical2MB(problem.data.h1, problem.data.eri, basis, basis_map)
+        check_norm(sector_lambda(other, (.05, -.03), (1, 2))*np.eye(len(basis))
+                   - sor_green_function(other, basis, basis_map, n), H)
 
     def test_default_call_uses_the_stored_particle_numbers(self):
         _, decomposition = shifted_fixture((2, 1), (.05, -.03))
@@ -480,7 +513,8 @@ class QCSORFromFileTests(TemporaryFiles, unittest.TestCase):
                 n = problem.data.h1.shape[0]
                 basis, basis_map = sector_basis(n, nelec)
                 H = physical2MB(problem.data.h1, problem.data.eri, basis, basis_map)
-                check_norm(float(ham.denom + ham.E0)*np.eye(len(basis)) - sor_green_function(ham, basis, basis_map, n), H)
+                Lam = sector_lambda(ham, decomposition.shift, nelec)
+                check_norm(Lam*np.eye(len(basis)) - sor_green_function(ham, basis, basis_map, n), H)
 
     def test_losses_match_sor_diagnostics(self):
         for nelec, shift in SECTORS:
@@ -503,8 +537,10 @@ class QCSORFromFileTests(TemporaryFiles, unittest.TestCase):
                 ham = QCSOR.from_file(self.saved(decomposition), parse=False, thresh=None)
                 h, chol = problem.data.h1, problem.data.chol
                 L2 = np.einsum("gpr,grq->pq", chol, chol)
-                np.testing.assert_allclose(np.asarray(ham.h1), h - .5*L2, atol=1e-13)
-                np.testing.assert_allclose(np.asarray(ham.h1) + ham.v0[0], h, atol=1e-13)
+                self.assertEqual(np.shape(ham.h1), (2,) + h.shape)          # per spin, as decompose_h1
+                for spin in (0, 1):
+                    np.testing.assert_allclose(np.asarray(ham.h1)[spin], h - .5*L2, atol=1e-13)
+                    np.testing.assert_allclose(np.asarray(ham.h1)[spin] + ham.v0[spin], h, atol=1e-13)
                 sg = ham.size_groups[h.shape[0]]
                 gauge = decomposition.two_body.gauge
                 r = gauge.chol.shape[0]

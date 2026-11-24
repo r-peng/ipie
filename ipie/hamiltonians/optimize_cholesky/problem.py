@@ -358,16 +358,35 @@ def near_zero_eigenvalues(state, *, rtol=1e-6, atol=0.0):
 
     state may be a GaugeState, a FixedDecomposition, or any result with a
     .decomposition attribute (outer or partition optimization results).
+
+    With a Cholesky shift the kinks are where the shifted eigenvalues
+    lambda[s, g, a] = ell[g, a] - mu[g, s] vanish, i.e. where mu[g, s] meets an
+    eigenvalue of factor g. Entries are then (factor, mode, lambda, spin) for
+    every spin that carries channels, with the scale max_mode |lambda| of that
+    factor and spin.
     """
     if not isinstance(rtol, Real) or not isinstance(atol, Real) or rtol < 0 or atol < 0:
         raise ValueError("rtol and atol must be nonnegative real numbers")
     gauge = state
     if hasattr(gauge, "decomposition") and not hasattr(gauge, "eigenvalues"):
         gauge = gauge.decomposition
+    two = None
     if hasattr(gauge, "two_body"):
-        gauge = gauge.two_body.gauge
+        two = gauge.two_body
+        gauge = two.gauge
     if not hasattr(gauge, "eigenvalues"):
         raise TypeError("state must be a GaugeState, FixedDecomposition, or a result with .decomposition")
+    if two is not None and getattr(two, "cholesky_shift", None) is not None:
+        lam = np.asarray(two.spin_eigenvalues, dtype=np.float64)
+        spins = sorted(set(np.asarray(two.table.spins).reshape(-1).tolist()))
+        found = []
+        for g in range(lam.shape[1]):
+            for s in spins:
+                values = lam[s, g]
+                tolerance = atol+rtol*np.max(np.abs(values), initial=0.0)
+                found.extend((g, int(a), float(values[a]), s)
+                             for a in np.flatnonzero(np.abs(values) <= tolerance))
+        return tuple(found)
     ell = np.asarray(gauge.eigenvalues, dtype=np.float64)
     found = []
     for g, values in enumerate(ell):

@@ -21,8 +21,9 @@ the term weights by default. The result is saved as an HDF5 file that
 
 The full reference, with the mathematics, every option and the file format,
 is [`docs/optimize_cholesky_documentation.pdf`](docs/optimize_cholesky_documentation.pdf).
-Its ReportLab sources are in `docs/build/`; `python docs/build/build_doc.py out.pdf`
-regenerates it. This README is the
+Its ReportLab source is `docs/build_documentation.py`:
+`python docs/build_documentation.py [out.pdf]` regenerates it (reportlab
+needed; the DejaVu fonts are used when found). This README is the
 in-repository guide: quick start, layout, how an evaluation runs, how to
 extend and debug the solver, and how to test.
 
@@ -83,13 +84,42 @@ from ipie.hamiltonians.sor_base import QCSOR
 ham = QCSOR.from_file(path, nelec=(2, 2), thresh=None)   # thresh=None: no truncation (exact)
 ```
 
-`QCSOR.optimize_from_cholesky(h1, eri, chol, nelec, tau1, tau2, path, ...)`
-does both steps in one call. Its options are keyword-only, and an unknown
-name raises `TypeError`. It starts from random angles of scale `theta`
+**Energies after loading.** On the `(N_up, N_down)` sector,
+`sum_i a_i U_i = Lambda I - H` with
+`Lambda = ham.denom + mu.N + ham.cholesky_energy`, where `mu = ham.mu` is the
+one-body shift and `cholesky_energy` is `E_c` (0 without a Cholesky shift).
+`lambda_electronic` in the file is the untruncated Λ. `ham.E0` is the
+constant added to a local energy measured with `ham.h1`. The energy
+integrals (`ham.h1`, `v0` and the factor integrals `W = ell ell^T`) are always
+the physical, unshifted ones, even when the channels carry a Cholesky
+shift, so `from_file` leaves `E0 = 0`. `ham.h1` has shape `(2, n, n)`, one
+copy per spin, as `decompose_h1` produces.
+
+**Cholesky shifts in the file** (format version 3):
+- the channels are stored shifted, with per-spin one-body bases (the
+  eigenbases of `h_s`);
+- the file adds `cholesky_shift`, `cholesky_energy` and the shifted channel
+  eigenvalues `chol_lam`, which the truncation rule compares;
+- `ham.cholesky_shift` and `ham.cholesky_energy` are set on load;
+- a shifted file is exact only on the sector it was built for, so `from_file`
+  refuses any other `nelec`.
+
+Version 2 files still load. `make_shift` is a separate preprocessing route
+and is unchanged.
+
+`QCSOR.optimize_from_cholesky(h1, chol, nelec, tau1, tau2, path, ...)`
+does both steps in one call. It builds `eri = einsum("gpr,gqs->prqs", chol, chol)`
+itself, so the decomposition is exact for the Hamiltonian that `chol`
+represents. Its options are keyword-only, and an unknown name raises
+`TypeError`. It starts from random angles of scale `theta`
 (reproducible with `seed=`). It runs weak-Wolfe L-BFGS with the shift
 relaxed and the `InnerOptions` defaults (1e-11 / 1e-9, 500 sweeps). The
 outer defaults are 100 iterations, verbosity 2 and the outer tolerances
-1e-8 / 1e-6. You can override:
+1e-8 / 1e-6. By default it also optimizes a tied Cholesky shift from the
+median start (`optimize_cholesky_shift="tied"`), so the file is exact only on
+the `nelec` sector. Pass `optimize_cholesky_shift=False` for the earlier
+behaviour, with no shift; that is also the setting to use without `nelec`.
+You can override:
 
 - `maxiter`, `verbosity`, `gradient_atol`, `gradient_rtol` (outer loop);
 - `maxsweep`, `inner_atol`, `inner_rtol`, `amplitude_limit`,
@@ -116,8 +146,11 @@ results, and `sor_base.py` (outside the package) only reads files.
 | `shift.py` | One-body shift bounds, exact quadratic profiles and updates | `with_shift`, `shift_coefficients`, `optimal_shift` |
 | `partitions.py` | Partition intervals, source profiles, the inner solver | `optimize_partitions`, `partition_coefficients`, `with_partitions`, `partition_bounds` |
 | `gradients.py` | Pullbacks, fixed / fixed-z / relaxed gauge gradients, the evaluator | `GaugeEvaluator`, `relaxed_gauge_gradient`, `check_gauge_regularity`, `check_gauge_direction` |
-| `optimizers.py` | Exponential objective, solver-neutral parent, L-BFGS, GDM placeholder | `optimize_gauge`, `ExponentialGaugeObjective`, `LBFGSOptimizer` |
-| `io.py` | The QCSOR-ready HDF5 file (format `lafqmc-optimized-decomposition`, version 2) | `save_decomposition` |
+| `optimizers.py` | Exponential objective (gauge angles and, optionally, the Cholesky shift), solver-neutral parent, L-BFGS, GDM placeholder | `optimize_gauge`, `ExponentialGaugeObjective`, `LBFGSOptimizer`, `median_cholesky_shift` |
+| `io.py` | The QCSOR-ready HDF5 file (format `lafqmc-optimized-decomposition`, version 3; version 2 still loads) | `save_decomposition` |
+
+`tests/` holds the test modules, the shared tolerance and the frozen
+reference; `docs/` holds the PDF and its source.
 
 ### Data model
 
@@ -143,6 +176,79 @@ The weights `a_i` are positive and unnormalized. On the selected sector,
 `(denom + mu_up N_up + mu_down N_down) I - H = sum_i a_i U_i`; with zero
 shift this is `denom I - H`. The one-body and two-body lists share one
 normalization, so never normalize them separately.
+
+### Cholesky shifts
+
+`build_fixed_decomposition(..., cholesky_shift=mu)` and
+`GaugeEvaluator(..., cholesky_shift=mu)` shift the rotated factors,
+`L'_{g,s} = L_g - mu[g,s] I`. `mu` is `(r,)` for a tied shift (both spins;
+up only for aa_only) or `(r, 2)` per spin, and needs particle numbers. With
+`m_g = sum_s N_s mu[g,s]`:
+
+- the channels use `lambda[s,g,a] = ell[g,a] - mu[g,s]`; eigenvectors, and
+  so the factor-factor overlaps, do not change;
+- the one-body channels diagonalize `h_s = h + sum_g (m_g - mu[g,s]) L_g`
+  (a tied shift: `h + (N-1) sum_g mu_g L_g`);
+- `cholesky_energy` is `E_c = 1/2 sum_g (sum_s N_s mu[g,s]^2 - m_g^2)`, and
+  `lambda_electronic = denom + mu.N + E_c`. The weights, and so `denom`, do
+  not change. With a shift every policy is exact only on the sector.
+
+Zero and tied shifts keep today's layouts and code path (`ell` replaced by
+`lambda`). A split shift (`mu_up != mu_down` somewhere) stores per-spin
+amplitudes `two_body.amplitudes` of shape `(sources, 2 legs, 2 spins)`, a
+per-spin one-body eigensystem `one_body.X` `(2, n, n)`, and a per-spin h
+strip in `ModeSpace`. A quartet keeps one `t`: its legs scale as
+`lambda_{a,s} e^t` and `lambda_{b,s'} e^-t`. With `balanced_log` each
+quartet leg is balanced by the RMS of its two spins' `lambda`, which equals
+`|lambda|` when the spins agree.
+
+The inner solver, the losses, the profiles and the gauge gradients accept
+shifted decompositions, and `optimize_gauge` can optimize the shift together
+with the gauge ("Optimizing the Cholesky shift" below). `save_decomposition`
+stores it (format version 3) and `QCSOR.from_file` loads it; see "Energies
+after loading". `QCSOR.optimize_from_cholesky` takes
+`optimize_cholesky_shift="tied"` (the default) `| "split" | False` and
+`cholesky_shift=None | "median" | "zero" | array`. With optimization, that
+array is the start (`None`: the median); with `False` it is the fixed
+shift (`None`: no shift).
+
+**Gradients with a shift.** `h_s` depends on the gauge through
+`L_g(O) = sum_h O[g,h] L0_h`, so `gradient_O` gains the term
+`sum_s (m_g - mu[g,s]) <dL/dh_s, L0_h>`, where `dL/dh_s` is the eigh pullback
+of `h_s` (eigenvalue adjoint `-tau1 dL/dd` per one-body channel, eigenvector
+adjoint from the loss pullback). Every gradient also reports
+`cholesky_gradient`, the derivative with respect to the shift at the same
+fixed `t`, fixed `z` or envelope:
+
+    dL/dmu[g,s] = -sum_a dL/dlambda[s,g,a] + N_s sum_s' P[g,s'] - P[g,s],
+    P[g,s] = <dL/dh_s, L_g(O)>.
+
+- `dL/dlambda` includes the moving interval ends. It is per spin: quartet
+  legs are differentiated through their RMS leg scale.
+- A relaxed one-body shift held on its lower bound `max(eps_s) - rho_1/tau1`
+  moves with `h_s`; that term goes to `bound_correction_O`.
+- The Cholesky shift is an outer variable: the inner solve keeps it fixed,
+  so its relaxed gradient is an ordinary partial derivative at the envelope.
+
+`cholesky_gradient=None` (the default, on `GaugeEvaluator` and on the three
+public gradient functions) reports it in the shift's own form: `(r,)` for a
+tied shift (column 0 for aa_only, whose `mu_down` is 0), `(r, 2)` for a split
+one, nothing without a shift. `"tied"` or `"split"` choose the form, also at
+zero shift. `"split"` keeps per-spin one-body bases (equal ones at a tied
+shift). The tied gradient is the sum of the split columns.
+
+Two regularity notes:
+
+- **Degenerate h.** A gradient through `h_s` needs simple eigenvalues of
+  `h_s`. A repeated one raises `GaugeRegularityError` ("One-body matrix
+  h_sigma ...") before any inner work. Bare `h` is degenerate for
+  H2/cc-pVDZ and LiH, so a shift gradient at zero shift is undefined there;
+  a nonzero shift usually lifts the degeneracy.
+- **Kink at equal spins.** A quartet leg's interval end takes the larger of
+  its two spins' amplitudes. At a tied shift the two are equal, so the
+  fixed-z loss has a kink in each spin's direction (not in the tied one), and
+  so does the relaxed loss when a quartet source sits on an amplitude wall.
+  The split gradient there is the mean of the two one-sided derivatives.
 
 ## How an evaluation runs
 
@@ -194,7 +300,9 @@ differentiated.
   factor eigenvalues, or near-zero ones for `balanced_log`, raise
   `GaugeRegularityError` straight away;
 - builds the mode space once and shares it between the inner solve and the
-  gradient.
+  gradient;
+- with a Cholesky shift (or a shift gradient), diagonalizes `h_s` and checks
+  its eigengaps in the same early step.
 
 The exponential coordinates form `expm` once per gauge. The public gradient
 functions (`fixed_partition_gradient`, `normalized_partition_gradient`,
@@ -268,6 +376,68 @@ trigger backtracking: feasibility, regularity, inner convergence,
 floating-point and linear-algebra errors. Any other exception propagates.
 A failing initial evaluation raises.
 
+### Optimizing the Cholesky shift
+
+`optimize_gauge(..., optimize_cholesky_shift="tied" | "split")` optimizes
+the gauge and the Cholesky shift together:
+
+```python
+result = optimize_gauge(evaluator, theta0=theta0,
+                        optimize_cholesky_shift="tied",    # or "split"
+                        cholesky_shift0="median",          # default; "zero" or an array
+                        options=LBFGSOptions(line_search="weak_wolfe"),
+                        inner_options=InnerOptions(optimize_shift=True))
+result.cholesky_shift          # final (r, 2) shift
+result.initial_cholesky_shift  # the start
+result.cholesky_scale          # s, see below
+```
+
+**Coordinates.** The solver works on `x = (theta, mu/s)`. A tied shift has
+`r` entries; a split one has `2r`, all spin-up entries first. aa_only always
+has `r`, because its `mu_down` is 0. The scale `s_g` is the eigenvalue
+spread of rotated factor `g` at the starting gauge (`cholesky_shift_scale`),
+fixed for the run, so that one unit of `x` moves `mu_g` across its factor's
+spectrum. `ExponentialGaugeObjective(optimize_cholesky_shift=...)` exposes
+`pack` and `unpack` for building `x` and reading it back. Its cache is keyed
+on `x`.
+
+**Start.** `"median"` is each rotated factor's spectral median at
+`O(theta0)` (`median_cholesky_shift`), for both spins. For an even number
+of orbitals this is `np.median`, as in `sor_base.compute_cholesky_shift`.
+For an odd number it is the midpoint of the wider gap next to the middle
+eigenvalue, because `np.median` would put `lambda = 0` exactly on that
+mode.
+
+**Modes.**
+
+| Call | Optimizes |
+| --- | --- |
+| `optimize_cholesky_shift=False` (default) | `theta`, with the evaluator's own shift |
+| `optimize_cholesky_shift=False, cholesky_shift0=...` | `theta`, at that fixed shift |
+| `optimize_cholesky_shift="tied"` or `"split"` | `theta` and `mu` |
+| ... plus `optimize_theta=False` | `mu` only, with the gauge held at `theta0` |
+
+**Stopping.** `gradient_norm` is the infinity norm over all of `x`.
+`tangent_gradient_norm` combines the physical tangent norm and the 2-norm of
+the scaled shift gradient (the shift gradient alone when the gauge is
+frozen).
+
+**Tied or split?** Prefer `"tied"`. When `N_up = N_down` the loss is
+unchanged by swapping the spins together with `mu_up <-> mu_down`, so a tied
+point is stationary in every split direction and a gradient method started
+there never splits. On H2 (ab_only), H4 and LiH, at N_up = N_down and at
+N_up != N_down, a split continuation at a fixed gauge ended within 0.012% of
+a tied one, while costing 9% to 160% more per evaluation.
+`tests/reference/spin_split_benchmark.py` repeats that measurement.
+
+**Kinks in mu.** The relaxed loss has a kink wherever `mu[g,s]` meets an
+eigenvalue of factor `g` (`lambda = 0`), and its minima tend to sit there.
+`near_zero_eigenvalues` reports the shifted eigenvalues as
+`(factor, mode, lambda, spin)`. `balanced_log` cannot be differentiated at
+`lambda = 0`: such trials are rejected and the line search backtracks.
+`anchored_log` can. Away from the amplitude walls both maps give the same
+relaxed loss, because they differ only by a per-source offset in `t`.
+
 ### Extending the solver
 
 `OuterOptimizer` knows neither a solver name nor a coordinate
@@ -308,9 +478,9 @@ with its reason. Look at `curvature_update`, `memory_size`,
 tests carry no markers, so clear the filter:
 
 ```sh
-# everything (about 4.5 min, almost all of it the frozen oracle's pair-loop self-check)
+# everything (about 8 min, almost 7 of them the frozen oracle's pair-loop self-check)
 python -m pytest ipie/hamiltonians/optimize_cholesky/tests -m ""
-# everything except that self-check (about 15 s)
+# everything except that self-check (about 1.5 min)
 python -m pytest ipie/hamiltonians/optimize_cholesky/tests -m "" \
     --deselect ipie/hamiltonians/optimize_cholesky/tests/test_reference_golden.py::OracleGoldenTests
 ```
@@ -343,7 +513,7 @@ numerical values.
 points at 1e-12, including 5-iteration L-BFGS trajectories. Do not
 regenerate the golden file; it is the yardstick.
 
-**Modules** (224 tests):
+**Modules** (281 tests):
 
 - **Exactness and finite differences.** `test_channels` checks exact
   Fock-space reconstruction for every policy, map and gauge.
@@ -370,35 +540,62 @@ regenerate the golden file; it is the yardstick.
   `QCSOR.from_file`, truncation, walker energy and propagation.
   `test_io_arrays` checks that the save builds no record objects and that
   files at the amplitude limits load. `test_wrapper` covers the options of
-  `QCSOR.optimize_from_cholesky`.
+  `QCSOR.optimize_from_cholesky` and that it builds `eri` from `chol`.
+  `test_make_shift` checks `QCSOR.make_shift` in Fock space: the bare form
+  it optimizes `mu` for, and the `h'` form and `E0` it returns.
+- **Cholesky shifts.** `test_cholesky_shift` checks the shifted forward model:
+  Fock-space exactness for every policy and map with tied and split shifts,
+  zero shifts against today's decomposition, a tied shift against shifted
+  inputs, the per-spin path against the shared one at equal spins, the
+  mode-space loss against the dense loss, exact profiles, intervals, the
+  inner solve, validation and the step-12 saving guard.
+  `test_cholesky_gradients` checks the gradients with a shift: finite
+  differences in `O` and `mu` for all three modes, every policy, both maps,
+  tied and split; a one-body shift on its wall and sources on amplitude
+  walls; tied against split; zero shift; the kink at equal spins; public
+  functions against the evaluator; regularity and validation.
+  `test_io_cholesky_shift` covers shifted files: attributes and physical
+  integrals, the QCSOR against a per-channel reference, the sector
+  Hamiltonian and Λ, the sector check, truncation by each channel's shifted
+  magnitude, the walker local energy and same-seed propagation, version 2
+  files, the reader's checks, and the wrapper's shift options end to end.
+  `test_cholesky_shift_optimization` covers the outer optimization over `(theta, mu/s)`:
+  coordinate layouts, the median start and the scale, finite differences in
+  `x`, the cache and stopping norms, every `optimize_gauge` mode (theta-only
+  runs unchanged), exactness of the result, and `near_zero_eigenvalues` with
+  a shift.
 
-**Known failures.** Four walker subtests in `test_io_sor` fail on the
-current `sor_base`/trial code, outside this package:
-
-- `SingleDet.build` iterates `hamiltonian.h1` per spin, but `from_file`
-  stores one `(n, n)` `h1`;
-- the walker local energy now adds `ham.E0`, which `parse_decomposition`
-  uses to carry the shift energy `mu.N` for Λ.
+The four walker subtests that used to fail (`SingleDet.build` iterates
+`hamiltonian.h1` per spin) pass since `from_file` sets a per-spin `h1`.
 
 The walker tests skip when the LAFQMC walker modules are not importable,
 and the HDF5 tests skip without h5py.
 
 ## Performance and memory
 
-`tests/reference/benchmark.py --outer 20` times one relaxed evaluation and
-20 L-BFGS iterations (2-core container):
+`tests/reference/benchmark.py --outer 20` times one relaxed evaluation at a
+fixed gauge and 20 weak-Wolfe L-BFGS iterations. With `--cholesky-shift tied`
+(or `split`) it uses the median Cholesky shift and optimizes it with the
+gauge. On a 2-core container (23 November 2026):
 
-| System | Relaxed evaluation | 20 L-BFGS iterations |
-| --- | --- | --- |
-| H2/cc-pVDZ (ab_only, n=10, r=54) | 0.050 s | 1.5 s |
-| H4/6-31G (hybrid, n=8, r=32) | 0.224 s | 5.8 s |
-| LiH/STO-3G (hybrid, n=6, r=21) | 0.044 s | 1.1 s |
+| System | Relaxed evaluation | 20 L-BFGS iterations | Per outer evaluation: no shift / tied / split |
+| --- | --- | --- | --- |
+| H2/cc-pVDZ (ab_only, n=10, r=54) | 0.070 s | 2.1 s | 0.075 / 0.076 / 0.102 s |
+| H4/6-31G (hybrid, n=8, r=32) | 0.307 s | 7.9 s | 0.305 / 0.313 / 0.316 s |
+| LiH/STO-3G (hybrid, n=6, r=21) | 0.059 s | 1.4 s | 0.060 / 0.062 / 0.066 s |
+
+The base commit of the Cholesky-shift work (`3290327`) measures the same on
+this machine, with identical losses. The previous README's numbers (0.050,
+0.224 and 0.044 s per relaxed evaluation) were measured in an earlier
+session, so the difference is the machine, not the code. A tied shift costs
+1–3% per outer evaluation (one diagonalization of `h_sigma` per trial); the
+per-spin bases of a split shift cost 4–36%, most on ab_only H2.
 
 The pair-loop implementation this package replaced was estimated at ~20 h
 per relaxed evaluation for H2/cc-pVDZ. For hybrid systems the time is
 dominated by `ModeSpace.orbital_K`. An optional patch from step 4
-(`step4b_orbital_K.patch`) rewrites it as two GEMMs: H4 then takes 0.038 s
-per evaluation.
+(`step4b_orbital_K.patch`) rewrites it as two GEMMs: H4 then took 0.038 s
+per evaluation, against 0.224 s at the time.
 
 **Memory.** The dense mode-space matrix `F` is `M x M` with `M = (r+1)n`.
 That is about 2 MB for H2/cc-pVDZ and about 140 MB at n = 20 with a full
@@ -423,4 +620,27 @@ to be applied blockwise, or fewer Cholesky vectors used.
   from the tables, and `QCSOR.from_file` reads it.
 - **Wrapper.** `QCSOR.optimize_from_cholesky` takes keyword-only options.
   Its inner defaults are now 1e-11 / 1e-9 with 500 sweeps (was 1e-6 / 1e-6,
-  100).
+  100). It no longer takes `eri`; it builds it from `chol`. Since roadmap
+  step 13 it optimizes a tied Cholesky shift by default
+  (`optimize_cholesky_shift="tied"`; `False` restores the previous behaviour).
+- **Energies.** `parse_decomposition` no longer adds `mu.N` to `E0`.
+  Λ is `ham.denom + mu.N` (+ `ham.cholesky_energy` with a Cholesky shift), and
+  `from_file` leaves `E0 = 0`.
+- **File format 3.** Per-spin one-body bases (`h1_X` is `(k, n, n)`), Cholesky
+  shift attributes and `chol_lam`; `from_file` sets `ham.h1` per spin
+  `(2, n, n)`. Version 2 files still load.
+- **Cholesky shifts.** Decompositions and `GaugeEvaluator` accept a fixed
+  `cholesky_shift`: forward model, inner solve, and the gauge and shift
+  gradients (`GaugeGradient.cholesky_gradient`, option `cholesky_gradient=`),
+  and the outer optimization of the shift
+  (`optimize_gauge(optimize_cholesky_shift=...)`), saved in file format 3.
+- **Outer points.** `ExponentialEvaluation` gains `coordinates` and
+  `gradient`, which are what L-BFGS steps on; without a shift they are `theta`
+  and `gradient_theta`. `near_zero_eigenvalues` returns
+  `(factor, mode, lambda, spin)` for a shifted decomposition.
+- **`check_gauge_regularity`** takes optional `eigenvalues=` (the shifted
+  eigenvalues for the zero test) and `one_body_eigenvalues=`.
+- **Documentation.** The PDF covers the Cholesky shift and file format 3, and
+  is built from `docs/build_documentation.py` (the `docs/build/` sources the
+  previous README named were never in the repository). `benchmark.py` gains
+  `--cholesky-shift`.

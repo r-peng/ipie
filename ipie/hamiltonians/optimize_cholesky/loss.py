@@ -88,6 +88,12 @@ class ModeSpace:
     Modes are ordered basis by basis: Cholesky factor g owns modes
     [g*n, (g+1)*n), the h eigenbasis owns [r*n, (r+1)*n) (hslice). C holds the
     overlaps between modes of DIFFERENT bases and is zero within a basis.
+
+    one_body_X (2, n, n) gives each spin its own h eigenbasis (a split Cholesky
+    shift). C, C2, F are then those of spin up; spin down differs only in the
+    h rows and columns, kept as the strips C_down, C2_down, F_down (n, r*n) of
+    h-basis rows against factor columns. split is True in that case, even if
+    the two bases happen to be equal.
     """
 
     def __init__(self, X, one_body_X):
@@ -97,13 +103,21 @@ class ModeSpace:
         self.X = X
         self.nmodes = (r+1)*n
         self.hslice = slice(r*n, (r+1)*n)
-        self.Xall = np.concatenate([X.transpose(1, 0, 2).reshape(n, r*n),
-                                    np.asarray(one_body_X, dtype=np.float64)], axis=1)
+        one_body_X = np.asarray(one_body_X, dtype=np.float64)
+        self.split = one_body_X.ndim == 3
+        up = one_body_X[0] if self.split else one_body_X
+        Xf = X.transpose(1, 0, 2).reshape(n, r*n)
+        self.Xall = np.concatenate([Xf, up], axis=1)
         basis = np.repeat(np.arange(r+1), n)
         self.cross = basis[:, None] != basis[None, :]
         self.C = np.where(self.cross, self.Xall.T @ self.Xall, 0.0)
         self.C2 = self.C*self.C
         self.F = self.C2 - self.C2*self.C2
+        if self.split:
+            self.X_down = one_body_X[1]
+            self.C_down = self.X_down.T @ Xf
+            self.C2_down = self.C_down*self.C_down
+            self.F_down = self.C2_down - self.C2_down*self.C2_down
 
     @classmethod
     def of(cls, decomposition):
@@ -112,13 +126,36 @@ class ModeSpace:
     def factor(self, g):
         return slice(g*self.n, (g+1)*self.n)
 
+    def _down_product(self, q, cols):
+        """(q F_down)[cols] for one spin-down load vector q (nmodes,), from the blocks.
+
+        F_down shares the factor-factor block with F; its h rows are F_down,
+        its h columns F_down.T, and its h-h block is zero.
+        """
+        rn = self.nchol*self.n
+        start, stop, _ = cols.indices(self.nmodes)
+        out = np.empty(max(stop - start, 0))
+        f_stop = min(stop, rn)
+        if f_stop > start:
+            out[:f_stop-start] = q[:rn] @ self.F[:rn, start:f_stop] + q[rn:] @ self.F_down[:, start:f_stop]
+        h_start = max(start, rn)
+        if stop > h_start:
+            out[h_start-start:] = self.F_down[h_start-rn:stop-rn] @ q[:rn]
+        return out
+
     def field(self, q, h, cols=slice(None)):
         """dL/dq on the selected modes: 2 (F q - h)."""
-        return 2.0*(q @ self.F[:, cols] - h[:, cols])
+        if not self.split:
+            return 2.0*(q @ self.F[:, cols] - h[:, cols])
+        return 2.0*(np.stack([q[0] @ self.F[:, cols], self._down_product(q[1], cols)]) - h[:, cols])
 
     def loss(self, q, h, OO):
         """q^T F q - 2 q.h - OO summed over spins; roundoff below zero is clamped to 0."""
-        value = float(np.sum(q*(q @ self.F)) - 2.0*np.sum(q*h) - np.sum(OO))
+        if not self.split:
+            quadratic = np.sum(q*(q @ self.F))
+        else:
+            quadratic = np.sum(q[0]*(q[0] @ self.F)) + np.sum(q[1]*self._down_product(q[1], slice(None)))
+        value = float(quadratic - 2.0*np.sum(q*h) - np.sum(OO))
         if not math.isfinite(value):
             raise FloatingPointError("Nonfinite commutator loss")
         return max(0.0, value)
@@ -135,6 +172,10 @@ class ModeSpace:
         r, n = self.nchol, self.n
         Y = self.C2[:, :r*n].reshape(self.nmodes, r, n)
         h = np.einsum("arm,srmk,ark->sa", Y, O, Y, optimize=True)
+        if self.split:
+            # Spin down sees its own h basis in the h rows; O only lives on factor modes.
+            Yd = self.C2_down.reshape(n, r, n)
+            h[1, self.hslice] = np.einsum("arm,rmk,ark->a", Yd, O[1], Yd, optimize=True)
         OO = np.zeros(2)
         for spin in (0, 1):
             if np.any(O[spin]):
@@ -192,7 +233,13 @@ def check_bases(decomposition):
     if X.ndim != 3 or X.shape[0] < 1 or X.shape[1] != X.shape[2] or X.shape[1] < 1:
         raise ValueError("Cholesky bases must have shape (r,n,n)")
     n = X.shape[1]
-    bases = [("one-body basis", _real_array(decomposition.one_body.X, "one-body basis"))]
+    one_body_X = _real_array(decomposition.one_body.X, "one-body basis")
+    if one_body_X.ndim == 3:
+        if one_body_X.shape[0] != 2:
+            raise ValueError("Per-spin one-body bases must have shape (2,n,n)")
+        bases = [(f"one-body basis (spin {s})", one_body_X[s]) for s in (0, 1)]
+    else:
+        bases = [("one-body basis", one_body_X)]
     bases += [(f"Cholesky basis {g}", factor) for g, factor in enumerate(X)]
     for name, basis in bases:
         if basis.shape != (n, n):
@@ -254,14 +301,18 @@ def commutator_loss(decomposition, *, normalize_weights=True):
 
 # --------------------------------------------------------------------------- pullback
 
-def loss_pullback(decomposition, loss_kind="weighted", check=True, space=None):
+def loss_pullback(decomposition, loss_kind="weighted", check=True, space=None, *, with_one_body=False):
     """(loss, dL/d channel-leg amplitudes (T,2), dL/dX (r,n,n)).
 
     gX[g][:, alpha] is the unconstrained partial derivative with respect to
-    the factor eigenvector X[g][:, alpha] (same-basis pairs excluded). The
-    one-body basis is fixed (it does not depend on the gauge). check=True runs
-    check_bases first. space: a ModeSpace already built for these bases
+    the factor eigenvector X[g][:, alpha] (same-basis pairs excluded). check=True
+    runs check_bases first. space: a ModeSpace already built for these bases
     (GaugeEvaluator reuses one per gauge); None builds it.
+
+    with_one_body=True also returns (g_one, gY): g_one (K,) = dL/d of each
+    one-body channel amplitude, and gY = dL/dY for the one-body eigenvectors Y
+    (columns), (n, n) for one shared basis or (2, n, n) for per-spin bases (a
+    split ModeSpace). They feed the h_sigma pullback of a Cholesky shift.
     """
     loss_kind = loss_kind_name(loss_kind)
     if check:
@@ -288,34 +339,98 @@ def loss_pullback(decomposition, loss_kind="weighted", check=True, space=None):
         g_amplitude[repeated, 0] = common*(1.0 + d1[repeated])
         g_amplitude[repeated, 1] = common*(1.0 + d0[repeated])
 
-    C, C2 = space.C, space.C2
-    GC = (np.outer(q[0], q[0]) + np.outer(q[1], q[1]))*(2.0*C - 4.0*C*C2)   # from q^T F(C) q
-    gX_offdiagonal = np.zeros((r, n, n))
+    if space.split:
+        gX, gY, dO = _split_basis_pullback(space, q, O)
+    else:
+        C, C2 = space.C, space.C2
+        GC = (np.outer(q[0], q[0]) + np.outer(q[1], q[1]))*(2.0*C - 4.0*C*C2)   # from q^T F(C) q
+        gX_offdiagonal = np.zeros((r, n, n))
+        dO = None
+        if O is not None:
+            Yr = C2[:, :r*n].reshape(N, r, n)
+            dO = np.zeros_like(O)                                    # dL/dO, entries independent
+            for spin in (0, 1):
+                Os = O[spin]
+                if not np.any(Os):
+                    continue
+                # -2 q.h, h = diag(C2 O C2^T)
+                dO[spin] -= 2.0*np.einsum("xga,xgb->gab", Yr*q[spin][:, None, None], Yr, optimize=True)
+                C2O = np.einsum("xgm,gmk->xgk", Yr, Os).reshape(N, r*n)
+                GC[:, :r*n] -= 8.0*q[spin][:, None]*C[:, :r*n]*C2O
+                # -OO = -sum_{pqrs} K[p,q,r,s] K[q,r,s,p]
+                gX_offdiagonal -= _offdiagonal_square_pullback(space, Os, dO, spin)
+        GX = space.Xall @ (GC + GC.T)
+        gX = GX[:, :r*n].reshape(n, r, n).transpose(1, 0, 2) + gX_offdiagonal
+        gY = GX[:, r*n:]
     if O is not None:
-        X = space.X
-        Yr = C2[:, :r*n].reshape(N, r, n)
-        dO = np.zeros_like(O)                                        # dL/dO, entries independent
-        for spin in (0, 1):
-            Os = O[spin]
-            if not np.any(Os):
-                continue
-            # -2 q.h, h = diag(C2 O C2^T)
-            dO[spin] -= 2.0*np.einsum("xga,xgb->gab", Yr*q[spin][:, None, None], Yr, optimize=True)
-            C2O = np.einsum("xgm,gmk->xgk", Yr, Os).reshape(N, r*n)
-            GC[:, :r*n] -= 8.0*q[spin][:, None]*C[:, :r*n]*C2O
-            # -OO = -sum_{pqrs} K[p,q,r,s] K[q,r,s,p]
-            K = space.orbital_K(Os)
-            Kt = K.transpose(3, 0, 1, 2)                             # Kt[p,q,r,s] = K[q,r,s,p]
-            T = np.einsum("pqrs,gpa,gqa->gars", Kt, X, X, optimize=True)
-            dO[spin] -= 2.0*np.einsum("gars,grb,gsb->gab", T, X, X, optimize=True)
-            V = np.einsum("gab,grb,gsb->gars", Os, X, X, optimize=True)
-            gX_offdiagonal -= 8.0*np.einsum("qrsu,gqa,gars->gua", K, X, V, optimize=True)
         both = dO + dO.transpose(0, 1, 3, 2)
         coupling = both[two.spins[distinct, 0], two.bix[distinct], two.modes[distinct, 0], two.modes[distinct, 1]]
         g_amplitude[distinct, 0] += (s*d1)[distinct]*coupling
         g_amplitude[distinct, 1] += (s*d0)[distinct]*coupling
-    GX = space.Xall @ (GC + GC.T)
-    gX = GX[:, :r*n].reshape(n, r, n).transpose(1, 0, 2) + gX_offdiagonal
     if not (np.isfinite(g_amplitude).all() and np.isfinite(gX).all()):
         raise FloatingPointError("Nonfinite loss pullback")
-    return float(loss), g_amplitude, gX
+    if not with_one_body:
+        return float(loss), g_amplitude, gX
+    one = decomposition.one_body.table
+    s1 = one.a if loss_kind == "weighted" else np.ones(len(one))
+    g_one = 2.0*s1*one.d*G[one.spin, r*n + one.mode]
+    if not (np.isfinite(g_one).all() and np.isfinite(gY).all()):
+        raise FloatingPointError("Nonfinite one-body pullback")
+    return float(loss), g_amplitude, gX, g_one, gY
+
+
+def _offdiagonal_square_pullback(space, Os, dO, spin):
+    """The -OO term of one spin: adds its dL/dO to dO[spin], returns its (positive) factor-basis term.
+
+    OO involves only factor-factor overlaps, so it does not depend on the h bases.
+    """
+    X = space.X
+    K = space.orbital_K(Os)
+    Kt = K.transpose(3, 0, 1, 2)                                     # Kt[p,q,r,s] = K[q,r,s,p]
+    T = np.einsum("pqrs,gpa,gqa->gars", Kt, X, X, optimize=True)
+    dO[spin] -= 2.0*np.einsum("gars,grb,gsb->gab", T, X, X, optimize=True)
+    V = np.einsum("gab,grb,gsb->gars", Os, X, X, optimize=True)
+    return 8.0*np.einsum("qrsu,gqa,gars->gua", K, X, V, optimize=True)
+
+
+def _split_basis_pullback(space, q, O):
+    """Basis adjoints (gX, gY (2, n, n), dO) for a split ModeSpace, in blocks.
+
+    Both spins share the factor-factor overlaps; spin s has its own h rows
+    (h basis Y_s against the factors). With GC_s = dL_s/dC_s, the adjoint of a
+    basis vector x_i is sum_j (GC_s + GC_s^T)[i, j] x_j over that spin's
+    bases, so the factor-factor blocks of both spins add up (one rn x rn
+    array, as in the shared path) and each spin contributes its own h strip.
+    """
+    r, n = space.nchol, space.n
+    rn = r*n
+    Xf = space.Xall[:, :rn]
+    Y = (space.Xall[:, rn:], space.X_down)
+    C, C2 = space.C, space.C2
+    Cff, C2ff = C[:rn, :rn], C2[:rn, :rn]
+    strips = ((C[rn:, :rn], C2[rn:, :rn]), (space.C_down, space.C2_down))     # (n, rn): h rows, factor columns
+    qf, qh = q[:, :rn], q[:, rn:]
+    GC_ff = (np.outer(qf[0], qf[0]) + np.outer(qf[1], qf[1]))*(2.0*Cff - 4.0*Cff*C2ff)
+    quad_hf = [np.outer(qh[s], qf[s])*(2.0*strips[s][0] - 4.0*strips[s][0]*strips[s][1]) for s in (0, 1)]
+    GC_hf = [block.copy() for block in quad_hf]
+    gX_offdiagonal = np.zeros((r, n, n))
+    dO = None
+    if O is not None:
+        dO = np.zeros_like(O)
+        Yff = C2ff.reshape(rn, r, n)
+        for spin in (0, 1):
+            Os = O[spin]
+            if not np.any(Os):
+                continue
+            Yh = strips[spin][1].reshape(n, r, n)
+            dO[spin] -= 2.0*(np.einsum("xga,xgb->gab", Yff*qf[spin][:, None, None], Yff, optimize=True)
+                             + np.einsum("xga,xgb->gab", Yh*qh[spin][:, None, None], Yh, optimize=True))
+            GC_ff -= 8.0*qf[spin][:, None]*Cff*np.einsum("xgm,gmk->xgk", Yff, Os).reshape(rn, rn)
+            GC_hf[spin] -= 8.0*qh[spin][:, None]*strips[spin][0]*np.einsum("xgm,gmk->xgk", Yh, Os).reshape(n, rn)
+            gX_offdiagonal -= _offdiagonal_square_pullback(space, Os, dO, spin)
+    # (GC_s + GC_s^T) has [h, f] = GC_hf + quad_hf (GC_s[f, h] is the quadratic part only) and [h, h] = 0.
+    sym_hf = [GC_hf[s] + quad_hf[s] for s in (0, 1)]
+    GXf = Xf @ (GC_ff + GC_ff.T) + Y[0] @ sym_hf[0] + Y[1] @ sym_hf[1]
+    gX = GXf.reshape(n, r, n).transpose(1, 0, 2) + gX_offdiagonal
+    gY = np.stack([Xf @ sym_hf[s].T for s in (0, 1)])
+    return gX, gY, dO
